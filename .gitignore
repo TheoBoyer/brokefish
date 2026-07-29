@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.so
+*.o
+*.ncu-rep
+*.nsys-rep
+*.sqlite
+runs/
+checkpoints/
+data/
+.venv/
+site/
+tests/_mutants/

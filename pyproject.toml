@@ -1,0 +1,53 @@
+[project]
+name = "brokefish"
+version = "0.0.1"
+description = "The cheapest superhuman chessbot from scratch"
+requires-python = ">=3.13"
+# Pinned to the exact stack the kernel was tuned and validated against on sm89.
+# Triton's codegen moves fast enough that a version bump is a kernel change:
+# re-run tests/ and bench/ before accepting one.
+#
+# To create an environment, use requirements.lock, not this file: it freezes
+# torch's whole transitive closure so the install hardlinks from the local uv
+# cache instead of re-downloading ~3 GB of CUDA wheels.
+dependencies = [
+    "torch==2.13.0",
+    "triton==3.7.1",
+]
+
+[project.optional-dependencies]
+# Test and build tooling. python-chess is the correctness oracle for the
+# environment and pyarrow reads the parquet shards of test positions; neither is
+# imported by the engine or the training loop. ninja is what
+# torch.utils.cpp_extension drives to compile csrc/, and it needs a CUDA toolkit
+# whose major version matches torch's -- see csrc/README.md. Deliberately not in
+# requirements.lock, which is the frozen stack every number in docs/perf.md was
+# measured on.
+dev = ["pytest", "chess", "pyarrow", "ninja"]
+
+[tool.pytest.ini_options]
+# The repository root on sys.path, so tests/ can `import brokefish` and
+# `import tests.test_model` without an installed package or a PYTHONPATH.
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = [
+    "mutation: slow suite that mutates the kernel to test the tests; needs --mutation",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["brokefish", "brokefish.env", "brokefish.nn"]
+
+# torch and triton both come from the CUDA 13.2 wheel index, not PyPI. Same
+# index as the reference environment, which is what makes the cache hit.
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu132" }
+triton = { index = "pytorch-cu132" }

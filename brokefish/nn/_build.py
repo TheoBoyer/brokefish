@@ -26,6 +26,7 @@ import functools
 import os
 import re
 import subprocess
+import sysconfig
 from pathlib import Path
 
 import torch
@@ -109,13 +110,34 @@ def cuda_home() -> Path:
 
 
 def _require_ninja() -> None:
+    """Import the package, and put its executable where torch will look for it.
+
+    ⚠️ **Importing the package is not enough.** ``torch``'s ``is_ninja_available()``
+    shells out to ``ninja --version``, so the console script has to be on ``PATH``.
+    ``uv run --python .venv/bin/python`` happens to prepend ``.venv/bin``; running
+    ``.venv/bin/python`` directly does not, and the failure reads "Ninja is required
+    to load C++ extensions", which looks like a missing install and is not one.
+
+    Repairing it here rather than in every caller's shell is the same choice this
+    module already makes for ``CUDA_HOME``, and for a better reason: it is always
+    effective, because :func:`load_extension` calls this immediately before torch
+    does the shelling out. Nobody should have to prefix a command with ``PATH=`` to
+    run a script.
+    """
     try:
-        import ninja  # noqa: F401
+        import ninja
     except ImportError:
         raise RuntimeError(
             "ninja is required to build CUDA extensions:\n"
             "  uv pip install -p .venv/bin/python ninja"
         ) from None
+
+    # `ninja.BIN_DIR` is where the wheel put the binary, which beats guessing from
+    # the interpreter's layout; `sysconfig` is the fallback for a distro package.
+    bindir = str(getattr(ninja, "BIN_DIR", None) or sysconfig.get_path("scripts"))
+    entries = os.environ.get("PATH", "").split(os.pathsep)
+    if bindir not in entries:
+        os.environ["PATH"] = os.pathsep.join([bindir, *entries])
 
 
 def build_dir(name: str) -> Path:
@@ -143,6 +165,14 @@ def load_extension(name: str, sources, verbose: bool = False, extra_cuda_cflags=
     # Belt and braces: the module may already have been imported by something
     # else, in which case its CUDA_HOME global is the stale PATH-derived one.
     cpp_extension.CUDA_HOME = str(home)
+
+    if not cpp_extension.is_ninja_available():
+        # Only reachable if `_require_ninja`'s PATH repair did not take. Say what is
+        # actually wrong, because torch's own message names the wrong problem.
+        raise RuntimeError(
+            f"the ninja package imports but torch cannot run `ninja --version`.\n"
+            f"PATH is {os.environ.get('PATH')!r}\n"
+            f"This is a PATH problem, not a missing install.")
 
     paths = [str(p if Path(p).is_absolute() else CSRC / p) for p in sources]
     missing = [p for p in paths if not Path(p).exists()]

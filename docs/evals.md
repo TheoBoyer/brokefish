@@ -525,7 +525,7 @@ opponent-ladder decision to be made before it starts.
 Verified against the papers on 2026-07-30. The quotes, links, the full scorecard of
 what was checked and what turned out to be wrong, and the four things still
 unverified are in **`eval_prior_art.md`** at the repository root — deliberately
-outside the MkDocs nav, same status as `briefing.md`.
+outside the MkDocs nav: working material, not part of the published site.
 
 The five results that this document rests on:
 

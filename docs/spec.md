@@ -1,14 +1,13 @@
 # Brokefish specification
 
 **Status: frozen 2026-07-29 (v1).** This document is normative. Where it disagrees
-with any other file in the repository, including `docs/legacy/representation.md`,
-`csrc/chess.cuh` and `briefing.md`, this document is correct and the other file is a
-bug.
+with any other file in the repository, including `docs/legacy/representation.md`
+and `csrc/chess.cuh`, this document is correct and the other file is a bug.
 
 Its scope is the contract between the chess engine and the network: how a position
 is represented, what the engine produces, what the network consumes and emits. The
-RL layer is outside that scope, and the decisions it still owns are listed in §11.
-Sections 1 to 10 do not depend on them.
+RL layer is outside that scope; §11 tracks where its parameters were settled and
+what is still open. Sections 1 to 10 do not depend on any of them.
 
 ---
 
@@ -553,20 +552,23 @@ the environment under 0.5 % of the self-play budget with margin.
 
 ---
 
-## 11. Not frozen
+## 11. The RL layer
 
-The following belong to the RL layer and remain undecided. Sections 1 to 10 do not
-depend on any of them.
+Outside this document's scope, and none of §§1-10 depend on it. This section is a
+pointer, not a contract: it records where each parameter was settled and which
+document now owns it. **Where a row below and its owning document disagree, the
+owning document is correct** — the reverse of the rule in the header, because these
+values are not part of the engine-network contract.
 
-| open question | why it is open |
+| question | where it stands |
 |---|---|
-| **Value target**: final game outcome, bootstrapped search value, or a mix | KataGo reports a real Elo gain from the mix, and the choice changes the replay buffer's schema |
-| **Training window** size and shape | it controls both staleness effects in §8 |
-| **Reuse factor R** and its cap | KataGo caps at 4 and calls that conservative; AlphaZero ran around 0.5 to 1 |
-| **Simulations per move** | 32 sits in the Gumbel low-*n* regime and is defensible, but was never measured. Through `positions/s = evals/s ÷ sims` it sets the whole cost structure, and therefore which device can host the learner |
-| **Playout cap randomisation** | KataGo decouples the cost of value and policy targets this way, which would turn "sims" into `(n_small, n_large, p_large)` |
-| **Tree node layout** | §6.3 fixes the hash and the irreversible bit; children, visit counts and prior precision are unspecified |
-| **Learner placement** | GPU, alternating with self-play, on measured throughputs of 5000 positions/s against 130 on the CPU. Revisit if the sims sweep moves the requirement |
+| **Value target** | settled 2026-07-30: **the final game outcome**, no bootstrapping and no mixing, per AZ p.3. `root_value` is recorded and trained on by nothing, so KataGo's mix stays a cheap later ablation. [`train.md`](train.md) §4 |
+| **Training window** | settled 2026-07-30: **AZ's literal 500,000 games**, uniform over all positions in the window, evicted by game, oldest first. [`train.md`](train.md) §5.2 |
+| **Reuse factor R** | settled 2026-07-30: **65.2 positions sampled per game generated**, derived from AZ's 700,000 × 4,096 steps against 44M games. [`train.md`](train.md) §6 |
+| **Simulations per move** | settled: **`n = 800`, AlphaZero PUCT**, chosen for convergence rather than for throughput. The sweep downward is a C4 measurement. [`mcts.md`](mcts.md) §4.4 |
+| **Tree node layout** | settled by C1 and normative there: the node arrays, `E = 64` children per node, and the pool's bump allocator. [`mcts.md`](mcts.md) §4.2, §4.3. §6.3 here still owns the hash and the irreversible bit |
+| **Learner placement** | settled: **GPU, alternating with self-play**, on 5000 positions/s against 130 on the CPU. Revisit if the sims sweep moves the requirement |
+| **Playout cap randomisation** | **still open.** KataGo decouples the cost of value and policy targets this way, which would turn "sims" into `(n_small, n_large, p_large)` and make positions stop costing the same. Priced as a seam in [`mcts.md`](mcts.md) §11, not scheduled |
 
 ---
 
@@ -608,3 +610,17 @@ one an implementation needed and the spec did not have.
   ready `[N] fp32` rather than a slice of an aux tensor (§7.4)
 - the embedding sum gains a normative flattening, a normative summation order,
   and the statement that clock and repetition are per position (§7.2)
+
+**v1.3, 2026-07-30.** §11 only. **Nothing normative changed**: §§1-10 are untouched
+and the engine-network contract is the same one frozen at v1.
+
+§11 had gone stale in a way that mattered, because it is the frozen document and it
+was still calling settled questions open. Six of its seven rows were decided between
+2026-07-29 and 2026-07-30 by `mcts.md` and `train.md` — value target, training
+window, reuse factor, simulations per move, tree node layout, learner placement —
+and the simulations row in particular still read "32 sits in the Gumbel low-*n*
+regime", which v0 is not: the search is AlphaZero PUCT at `n = 800`. The section is
+now a pointer to whichever document owns each parameter, and says so, rather than a
+second place where those values are written down. Playout cap randomisation is the
+one row still genuinely open. The header's reference to `briefing.md` goes with the
+file, which was deleted the same day.

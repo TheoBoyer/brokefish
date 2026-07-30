@@ -2,8 +2,8 @@
 
 **2026-07-30.** Written to check the claims in [`docs/evals.md`](docs/evals.md) §12
 against the papers rather than against memory, and to look at what the other
-from-scratch projects actually do. Deliberately **not** in the MkDocs nav (`mkdocs.yml`),
-same status as `briefing.md`: working material, not part of the published site.
+from-scratch projects actually do. Deliberately **not** in the MkDocs nav (`mkdocs.yml`):
+working material, not part of the published site.
 
 Everything below was read this session. Where a claim could not be sourced it says so.
 

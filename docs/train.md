@@ -135,38 +135,91 @@ trained. That variant needs no legality mask at training time at all. It is in �
 
 ### 3.4 What that costs, and what it does *not* require
 
-It needs the **set** of legal moves. One `env.movegen` per training sample, at 3.8M
-positions/s in-process (`bench/bench_loop.py`) against ~5000 positions/s of training:
-**0.13 %** of the phase. The alternative — storing all ≤64 edge labels in the record —
-adds 128 B to 330 B, a 39 % larger buffer, and §5.2 says host RAM is the binding
-constraint. Recompute wins on the only axis that is tight.
+Nothing, as of §3.5: the record carries its own support. For one record, decode each
+stored `policy_move` label to its logit, take `log_softmax` over the stored edges, and
+dot with `policy_prob`.
 
-Then, for one record: decode each stored `policy_move` label to its logit, take
-`log_softmax` over the legal set, and dot with `policy_prob`.
+⚠️ The first draft of this section costed a `movegen` per training sample — 3.8M
+positions/s in-process against ~5000 positions/s of training, **0.13 %** of the phase —
+and rejected storing the edge labels because it "adds 128 B to 330 B". That arithmetic
+was wrong: §10's arrays are `E` wide and zero-padded whether or not the entries are
+used, so storing the unvisited edges costs **nothing**. The cheap option was available
+the whole time and the recompute was never necessary.
 
 ⚠️ **The unvisited legal moves matter.** They contribute nothing to `−Σ π log p`
 directly and everything through the denominator. Restricting the softmax to the
 `policy_len` moves that were actually visited optimises a different objective, and
 every loss value it produces looks reasonable.
 
-**Two things must match the search exactly, and neither is the whole enumeration:**
+**One thing must match the search exactly, and it is not the enumeration.**
 
-1. **The label decode.** A `u16` label is `(move, promo)` per `spec.md` §3; `move`
-   indexes the `[32, 64]` policy head as `(slot, square)` and `promo` selects one of
-   the 4 promotion logits, with a promotion edge's logit being
-   `policy_logits[slot, square] + log_softmax(promo)[k]`. This map is shared with
-   `expand` and **a mismatch permutes the target silently** — the loss still falls,
-   because the network happily learns a consistently shuffled labelling. §12 check 3
-   is for this.
-2. **The truncation, and only when it fires.** When a position has more than `E = 64`
-   legal moves the search kept the first 64 in its canonical order, so `π` is
-   supported on that subset and the denominator must be too. This is the *only* reason
-   the canonical order appears in the training path at all.
+**The label decode.** A `u16` label is `(move, promo)` per `spec.md` §3; `move`
+indexes the `[32, 64]` policy head as `(slot, square)` and `promo` selects one of the
+4 promotion logits, with a promotion edge's logit being
+`policy_logits[slot, square] + log_softmax(promo)[k]`. This map is shared with
+`expand` and **a mismatch permutes the target silently** — the loss still falls,
+because the network happily learns a consistently shuffled labelling. §12 check 3 is
+for this.
 
 ⚠️ Corrected from the first draft, which required the training path to rebuild the
 search's edge array "in the same canonical order". It does not. The denominator is a
-sum over a *set*, and indexing logits by label is order-free. Order enters once, at
-truncation, in a case that is rare (`mcts.md` §4.3) and must still be reproduced.
+sum over a *set*, and indexing logits by label is order-free.
+
+### 3.5 The record carries the support, so the training path recomputes nothing
+
+Revised 2026-07-31, twice, and the second revision deleted the problem the first one
+was solving. The question is what the softmax denominator runs over when a position
+has more than `E = 64` legal moves and the search kept only 64 of them.
+
+**The first draft said: recompute it.** Rebuild the legality mask with `movegen` and
+re-derive the top-64. **That cannot be done correctly** — the search truncated with the
+*generating* weights and the training path holds the *current* ones — and it fails in
+practice, not merely in principle: within eight generations of the first smoke run, on
+
+```
+r6r/1ppq1kpp/5n2/2n1pbP1/7P/1P1P1N2/PpP1PK2/2R2Q1R b - - 1 1
+```
+
+the search kept `b2b1=N` and a recomputed top-64 dropped it, which turns a stored
+target into an infinite loss.
+
+**The right question is why the training path is recomputing anything at all.** The
+search knew its support exactly. §10's policy arrays are already `E = 64` wide and
+zero-padded, so storing **every edge** rather than only the visited ones — `π = 0`
+where the search never went — costs **zero extra bytes**. `policy_len` becomes the
+root's edge count instead of its visit count and the record is complete.
+
+**Decision: the denominator is the stored edge set.** The consequences are all in one
+direction:
+
+- the truncation question disappears. The stored edges *are* the support, exactly, by
+  construction, whichever weights chose them;
+- the loss touches **no engine**: no `movegen`, no legality mask, no `bitset_to_bool`.
+  `az_loss` does not take an `env` argument;
+- it is cheaper by two orders of magnitude in the tensor that dominates it — an
+  `[N, 64]` gather where the masked form built two `[N, 8192]` fp32 tensors;
+- the canonical enumeration order of `mcts.md` §6.4 never enters the training path.
+  No sort, no `topk`, and no host synchronisation to discover whether a sort was
+  needed.
+
+⚠️ **What is given up, and where it went.** The recomputed mask was also an
+independent cross-check on the record. That does not vanish, it moves: `audit_labels`
+verifies every stored edge is legal in the recomputed position, and §12's `audit_every`
+runs it periodically — at 0.13 % of a step it is affordable every hundredth one rather
+than never. ⚠️ It catches an *illegal* label and not a *permuted* one; only the
+comparison against a live search settles the ordering, and that is check 3.
+
+⚠️ **The residual difference from AZ** is that on a position with more than 64 legal
+moves the denominator is the search's 64 rather than every legal move, which is what AZ
+Methods renormalises over. Softmax is consistent under restriction, so training exactly
+the distribution the search consumes is coherent — but it is ours and not the paper's,
+and it is in [`fidelity.md`](fidelity.md) §4.2(i).
+
+⚠️ **One thing the label alone cannot tell you.** `promo == 0` does not mean "not a
+promotion": spec §3 numbers the types `0:N 1:B 2:R 3:Q` and a quiet move carries field
+0 too. Whether the `log_softmax(promo)` term belongs in an edge's logit is decided from
+the **piece word and the target rank**, which the record's board carries — never from
+the label. Getting it backwards deletes the entire underpromotion motif.
 
 ---
 
@@ -217,8 +270,8 @@ The record is `mcts.md` §10, unchanged, produced by
 board       [32] u16    the position searched
 control     i16
 rep         u8          min(rep - 1, 2)
-policy      [<=64] (u16 move, f16 prob)
-policy_len  u8
+policy      [64] (u16 move, f16 prob)   the root's WHOLE edge set, pi = 0 where unvisited
+policy_len  u8          the root's edge count, NOT its visit count (§3.5)
 value       f32         §4, written when the game ends
 weight_gen  u16         the generation that produced the search
 root_value  f32         reserved, written, trained on by nothing (§4)
@@ -226,12 +279,17 @@ root_value  f32         reserved, written, trained on by nothing (§4)
 
 ≈ 334 B per position.
 
-⚠️ **`root_value` does not exist yet.** `mcts.md` §10 reserves "one `f32`" for it but
-`MoveRecord` has no such attribute, so C2's first edit is in *search* code, not
-training code: `select_and_advance` in **both** `search/torch_impl.py` and
-`search/cuda_impl.py`, plus the field-by-field comparison in
-`tests/test_search_cuda.py`. Small, and worth naming because it is the one place C2
-reaches into a module it does not own.
+✅ **`root_value` landed 2026-07-31**, and it was C2's one edit into a module it does
+not own: `MoveRecord` in `search/torch_impl.py`, computed in `select_and_advance`, and
+added to the field-by-field comparison in `tests/test_search_cuda.py`.
+`search/cuda_impl.py` needed no change — it inherits `select_and_advance` and its
+kernels already write `edge_N` and `edge_Q`.
+
+⚠️ It is the **search's** value of the root, `Σ π(a) Q(a)` over the root edges, not
+the raw network evaluation the root started from. The improved estimate is what a
+KataGo-style mix would bootstrap against; the raw one is already recoverable from the
+network. Stored in `[-1, 1]` to match `z`, while the tree works in `[0, 1]` (§3.5 of
+`mcts.md`).
 
 ### 5.2 Window
 
@@ -346,6 +404,14 @@ does not publish and ours does not match.
 accumulated loss makes its effective strength depend on the accumulation count, which
 is a bug that shows up as a mysterious dependence on a memory parameter.
 
+⚠️ **`weight_decay = 2c`, not `c`** (noted 2026-07-31, `train/loss.py`'s
+`weight_decay_for`). AGZ writes the penalty as `c‖θ‖²` with **no factor of a half**,
+so its gradient is `2cθ`; `torch.optim.SGD(weight_decay=w)` adds `wθ`. Passing `c`
+straight through halves the regularisation the paper specifies, and no check in §12
+would notice — it changes nothing except a curve, months later. The literature's
+frequent `½c‖θ‖²` convention is what makes this easy to get wrong in either direction,
+so the value is derived from AGZ's formula rather than from a habit.
+
 ⚠️ **Our measured 5000 positions/s was fwd+bwd+AdamW.** SGD+momentum is cheaper in
 both time and state (one buffer instead of two: ~26 MB rather than ~51 MB), so the
 figure is a lower bound, but it has not been re-measured. Do that before it is quoted.
@@ -399,6 +465,31 @@ ours is a 6.38M-parameter pre-norm transformer initialised at `std = 1/sqrt(d)`.
 Nothing about AZ's tuning transfers to that. §12's overfit-one-batch check will show
 divergence immediately, and a learning-rate sweep is the first legitimate ablation on
 top of the AZ reproduction — not a change to it.
+
+**First measurement, 2026-07-31.** `python -m brokefish.train.overfit --sweep
+0.2,0.02,0.002,0.0002`, 1024 positions harvested at `n = 16`, 300 steps each from one
+initialisation and one frozen batch:
+
+| lr | KL at 0 | KL at 300 | value at 0 | value at 300 |
+|---|---|---|---|---|
+| 0.2 | 1.585 | 0.876 | 1.047 | **1.383** |
+| 0.02 | 1.585 | 0.750 | 1.047 | 0.703 |
+| **0.002** | 1.585 | **0.571** | 1.047 | **0.178** |
+| 0.0002 | 1.585 | 0.946 | 1.047 | 0.215 |
+
+`lr = 0.002` wins on both heads, **two orders of magnitude below AZ's value**. At
+`lr = 0.2` the value loss *rises* and then sits at exactly 1.383 while the gradient
+norm falls to 0.1: that is a **saturated `tanh`**, which stops producing gradient
+entirely — `mcts.md` §15.3 already watches for it, and here it is a training pathology
+rather than a search one.
+
+⚠️ **This is a rate comparison and not yet a pass of check 1.** No rate reached
+`KL ≈ 0`, so it does not yet say the loop *can* memorise a batch; 300 steps of
+SGD+momentum over 1024 positions is not enough to conclude either way. And the batch
+was harvested at `n = 16`, where the mean `policy_len` is 3.5 — the targets are far
+sparser than the `n = 800` ones a real run produces. The verdict on `lr` is provisional
+until check 1 is run at §12's own size, and the row in [`fidelity.md`](fidelity.md)
+§4.2(a) stays open until it is.
 
 ---
 
@@ -575,11 +666,14 @@ sense `roadmap.md` uses for perft.
    tolerance.
 3. **The label decode, against a live search.** Run one search; for each root edge,
    the logit the *training* path selects for that edge's stored label must be the same
-   scalar `expand` used to build the edge's prior. Plus the truncation case: a
-   position with more than 64 legal moves must give the same 64-move support on both
-   sides. ⚠️ **This is the most important check in C2.** A permuted target trains a
-   network that learns a shuffled labelling, the loss falls the whole time, and every
-   other check in this list passes while it happens.
+   scalar `expand` used to build the edge's prior. Plus the truncation case: on a
+   position with more than 64 legal moves, every stored label must still be a
+   candidate — §3.5's exact invariant, replacing the first draft's "the same 64-move
+   support on both sides", which is unachievable. ⚠️ **This is the most important
+   check in C2.** A permuted target trains a network that learns a shuffled
+   labelling, the loss falls the whole time, and every other check in this list
+   passes while it happens. It is cheap enough to assert on every micro-batch, and
+   `az_loss(strict=True)` does.
 4. **Resume bit-exactness**, §9.
 5. **Buffer invariants**, asserted continuously and cheaply: every pending record is
    filled exactly once; no record is sampled before it is filled; eviction never
@@ -698,7 +792,42 @@ deviation: the released pseudocode stores untempered visit counts and applies
 because the symbol overloading will invite the same wrong reading again. The same read
 of `select_action` narrowed §2.1(c): the released code counts 30 **plies**.
 
-Five decisions were taken the same day and are folded in above rather than left as
+**§3.5 revised again, 2026-07-31, and the second revision deleted the problem.** The
+first two drafts both had the training path *recomputing* the softmax support — one by
+rebuilding the search's truncation, one by rebuilding the full legal set — and neither
+asked why it was recomputing anything the rollout already knew. It was: `mcts.md` §10's
+policy arrays are `E` wide and zero-padded, so storing the root's whole edge set rather
+than only its visited edges costs **no bytes**. The record now carries its own support,
+`az_loss` takes no `env`, the dominant tensor went from two `[N, 8192]` fp32 arrays to
+one `[N, 64]` gather, and the truncation question stops existing. The engine-side
+cross-check the recompute used to provide moves to `audit_labels` on a schedule.
+
+**Implemented 2026-07-31**, `brokefish/train/` and `tests/test_train.py` (33 checks).
+Four things the document said turned out to be wrong or incomplete once they were
+code, and all four are corrected above rather than annotated:
+
+- **§3.5, the truncation.** The contract asked the training path to reproduce the
+  search's `E = 64` support. It cannot — the search truncated with the generating
+  weights — and the disagreement is not theoretical: it fired in the eighth generation
+  of the first smoke run. The denominator is now the full legal set, which is AZ's own
+  rule, is the coherent choice under softmax restriction, and turns §12 check 3 into an
+  exact invariant.
+- **§7.1, `weight_decay = 2c`.** AGZ's `c‖θ‖²` has no half in it.
+- **§5.1, `root_value`** is in, and it is the visit-weighted root `Q`, not the raw
+  network evaluation.
+- **§9's checkpoint** carries the games in flight as well as the counters, because a
+  fresh tree is built every move and the games are therefore the whole of self-play's
+  state. Resume is bit-exact, tested.
+
+Two things measured rather than assumed while building it. The backward pass is
+deterministic run to run on this card, so §9's bit-exactness does not need
+`use_deterministic_algorithms` to be more than a belt; and §7.2's accumulation
+identity holds to 1e-11 relative **in float64**, while in fp32 it lands at 1e-4 to
+1e-6 and moves between runs, because a matmul at `N` and a matmul at `N/4` select
+different cuBLAS split-k reductions. The identity is exact; fp32 is not. The test
+proves it in double and pins the fp32 case loosely, with the reason named.
+
+Five decisions were taken on 2026-07-30 and are folded in above rather than left as
 open rows: the replay window keeps AZ's literal 500,000 games and lives in a
 disk-backed mapping (§5.2), `n = 800` stands for a hill-climbing run with the
 simulation count reduced afterwards (§13), the weight-synchronisation step and its

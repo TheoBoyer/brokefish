@@ -860,17 +860,23 @@ One record per real move per game, `B` records per move step.
 board       [32] u16    the position searched, spec §2.1
 control     i16         spec §2.2
 rep         u8          min(rep - 1, 2), spec §7.2
-policy      [min(E, n)] (u16 move, f16 prob)
-policy_len  u8
+policy      [E] (u16 move, f16 prob)   the root's whole edge set
+policy_len  u8          the root's edge count
 value       f32         filled in when the game ends
 weight_gen  u16         the network generation that produced the search
+root_value  f32         the search's value of the root, Σ π(a) Q(a) in [-1, 1]
 ```
 
-The policy target holds at most `min(E, n)` nonzero entries: at most `n` because the
-visit counts sum to `n`, and at most `E` because the root has at most `E` edges. At
-`n >= 64` the binding limit is `E = 64`, so a record is
-64 + 2 + 1 + 256 + 1 + 4 + 2 ≈ 330 B independently of `n`, and a 2M-position window
-is 660 MB in host RAM.
+⚠️ **`policy` is the root's whole edge array, not only the edges a simulation
+reached** (revised 2026-07-31). An edge with `N(a) = 0` is stored with `π = 0`. It
+carries nothing for the training *target* and everything for the training
+*denominator*: it is what tells C2 which moves the softmax normalises over, without
+which the training path has to recompute `movegen` and re-derive a truncation it
+cannot reproduce (`train.md` §3.5). The array is `E` wide and zero-padded either way,
+so this costs **no bytes at all** — which is why the earlier `[min(E, n)]` width, and
+the "at most `min(E, n)` nonzero entries" reasoning behind it, was a false economy.
+
+A record is 64 + 2 + 1 + 128 + 128 + 1 + 4 + 2 + 4 = **334 B** independently of `n`.
 
 `value` is the final game outcome from the point of view of the side to move in
 `board`, in `[-1, 1]`. It is written when the game terminates, so a record is

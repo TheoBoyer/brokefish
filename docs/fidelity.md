@@ -289,9 +289,9 @@ none is a silent omission.
 
 ## 4. The training loop against AlphaZero
 
-Written 2026-07-30 alongside [`train.md`](train.md), before any C2 code exists, so
-every row is a statement about the *specification* and none of them is yet a
-statement about an implementation.
+Written 2026-07-30 alongside [`train.md`](train.md) and revised 2026-07-31 when C2
+landed. Rows (a), (b), (d), (f) and (h) are still statements about the specification;
+(c), (e), (g) and (i) are now statements about `brokefish/train/`.
 
 ⚠️ **The evidence here is weaker than anywhere else in this file, and structurally so.**
 §2's search had an independent AGZ transcription to check against and §3's engine has
@@ -324,6 +324,7 @@ rather than invented.
 | e | **the game-length cap at 512 plies** | high | AZ's Domain Knowledge item 5 caps chess games and scores them drawn but does not give the number; 512 is the pseudocode's. Our rules are *stricter* than AZ's plane encoding implies (we implement the fifty-move rule and threefold), so the cap should rarely fire. `train.md` §5.4 makes its firing rate a logged counter rather than an assumption |
 | f | **`samples_per_game = 65.2`** | high | Not a published parameter — a ratio *derived* from two published counts (700,000 × 4,096 minibatch positions against 44M training games, AZ Table S3 and p.4). It reproduces AZ's data economics exactly if our mean game length matches theirs, and approximately if it does not, since the per-position reuse is the derived quantity and the per-game one is what we hold fixed |
 | g | **the masked policy softmax** | high | `train.md` §3.3. AZ's Representation section says illegal moves are masked and renormalised, and our search's prior is a masked softmax, so training on the same support is the faithful reading. The unmasked alternative is *coherent* rather than wrong — softmax is consistent under restriction — so this is a choice between two defensible readings, not a departure |
+| i | **the policy denominator is the search's `E = 64` edge set, not every legal move** | high | Added 2026-07-31. `E = 64` is our approximation and not AZ's — AZ's 4672-move action space carries every move and truncates nothing — so on the small fraction of positions with more than 64 legal moves, the training denominator omits the moves the search itself omitted. Softmax is consistent under restriction, so training exactly the distribution the search consumes is coherent, and it is what makes the support *exact* rather than a recomputed guess: `train.md` §3.5 shows the recomputed version disagreeing with the search within eight generations, because the search truncated with the generating weights and training holds the current ones. The record now stores the whole edge set at zero byte cost, which is the fix |
 | h | **SGD+momentum, if it is ever replaced** | n/a today | AGZ Methods: momentum 0.9, `c = 10⁻⁴`, and AZ defers to it. `train.md` §7.1 specifies it. Our measured 5000 positions/s was AdamW; **if AdamW is kept for throughput or stability that is a real deviation and belongs in this table with the reason** |
 
 ⚠️ **(a) and (b) are the two the project will actually depart on**, and they compound:

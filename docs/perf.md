@@ -651,7 +651,7 @@ out of 3.
 
 | lever | expected gain | state |
 |---|---|---|
-| **warp-specialised CUDA C++ kernel** | **×1.25-2.5** | the path to GO; full spec in `briefing.md` §5.1 and `csrc/README.md` |
+| **warp-specialised CUDA C++ kernel** | **×1.25-2.5** | the path to GO; full spec in `csrc/README.md` |
 | fp8 e4m3 | ×1.5-2 theoretical | untested, deferred by Théo |
 | weight-stationary (weights resident in SMEM, activations streamed) | ~200 GB of weight re-reads down to ~26 GB | untested |
 | 2-head attention pingpong (FA3 style) | 2-5 % | untested |

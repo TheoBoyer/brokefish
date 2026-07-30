@@ -421,15 +421,26 @@ what the interleaved protocol is for.
 Two pieces spec §6.3 and §7.2 left to the search are now filled: the per-game
 repetition ring, and `rep`, which B2 had been taking as a synthesised argument.
 
-### C2. Training loop, 3-4 days
+### C2. Training loop ✅ **done 2026-07-31**
 
 Replay buffer, alternating self-play and gradient phases, weight versioning,
-checkpoint and resume, and the euro counter. The buffer schema depends on the value
-target question below.
+checkpoint and resume, and the euro counter. Specified in [`train.md`](train.md),
+implemented in `brokefish/train/`, tested by `tests/test_train.py` (31 checks).
 
 Learner placement is settled: GPU, alternating with self-play. Measured throughput
 is 5000 positions per second on the 4060 against 130 on the CPU, both fwd+bwd+AdamW
-at d=256 and L=8.
+at d=256 and L=8. ⚠️ That figure is **AdamW**; C2 ships SGD+momentum per AGZ, which
+is cheaper in time and state and has not been re-measured.
+
+⚠️ **C2 is the first phase with no oracle**, and that is the thing to hold onto: a
+training loop has no perft and no independent transcription to be wrong against, and
+its failure mode is a curve that is merely worse than it should have been.
+[`train.md`](train.md) §12's nine checks are what replace one, and passing all nine is
+consistent with training a subtly wrong objective competently.
+
+What is left before a real run is not code: `lr = 0.2` is AZ's value for a 46M-param
+convolutional resnet and §12 check 1 (`python -m brokefish.train.overfit`) is the
+instrument for re-tuning it.
 
 ### ~~C3. Evaluation protocol~~ → [Track D](#track-d-evaluation)
 
@@ -697,8 +708,9 @@ engine never touches a training tensor.
 | ~~**is the system env-bound?**~~ | settled by measurement 2026-07-30: no, the environment is **2.2 %** of a node |
 | tree node layout | start of C1, and now the next thing to decide |
 | the per-game repetition ring (spec §6.3) | start of C1; A1 left it to the search on purpose |
-| value target: outcome, bootstrapped search value, or a mix | start of C2 |
-| reuse factor R and training window | start of C2 |
+| ~~value target: outcome, bootstrapped search value, or a mix~~ | settled 2026-07-30 by AZ p.3: **the final game outcome**, no bootstrapping and no mixing. `root_value` is written and trained on by nothing, so KataGo's mix stays a cheap later ablation (`train.md` §4) |
+| ~~reuse factor R and training window~~ | settled 2026-07-30: **65.2 positions sampled per game generated**, derived from AZ's 700,000 × 4,096 against 44M games, over the full AGZ window of **500,000 games** (`train.md` §6, §5.2) |
+| **`lr = 0.2` and its three drop points** | the first ablation on top of the AZ reproduction, and now the next one due. §12 check 1 is the instrument |
 | ~~checkpoint gating in the training loop~~ | settled 2026-07-30: **no gating**, so C2 does not depend on Track D (`evals.md` §11) |
 | **which calibration engines** | start of D4, and the next one due |
 | whether the external anchor is a node in the league fit or a separate affine map | start of D2; folding it in deletes the two-scale hazard but pulls D0 and D3 earlier |

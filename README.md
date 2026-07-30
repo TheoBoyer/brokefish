@@ -32,7 +32,10 @@ index-aligned with the engine's 32 legality masks and the policy is masked by a
 device-side AND.
 
 The network is a transformer over those 32 tokens: `d=256`, 8 layers, 8 heads,
-6.32M parameters, around 400 MFLOPs per evaluation. Search is Gumbel MCTS.
+6,383,360 parameters, around 400 MFLOPs per evaluation. Search is AlphaZero PUCT at
+800 simulations a move, following AlphaGo Zero rather than the released
+`pseudocode.py`; Gumbel is a seam left open for the throughput work, not what v0
+runs.
 
 ## Success
 
@@ -43,22 +46,36 @@ evaluation conditions and the training budget that produced it.
 ## Layout
 
 ```
-brokefish/nn/        the encoder: one implementation per file, same contract
+brokefish/nn/        the network: one implementation per fused kernel, same contract
 brokefish/env/       the PyTorch engine, reference implementation and oracle
-csrc/                CUDA C++: the representation, and the two kernels to come
+brokefish/search/    the MCTS, torch reference and CUDA loop
+brokefish/train/     self-play, replay buffer and the gradient phases
+brokefish/eval/      the evaluation harness
+csrc/                CUDA C++: the representation, the encoder and the search
 tests/               correctness; torch and python-chess are the oracles
 bench/               throughput, order-balanced interleaved A/B
 docs/                the specification, the roadmap and the performance ledger
 ```
 
+Everything runs from the repository root through `uv`, against the self-contained
+`.venv`. The `--no-project` is load-bearing: without it a run can turn into a
+re-resolve, and a re-resolve re-downloads roughly 3 GB of CUDA wheels.
+
 ```
-pytest tests/                    the suite
-pytest tests/ --slow --mutation  and the two opt-in ones
-python -m bench.bench_model      encoder throughput
-python -m bench.bench_env        environment throughput
-python scripts/check_cuda_build.py   the CUDA toolchain, end to end
+alias py='uv run --no-project --python .venv/bin/python'
+
+py -m pytest tests/                    the suite
+py -m pytest tests/ --slow --mutation  and the two opt-in ones
+py -m bench.bench_model                encoder throughput
+py -m bench.bench_search               the in-loop number, Gate 1a
+py -m bench.bench_env                  environment throughput
+py scripts/check_cuda_build.py         the CUDA toolchain, end to end
 ```
 
+Anything that compiles a CUDA extension also needs `PATH="$PWD/.venv/bin:$PATH"`,
+because torch shells out to `ninja --version` to decide whether ninja exists.
+
 `docs/spec.md` is the normative contract between engine and network, and it is
-frozen. `docs/roadmap.md` says what is built and what is next. `docs/perf.md`
+frozen. `docs/state.md` is the ledger: what is built, what it measured, and the
+mistakes that cost time. `docs/roadmap.md` says what is next. `docs/perf.md`
 records every measured number, including the optimisations that returned nothing.

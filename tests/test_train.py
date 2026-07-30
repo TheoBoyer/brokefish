@@ -1,0 +1,776 @@
+"""C2, the training loop: `brokefish/train/`.
+
+⚠️ **C2 is the first phase with no oracle.** Perft settled the engine, `nn/model.py`
+settled the encoder, an independently written AGZ search settled C1. Nothing external
+says whether a training loop is correct, and its failure mode is not a crash but a
+curve that is merely worse than it should have been — which is indistinguishable from
+a project whose premise was wrong. `docs/train.md` §12 is what replaces the oracle,
+and this file is most of it. Check 1 is `python -m brokefish.train.overfit`, because
+it needs minutes rather than seconds; check 8 is Track D's.
+
+The checks that carry the most weight, in order:
+
+**Check 3, the label decode.** A `u16` label is `(move, promo)` and the training path
+has to select the same logit `_expand` used to build that edge's prior. A mismatch
+permutes the target silently: the network learns a consistently shuffled labelling,
+the loss falls the whole time, and every other check here passes while it happens. So
+the training path is an independent transcription and this compares it against a
+*live* search rather than against a shared helper.
+
+**Check 6, the value parity.** Getting it backwards is a working system that plays to
+lose, and `mcts.md`'s `L >= 3` warning applies for the same reason it did there: a
+two-ply game cannot distinguish the correct rule from its inverse, so the games here
+are of odd *and* even length.
+
+**Check 9, weights propagate.** Every other check in §12 passes on a loop whose
+self-play is frozen at generation 0.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+
+import numpy as np
+import pytest
+import torch
+
+from brokefish.env import torch_impl as env
+from brokefish.nn.model import BrokefishNet
+from brokefish.search import SearchConfig, Search, make_evaluator
+from brokefish.train.buffer import RECORD, RECORD_BYTES, ReplayBuffer
+from brokefish.train.log import Logger
+from brokefish.train.loop import LR_SCHEDULE, Trainer, TrainConfig
+from brokefish.train.loss import (TrainBatch, audit_labels, az_loss, decode_labels,
+                                  edge_logits, is_promotion_edge, weight_decay_for)
+from brokefish.train.sync import PackedWeights, weight_fingerprint
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(),
+                                reason="the engine and the search are CUDA-shaped")
+
+# tests/test_search_cuda.py's maximum-mobility position: 218 legal moves for White
+# and no pawns, so the search truncates at E = 64 and the training path does not.
+MAX_MOBILITY = "R6R/3Q4/1Q4Q1/4Q3/2Q4Q/Q4Q2/pp1Q4/kBNN1KB1 w - - 0 1"
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+
+class ConstNet(torch.nn.Module):
+    """Fixed logits, so a loss test measures the loss and not the network."""
+
+    def __init__(self, policy, promo, value):
+        super().__init__()
+        self.policy = torch.nn.Parameter(policy)
+        self.promo = torch.nn.Parameter(promo)
+        self.value = torch.nn.Parameter(value)
+
+    def forward(self, boards, control, rep):
+        return self.policy, self.promo, torch.tanh(self.value)
+
+
+@torch.no_grad()
+def make_batch(n: int, seed: int = 0, plies: int = 24):
+    """`n` positions from random legal play, with a plausible synthetic target.
+
+    ⚠️ `no_grad` is load-bearing, not tidiness. The search calls the net once per
+    simulation, and with grad enabled the fp32 master weights build one autograd
+    graph across every simulation of the move — which OOM'd an 8 GB card at
+    `n = 256`. Same trap `eval/` hit at 8 games and 300 plies.
+    """
+    from tests.boards import random_positions
+
+    boards, control, rep = random_positions(n, plies=plies, seed=seed, device=DEVICE)
+    mask, in_check = env.movegen(boards, control)
+    code, _ = env.terminal(mask, in_check, control, boards)
+    live = (code == 0).nonzero(as_tuple=True)[0]
+    fill = live[torch.arange(n, device=DEVICE) % live.numel()]
+    boards, control, rep = boards[fill], control[fill], rep[fill]
+
+    gen = torch.Generator(device=DEVICE).manual_seed(seed)
+    net = BrokefishNet().to(DEVICE)
+    search = Search(SearchConfig(n=24, B=n, E=64, eps=0.0), evaluate=make_evaluator(net),
+                    env=env, device=DEVICE, seed=seed)
+    search.reset(boards, control)
+    record = search.self_play_move()
+    z = torch.randint(-1, 2, (n,), generator=gen, device=DEVICE).float()
+    k = record.policy_move.shape[1]
+    batch = TrainBatch(
+        board=record.board, control=record.control, rep=record.rep,
+        policy_move=record.policy_move, policy_prob=record.policy_prob,
+        policy_len=record.policy_len, value=z,
+        weight_gen=torch.zeros(n, dtype=torch.int32, device=DEVICE))
+    assert k <= 64
+    return batch, record, search
+
+
+def fake_record(board, control, rep, labels, probs, played, ply, done, result,
+                root_value=None):
+    """A `MoveRecord`-shaped object, for buffer tests that want a known game."""
+    from brokefish.search.torch_impl import MoveRecord
+
+    b = board.shape[0]
+    return MoveRecord(
+        board=board, control=control, rep=rep, policy_move=labels, policy_prob=probs,
+        policy_len=torch.full((b,), labels.shape[1], dtype=torch.uint8, device=DEVICE),
+        played=played, ply=ply,
+        root_value=(torch.zeros(b, device=DEVICE) if root_value is None else root_value),
+        weight_gen=0, done=done, result=result)
+
+
+def one_game(length: int, result: int, seed: int = 0):
+    """One game of `length` plies as a stream of single-row records."""
+    boards, control = env.initial_boards(1, device=DEVICE)
+    rows = []
+    for t in range(length):
+        done = torch.tensor([t == length - 1], device=DEVICE)
+        rows.append(fake_record(
+            boards.clone(), control.clone(),
+            torch.zeros(1, dtype=torch.uint8, device=DEVICE),
+            torch.full((1, 4), t + 1, dtype=torch.int16, device=DEVICE),
+            torch.full((1, 4), 0.25, dtype=torch.float16, device=DEVICE),
+            torch.zeros(1, dtype=torch.int16, device=DEVICE),
+            torch.tensor([t], dtype=torch.int32, device=DEVICE),
+            done, torch.tensor([result if t == length - 1 else 0],
+                               dtype=torch.int8, device=DEVICE)))
+    return rows
+
+
+# --------------------------------------------------------------------------- #
+# §3, the loss — check 2
+# --------------------------------------------------------------------------- #
+
+def test_loss_matches_a_scalar_transcription_of_the_paper():
+    """§12 check 2: the AZ formula read directly, in double, one sample at a time.
+
+    The same method `test_search.py` used on `ucb_score`. The point is that the
+    tensor version and the formula are written from different ends: this one loops,
+    normalises by hand, and never touches `log_softmax`.
+    """
+    batch, _, _ = make_batch(16, seed=3)
+    n = len(batch)
+    torch.manual_seed(0)
+    net = ConstNet(torch.randn(n, 32, 64, device=DEVICE),
+                   torch.randn(n, 32, 4, device=DEVICE),
+                   torch.randn(n, device=DEVICE))
+    parts = az_loss(net, batch)
+
+    # The reference decodes the labels itself, in python, from the raw heads — it
+    # shares no helper with the loss, which is the point.
+    policy = net.policy.detach().double().cpu()
+    promo = net.promo.detach().double().cpu()
+    board = batch.board.cpu()
+    control = batch.control.cpu()
+    labels = batch.policy_move.cpu()
+    v = torch.tanh(net.value).double().cpu()
+    z = batch.value.double().cpu()
+
+    def edge_logit(i, label):
+        move, k = int(label) & 0x7FF, (int(label) >> 11) & 0b11
+        slot, sq = move // 64, move % 64
+        word = int(board[i, slot]) & 0xFFFF
+        out = float(policy[i, slot, sq])
+        promotes = (((word >> 6) & 7) == 0 and ((word >> 11) & 1) == 0
+                    and sq // 8 == (0 if int(control[i]) < 0 else 7))
+        if promotes:
+            row = [float(promo[i, slot, t]) for t in range(4)]
+            top = max(row)
+            out += row[k] - top - math.log(sum(math.exp(x - top) for x in row))
+        return out
+
+    policy_ref, value_ref = 0.0, 0.0
+    for i in range(n):
+        k = int(batch.policy_len[i])
+        # The denominator is the record's own support, and nothing else.
+        logits = [edge_logit(i, labels[i, j]) for j in range(k)]
+        top = max(logits)
+        denom = sum(math.exp(x - top) for x in logits)
+        pi = [float(batch.policy_prob[i, j]) for j in range(k)]
+        total = sum(pi)
+        for j in range(k):
+            policy_ref -= (pi[j] / total) * (logits[j] - top - math.log(denom))
+        value_ref += (float(z[i]) - float(v[i])) ** 2
+    policy_ref /= n
+    value_ref /= n
+
+    assert float(parts.policy) == pytest.approx(policy_ref, rel=1e-5, abs=1e-6)
+    assert float(parts.value) == pytest.approx(value_ref, rel=1e-6, abs=1e-7)
+    assert float(parts.total) == pytest.approx(policy_ref + value_ref, rel=1e-6)
+
+
+def test_kl_is_the_cross_entropy_minus_the_targets_own_entropy():
+    """§3.2. The two have identical gradients and differ by a stored constant."""
+    batch, _, _ = make_batch(16, seed=4)
+    torch.manual_seed(1)
+    net = ConstNet(torch.randn(16, 32, 64, device=DEVICE),
+                   torch.randn(16, 32, 4, device=DEVICE),
+                   torch.randn(16, device=DEVICE))
+    parts = az_loss(net, batch)
+    assert float(parts.kl) == pytest.approx(float(parts.policy) - float(parts.entropy),
+                                            rel=1e-6)
+    assert float(parts.entropy) > 0.0
+    assert float(parts.kl) >= -1e-5, "KL against a normalised target cannot be negative"
+
+
+def test_a_perfectly_fitted_policy_has_zero_kl_and_a_positive_cross_entropy():
+    """§3.2's reason for logging both: the CE floor is `H(pi)` and varies by batch.
+
+    Sharper now than it could be against a recomputed legality mask: the denominator
+    is exactly the stored support, so logits equal to `log pi` on that support give a
+    softmax equal to `pi` and the KL is zero to floating point, not to a tolerance
+    that absorbed a `-30` filler.
+    """
+    batch, _, _ = make_batch(8, seed=5)
+    slot, square, _ = decode_labels(batch.policy_move)
+    k = batch.policy_move.shape[1]
+    valid = torch.arange(k, device=DEVICE)[None, :] < batch.policy_len.long()[:, None]
+    assert not bool(is_promotion_edge(batch.board, batch.control, slot, square).any()), \
+        "this rig zeroes the promo head, so it needs a promotion-free batch"
+
+    pi = torch.where(valid, batch.policy_prob.float(), torch.zeros(1, device=DEVICE))
+    pi = pi / pi.sum(-1, keepdim=True)
+    policy = torch.full((8, 32, 64), -30.0, device=DEVICE)
+    for i in range(8):
+        for j in range(int(batch.policy_len[i])):
+            # ⚠️ `pi` is zero on the edges the search never visited, and they are in
+            # the support now — so a perfect fit puts them at -60, not at `log 0`.
+            p = float(pi[i, j])
+            policy[i, slot[i, j], square[i, j]] = math.log(p) if p > 0 else -60.0
+    net = ConstNet(policy, torch.zeros(8, 32, 4, device=DEVICE),
+                   torch.zeros(8, device=DEVICE))
+    parts = az_loss(net, batch)
+    assert float(parts.kl) < 1e-5
+    assert float(parts.policy) == pytest.approx(float(parts.entropy), abs=1e-5)
+    assert float(parts.entropy) > 0.1
+
+
+def _accumulated_grad(net, batch, micro: int) -> torch.Tensor:
+    net.zero_grad(set_to_none=True)
+    n = len(batch)
+    for i in range(n // micro):
+        mb = batch.slice(i * micro, (i + 1) * micro)
+        (az_loss(net, mb).total * (len(mb) / n)).backward()
+    return torch.cat([p.grad.detach().reshape(-1) for p in net.parameters()])
+
+
+def test_gradient_accumulation_is_exact_in_double():
+    """§7.2: four micro-batches against one whole batch, in float64.
+
+    Not an approximation — the network is pre-norm LayerNorm with no batch
+    statistics anywhere, so every per-sample activation is independent of batch
+    composition and four means scaled by 1/4 sum to the mean over the whole. This is
+    what lets AZ's learning rate schedule transfer unchanged instead of needing a
+    rescaling we would have had to invent, so it is worth proving rather than
+    approximating.
+
+    ⚠️ In double, because the claim is an *identity*. In fp32 the same comparison
+    lands at 1e-4 to 1e-6 relative and moves between runs, since a matmul at N and a
+    matmul at N/4 select different cuBLAS split-k reductions — see the fp32 test
+    below, which is the loose one on purpose.
+    """
+    batch, _, _ = make_batch(32, seed=6)
+    net = BrokefishNet().to(DEVICE).double()
+    whole = _accumulated_grad(net, batch, 32)
+    for micro in (8, 16):
+        split = _accumulated_grad(net, batch, micro)
+        rel = float((whole - split).norm() / whole.norm())
+        assert rel < 1e-11, f"{32 // micro} x {micro}: relative difference {rel:.3e}"
+
+
+def test_gradient_accumulation_holds_in_the_precision_it_actually_runs_at():
+    """The same identity in fp32, at the tolerance the hardware allows.
+
+    The tolerance is loose and the reason is named: the difference is kernel
+    selection, not algebra. What is checked tightly is that re-running the *same*
+    split reproduces bit for bit, which is what says the 1/N scaling is right rather
+    than accidentally close.
+    """
+    batch, _, _ = make_batch(64, seed=6)
+    net = BrokefishNet().to(DEVICE)
+    whole = _accumulated_grad(net, batch, 64)
+    assert float((whole - _accumulated_grad(net, batch, 64)).abs().max()) == 0.0
+    for micro in (16, 32):
+        split = _accumulated_grad(net, batch, micro)
+        rel = float((whole - split).norm() / whole.norm())
+        assert rel < 1e-3, f"{64 // micro} x {micro}: relative difference {rel:.3e}"
+
+
+def test_the_l2_constant_reaches_the_optimiser_doubled():
+    """AGZ writes `c||theta||^2` with no half, so its gradient is `2 c theta`.
+
+    ⚠️ torch's `weight_decay=w` adds `w theta`. Passing `c` straight through halves
+    the regularisation the paper specifies, and nothing else in §12 would catch it.
+    """
+    assert weight_decay_for(1e-4) == 2e-4
+    net = BrokefishNet().to(DEVICE)
+    opt = torch.optim.SGD(net.parameters(), lr=1.0, momentum=0.0,
+                          weight_decay=weight_decay_for(1e-4))
+    p = next(iter(net.parameters()))
+    before = p.detach().clone()
+    net.zero_grad(set_to_none=True)
+    for q in net.parameters():
+        q.grad = torch.zeros_like(q)
+    opt.step()
+    # theta <- theta - lr * 2c * theta
+    assert torch.allclose(p.detach(), before * (1.0 - 2e-4), atol=1e-9)
+
+
+# --------------------------------------------------------------------------- #
+# §3.4, the label decode — check 3
+# --------------------------------------------------------------------------- #
+
+def test_the_label_decode_agrees_with_a_live_search():
+    """§12 check 3, the most important one in C2.
+
+    For every root edge the search built, the logit the *training* path selects for
+    that edge's stored label must be the scalar `expand` used to build the edge's
+    prior. Compared as priors rather than as logits, because that is what `_expand`
+    stores; the tolerance is fp16's, since `edge_prior` is fp16.
+    """
+    net = BrokefishNet().to(DEVICE)
+    boards, control, _ = _positions(24, seed=7)
+    search = Search(SearchConfig(n=8, B=24, E=64, eps=0.0), evaluate=make_evaluator(net),
+                    env=env, device=DEVICE, seed=7)
+    search.reset(boards, control)
+    search.root_init()
+
+    policy, promo, _ = net(search.game_board, search.game_control, search.root_rep)
+    ne = search.node_nedges[:, 0].long()
+    valid = torch.arange(64, device=DEVICE)[None, :] < ne[:, None]
+    logit = edge_logits(policy, promo, search.game_board, search.game_control,
+                        search.edge_move[:, 0])
+    got = torch.log_softmax(
+        torch.where(valid, logit, torch.full_like(logit, float("-inf"))), -1).exp()
+    want = search.edge_prior[:, 0].float()
+    assert bool((ne > 0).all())
+    assert float((got - want).abs()[valid].max()) < 2e-4
+
+
+def test_the_record_carries_the_searchs_own_support():
+    """§3.5: `policy_len` is the root's **edge** count, not its visit count.
+
+    This is what lets the loss stop recomputing `movegen`, and it is the difference
+    that would silently shrink the softmax denominator if it regressed — every loss
+    value a visit-count support produces still looks reasonable.
+    """
+    net = BrokefishNet().to(DEVICE)
+    boards, control, _ = _positions(16, seed=12)
+    # `n` well below the edge count, so visited and valid genuinely differ.
+    search = Search(SearchConfig(n=8, B=16, E=64, eps=0.0), evaluate=make_evaluator(net),
+                    env=env, device=DEVICE, seed=12)
+    search.reset(boards, control)
+    with torch.no_grad():
+        record = search.self_play_move()
+
+    n_edges = search.node_nedges[:, 0].long()
+    visited = (search.edge_N[:, 0] > 0).sum(-1)
+    assert bool((record.policy_len.long() == n_edges).all()), \
+        "policy_len must be the edge count"
+    assert bool((visited < n_edges).any()), "no unvisited edge in the batch, test is blind"
+    # The stored labels are the search's edge array, in order, and the unvisited ones
+    # carry pi = 0 rather than being dropped.
+    for row in range(16):
+        k = int(n_edges[row])
+        assert record.policy_move[row, :k].tolist() == \
+            search.edge_move[row, 0, :k].tolist()
+        assert float(record.policy_prob[row, :k].float().sum()) == pytest.approx(1.0, abs=2e-3)
+        assert float(record.policy_prob[row, k:].abs().max()) == 0.0
+
+
+def test_a_truncated_position_stores_exactly_the_64_edges_it_searched():
+    """The truncation question, dissolved rather than answered.
+
+    On a position with 218 legal moves the search keeps 64. The record now carries
+    those 64, so the training denominator *is* the search's support — no recomputed
+    top-64, no dependence on which weights truncated. `audit_labels` still confirms
+    every one of them is legal.
+    """
+    boards, control = env.from_fen(MAX_MOBILITY)
+    boards, control = boards.to(DEVICE), control.to(DEVICE)
+    n_legal = int(env.bitset_to_bool(env.movegen(boards, control)[0]).sum())
+    assert n_legal > 64, f"only {n_legal} legal moves, nothing to truncate"
+
+    net = BrokefishNet().to(DEVICE)
+    search = Search(SearchConfig(n=96, B=1, E=64, eps=0.0), evaluate=make_evaluator(net),
+                    env=env, device=DEVICE, seed=8)
+    search.reset(boards, control)
+    with torch.no_grad():
+        record = search.self_play_move()
+    assert int(search.node_nedges[0, 0]) == 64, "the search did not truncate"
+    assert int(record.policy_len[0]) == 64
+    assert record.policy_move[0].tolist() == search.edge_move[0, 0].tolist()
+
+    batch = TrainBatch(
+        board=record.board, control=record.control, rep=record.rep,
+        policy_move=record.policy_move, policy_prob=record.policy_prob,
+        policy_len=record.policy_len,
+        value=torch.zeros(1, device=DEVICE),
+        weight_gen=torch.zeros(1, dtype=torch.int32, device=DEVICE))
+    assert audit_labels(batch, env) == 0
+    az_loss(net, batch, strict=True)
+
+
+def test_the_audit_catches_a_label_that_is_not_legal_here():
+    """§12 check 3's engine-side half, which the loss itself no longer performs.
+
+    ⚠️ It catches an *illegal* label, not a *permuted* one: a permutation of a
+    position's own edges is still legal and still trains a shuffled target. Only
+    `test_the_label_decode_agrees_with_a_live_search` above settles that, which is
+    why that one and not this one is the important check.
+    """
+    batch, _, _ = make_batch(8, seed=9)
+    assert audit_labels(batch, env) == 0
+    az_loss(net := BrokefishNet().to(DEVICE), batch, strict=True)
+
+    poisoned = batch.slice(0, 8)
+    moves = poisoned.policy_move.clone()
+    moves[3, 0] = 31 * 64 + 0        # the black king onto a1, from a white position
+    poisoned.policy_move = moves
+    with pytest.raises(AssertionError, match="check 3"):
+        audit_labels(poisoned, env)
+
+    # And a record whose moving slot is a captured piece fails without the engine.
+    dead = batch.slice(0, 8)
+    board = dead.board.clone()
+    slot, _, _ = decode_labels(dead.policy_move)
+    board[2, slot[2, 0]] = 1 << 11   # spec §2.1's captured word
+    dead.board = board
+    with pytest.raises(AssertionError, match="check 3"):
+        az_loss(net, dead, strict=True)
+
+
+def _positions(n: int, seed: int, plies: int = 24):
+    from tests.boards import random_positions
+
+    boards, control, rep = random_positions(n, plies=plies, seed=seed, device=DEVICE)
+    mask, in_check = env.movegen(boards, control)
+    code, _ = env.terminal(mask, in_check, control, boards)
+    live = (code == 0).nonzero(as_tuple=True)[0]
+    fill = live[torch.arange(n, device=DEVICE) % live.numel()]
+    return boards[fill].contiguous(), control[fill].contiguous(), rep[fill].contiguous()
+
+
+# --------------------------------------------------------------------------- #
+# §4 and §5, the buffer — checks 5 and 6
+# --------------------------------------------------------------------------- #
+
+def test_the_record_is_334_bytes_and_round_trips():
+    assert RECORD_BYTES == 334
+    assert RECORD.itemsize == 334
+    buf = ReplayBuffer(window_games=8, mean_plies=8, seed=0)
+    rows = one_game(3, result=1)
+    for r in rows:
+        buf.append(r)
+    assert buf.n_records == 3
+    # Read the store directly: `sample` draws with replacement, so it is the wrong
+    # instrument for "every record arrived".
+    assert set(np.array(buf.data[:3]["policy_move"])[:, :4].flatten()) == {1, 2, 3}
+    batch = buf.sample(3, device=DEVICE)
+    assert batch.board.shape == (3, 32) and batch.board.dtype is torch.int16
+    assert batch.policy_move.shape == (3, 64)
+    assert batch.policy_prob.dtype is torch.float16
+    assert batch.value.dtype is torch.float32
+
+
+@pytest.mark.parametrize("length,result", [(3, 1), (4, 1), (5, -1), (6, 0)])
+def test_value_parity_on_a_hand_built_game(length, result):
+    """§12 check 6, at odd *and* even length.
+
+    `MoveRecord.result` is from the *new* mover's point of view after the move was
+    played, and the record's own position has the *previous* mover to move, so
+    `z(i) = r if (L - i) is even else -r`. ⚠️ `mcts.md`'s `L >= 3` warning applies:
+    at two plies the correct rule and its inverse agree on both records.
+    """
+    assert length >= 3
+    buf = ReplayBuffer(window_games=4, mean_plies=16, seed=0)
+    for r in one_game(length, result=result):
+        buf.append(r)
+    assert buf.n_records == length
+    got = np.array(buf.data[:length]["value"])
+    want = np.array([result if (length - i) % 2 == 0 else -result
+                     for i in range(length)], dtype=np.float32)
+    assert np.array_equal(got, want), f"{got} != {want}"
+    if result == 0:
+        assert not got.any(), "a draw is zero regardless of parity"
+
+
+def test_the_inverted_parity_would_be_caught():
+    """The test above is only worth what its ability to fail is worth."""
+    length, result = 5, 1
+    correct = [result if (length - i) % 2 == 0 else -result for i in range(length)]
+    inverted = [result if i % 2 == 0 else -result for i in range(length)]
+    assert correct != inverted
+
+
+def test_no_record_is_sampleable_before_its_game_ends():
+    """§5.3. The incomplete population lives outside the mapping, not inside it
+    with a flag, which makes this structural rather than asserted."""
+    buf = ReplayBuffer(window_games=4, mean_plies=16, seed=0)
+    rows = one_game(5, result=1)
+    for i, r in enumerate(rows[:-1]):
+        buf.append(r)
+        assert buf.n_records == 0
+        assert buf.pending_records == i + 1
+    buf.append(rows[-1])
+    assert buf.n_records == 5 and buf.pending_records == 0
+
+
+def test_eviction_is_by_game_and_the_window_holds():
+    """§12 check 5: occupancy never exceeds the window, and blocks stay whole."""
+    buf = ReplayBuffer(window_games=3, mean_plies=8, seed=0)
+    lengths = [4, 5, 3, 6, 4]
+    for j, length in enumerate(lengths):
+        for r in one_game(length, result=1, seed=j):
+            buf.append(r)
+        buf.check()
+        assert buf.n_games <= 3
+    assert buf.n_games == 3
+    assert buf.n_records == sum(lengths[-3:])
+    assert buf.evicted_games == 2
+
+
+def test_the_buffer_survives_a_wraparound():
+    """A game's block may straddle the end of the ring; reads are modular."""
+    buf = ReplayBuffer(window_games=100, mean_plies=1, capacity_records=11, seed=0)
+    for j in range(6):
+        for r in one_game(4, result=1, seed=j):
+            buf.append(r)
+        buf.check()
+    assert buf.capacity_evictions > 0, "the capacity bound never bound"
+    assert buf.n_records <= 11
+    batch = buf.sample(buf.n_records, device=DEVICE)
+    assert int(batch.board.shape[0]) == buf.n_records
+
+
+def test_the_buffer_snapshot_round_trips(tmp_path):
+    buf = ReplayBuffer(str(tmp_path / "r.dat"), window_games=8, mean_plies=8, seed=0)
+    for j in range(3):
+        for r in one_game(4, result=1, seed=j):
+            buf.append(r)
+    for r in one_game(6, result=-1)[:3]:      # a game left in flight
+        buf.append(r)
+    assert buf.pending_records == 3
+    buf.save(str(tmp_path / "meta.npz"))
+
+    again = ReplayBuffer(str(tmp_path / "r.dat"), window_games=8, mean_plies=8,
+                         seed=0, resume=True)
+    again.open_games(1)
+    again.load(str(tmp_path / "meta.npz"))
+    assert (again.n_games, again.n_records) == (buf.n_games, buf.n_records)
+    assert again.pending_records == 3
+    again.check()
+    # ⚠️ A restored game's pending records come back as one block, not one entry
+    # per ply, so anything that counts them by list length gets the parity wrong.
+    for r in one_game(6, result=-1)[3:]:
+        again.append(r)
+    assert again.n_records == buf.n_records + 6
+    tail = np.array(again.data[(again.head + buf.n_records) % again.capacity:][:6]["value"])
+    assert np.array_equal(tail, np.array([-1, 1, -1, 1, -1, 1], dtype=np.float32))
+
+
+# --------------------------------------------------------------------------- #
+# §6, the cadence
+# --------------------------------------------------------------------------- #
+
+def test_the_carry_makes_the_long_run_ratio_exact():
+    """§6: 65.2 positions sampled per game generated, whatever the phase size."""
+    cfg = TrainConfig(samples_per_game=65.2, batch=4096)
+    obj = object.__new__(Trainer)
+    obj.cfg = cfg
+    obj.carry = 0.0
+    obj.samples_dropped_filling = 0.0
+    obj.buffer = type("B", (), {"n_records": 10 ** 9})()
+    total_steps, total_games = 0, 0
+    for _ in range(500):
+        total_games += 37
+        total_steps += Trainer.steps_owed(obj, 37)
+    # The carry is the whole point: what is exact is samples-owed, not samples-taken,
+    # and the difference is bounded by one batch however the phases are sized.
+    assert total_steps * cfg.batch + obj.carry == pytest.approx(65.2 * total_games)
+    assert 0.0 <= obj.carry < cfg.batch
+    ratio = total_steps * cfg.batch / total_games
+    assert 65.2 - cfg.batch / total_games <= ratio <= 65.2
+
+
+def test_no_gradient_step_before_the_buffer_holds_one_batch():
+    """§5.5, and the carry is dropped rather than banked while it fills."""
+    cfg = TrainConfig(samples_per_game=65.2, batch=4096)
+    obj = object.__new__(Trainer)
+    obj.cfg = cfg
+    obj.carry = 0.0
+    obj.samples_dropped_filling = 0.0
+    obj.buffer = type("B", (), {"n_records": 10})()
+    assert Trainer.steps_owed(obj, 1000) == 0
+    assert obj.carry == 0.0
+    assert obj.samples_dropped_filling > 0.0
+
+
+def test_the_learning_rate_schedule_is_the_paper_s_four_values():
+    """§7.3. Three drops, matching AZ p.14's prose, at AZ's four values."""
+    cfg = TrainConfig(total_steps=700_000, lr_schedule=LR_SCHEDULE)
+    assert [v for _, v in LR_SCHEDULE] == [0.2, 0.02, 0.002, 0.0002]
+    assert cfg.lr_at(0) == 0.2
+    assert cfg.lr_at(99_999) == 0.2
+    assert cfg.lr_at(100_000) == 0.02
+    assert cfg.lr_at(299_999) == 0.02
+    assert cfg.lr_at(300_000) == 0.002
+    assert cfg.lr_at(500_000) == 0.0002
+    assert cfg.lr_at(10 ** 9) == 0.0002
+
+
+# --------------------------------------------------------------------------- #
+# §8.1, weight synchronisation — check 9
+# --------------------------------------------------------------------------- #
+
+def test_the_fingerprint_moves_when_any_single_weight_does():
+    net = BrokefishNet().to(DEVICE)
+    before = weight_fingerprint(net)
+    assert weight_fingerprint(net) == before, "the fingerprint is not deterministic"
+    with torch.no_grad():
+        net.policy.weight[3, 7] += 1e-4
+    assert weight_fingerprint(net) != before
+
+
+def test_the_fingerprint_sees_a_permutation_of_the_same_values():
+    """Which is the failure being guarded against: `pack_b` on the wrong tensor."""
+    net = BrokefishNet().to(DEVICE)
+    before = weight_fingerprint(net)
+    with torch.no_grad():
+        net.policy.weight.copy_(net.policy.weight.flip(0))
+    assert weight_fingerprint(net) != before
+
+
+def test_a_stale_packed_snapshot_raises_rather_than_self_playing():
+    """§8.1. A snapshot built once is a working system that never learns."""
+    net = BrokefishNet().to(DEVICE)
+    packed = PackedWeights.pack(net, weight_gen=0)
+    packed.assert_current(net, 0)
+    with pytest.raises(AssertionError, match="§8.1"):
+        packed.assert_current(net, 1)
+    with torch.no_grad():
+        net.policy.weight[0, 0] += 0.5
+    with pytest.raises(AssertionError, match="fingerprint"):
+        packed.assert_current(net, 0)
+
+
+@pytest.mark.slow
+def test_weights_propagate_to_the_fused_encoder(tmp_path):
+    """§12 check 9. Every other check here passes on a loop frozen at generation 0."""
+    trainer = _smoke_trainer(tmp_path, "propagate")
+    out = trainer.check_weights_propagate()
+    assert out["moved"] > 1e-3
+    assert out["agree"] < 3e-2
+    trainer.log.close()
+
+
+# --------------------------------------------------------------------------- #
+# §9, checkpoint and resume — check 4
+# --------------------------------------------------------------------------- #
+
+def _smoke_trainer(tmp_path, run: str, **kw):
+    defaults = dict(
+        n_sims=8, batch_games=16, moves_per_phase=2, window_games=64, mean_plies=32,
+        max_plies=40, batch=8, micro_batch=4, total_steps=50, buffer_in_memory=True,
+        collect_search_stats=False, checkpoint_every=10 ** 9,
+        buffer_snapshot_every=10 ** 9)
+    cfg = TrainConfig(**{**defaults, **kw})
+    logger = Logger(run, log_dir=str(tmp_path), use_wandb=False)
+    return Trainer(cfg, run=run, logger=logger, log_dir=str(tmp_path))
+
+
+@pytest.mark.slow
+def test_resume_is_bit_exact(tmp_path):
+    """§9, and §12 check 4.
+
+    Checkpoint at `k`, continue to `k + steps`; then resume from `k` and run the same
+    steps. The two weight tensors must be identical. This is one of the few checks in
+    C2 with a definite right answer, and it catches the whole class of "something in
+    the loop is not in the checkpoint" bugs, which otherwise appear weeks later as an
+    unexplained kink in the Elo curve.
+    """
+    trainer = _smoke_trainer(tmp_path, "resume")
+    while trainer.buffer.n_records < 8 * 4:
+        trainer.self_play_phase()
+    ckpt = str(tmp_path / "k.pt")
+    trainer.save_checkpoint(ckpt, with_buffer=True)
+    for _ in range(6):
+        trainer.train_step()
+    straight = weight_fingerprint(trainer.net)
+    trainer.log.close()
+
+    again = _smoke_trainer(tmp_path, "resume2")
+    again.load_checkpoint(ckpt)
+    for _ in range(6):
+        again.train_step()
+    assert weight_fingerprint(again.net) == straight
+    again.log.close()
+
+
+def test_a_config_change_refuses_to_resume(tmp_path):
+    trainer = _smoke_trainer(tmp_path, "cfg")
+    ckpt = str(tmp_path / "c.pt")
+    trainer.save_checkpoint(ckpt)
+    trainer.log.close()
+    other = _smoke_trainer(tmp_path, "cfg2", momentum=0.5)
+    with pytest.raises(RuntimeError, match="hybrid run"):
+        other.load_checkpoint(ckpt)
+    other.load_checkpoint(ckpt, allow_config_change=True)
+    other.log.close()
+
+
+def test_the_checkpoint_carries_everything_section_9_lists(tmp_path):
+    trainer = _smoke_trainer(tmp_path, "state")
+    state = trainer.state_dict()
+    for key in ("net", "opt", "step", "weight_gen", "carry", "games_completed",
+                "positions_generated", "samples_drawn", "lr", "fingerprint",
+                "seconds", "euros_per_hour", "search_rng", "torch_rng",
+                "torch_cuda_rng", "games", "config_hash"):
+        assert key in state, f"§9 lists {key} and the checkpoint does not carry it"
+    # The tree is rebuilt from scratch every move, so the games are the whole of
+    # self-play's state and there is nothing else to store.
+    assert set(state["games"]) == {
+        "game_board", "game_control", "game_hash", "game_ring", "game_ring_len",
+        "game_ply", "game_done", "game_result"}
+    trainer.log.close()
+
+
+# --------------------------------------------------------------------------- #
+# §5.4 and §8, the loop
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.slow
+def test_the_game_length_cap_closes_a_game_as_a_draw(tmp_path):
+    """§5.4: 512 plies, scored drawn, counted as a completed game.
+
+    ⚠️ A game that never terminates leaks its whole pending list, which is the only
+    reason the cap exists. Here it is set to 6 plies so it fires immediately.
+    """
+    trainer = _smoke_trainer(tmp_path, "cap", max_plies=6)
+    for _ in range(4):
+        trainer.self_play_phase()
+    assert trainer.games_capped > 0
+    assert trainer.buffer.n_games > 0
+    values = np.array(trainer.buffer.data[:trainer.buffer.n_records]["value"])
+    assert (values == 0).any(), "a capped game must be scored as a draw"
+    assert trainer.buffer.stats().mean_game_length <= 6
+    trainer.log.close()
+
+
+@pytest.mark.slow
+def test_a_generation_trains_and_republishes_the_weights(tmp_path):
+    """§8 end to end: self-play, cadence, gradient phase, new generation."""
+    trainer = _smoke_trainer(tmp_path, "gen")
+    while trainer.buffer.n_records < 8:
+        trainer.self_play_phase()
+    before = weight_fingerprint(trainer.net)
+    gen_before = trainer.packed.weight_gen
+    trainer.gradient_phase(2)
+    assert trainer.step == 2
+    assert weight_fingerprint(trainer.net) != before
+    assert trainer.packed.weight_gen == gen_before + 1
+    assert trainer.packed.fingerprint == weight_fingerprint(trainer.net)
+    trainer.packed.assert_current(trainer.net, trainer.weight_gen)
+    assert trainer.training_seconds > 0.0
+    trainer.log.close()

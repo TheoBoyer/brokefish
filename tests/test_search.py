@@ -424,7 +424,7 @@ def test_record_schema():
     s = make(n=32, B=3, E=64)
     with torch.no_grad():
         rec = s.self_play_move()
-    K = min(s.config.E, s.config.n)
+    K = s.config.E   # §10 stores the whole edge set, not only the visited edges
     assert rec.board.shape == (3, 32) and rec.board.dtype == torch.int16
     assert rec.policy_move.shape == (3, K) and rec.policy_prob.shape == (3, K)
     assert rec.rep.dtype == torch.uint8 and int(rec.rep.max()) <= 2

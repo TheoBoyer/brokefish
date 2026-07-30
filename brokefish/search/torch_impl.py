@@ -91,6 +91,13 @@ class MoveRecord:
 
     One row per game. ``done`` and ``result`` are what let the caller close out
     the pending records of a game that just finished.
+
+    ``root_value`` is §10's reserved field, written and trained on by nothing
+    (`train.md` §4). It is the **search's** value of the root — the visit-weighted
+    mean of the root edges' ``Q``, which is the improved estimate a KataGo-style
+    bootstrapped target would mix into ``z``, not the raw network evaluation the
+    root started from. Stored in ``[-1, 1]`` so it is directly comparable with the
+    game outcome, while the tree itself works in ``[0, 1]`` (§3.5).
     """
 
     board: torch.Tensor        # [B, 32] int16
@@ -101,6 +108,7 @@ class MoveRecord:
     policy_len: torch.Tensor   # [B]     uint8
     played: torch.Tensor       # [B]     int16, the edge label actually played
     ply: torch.Tensor          # [B]     int32, the ply this record sits at
+    root_value: torch.Tensor   # [B]     float32, §10's reserved field, see below
     weight_gen: int
     done: torch.Tensor         # [B]     bool
     result: torch.Tensor       # [B]     int8, from the new mover's point of view
@@ -641,7 +649,10 @@ class Search:
         """Pick the move from the root visit counts, play it, and emit the record."""
         c = self.config
         b = self._b
-        K = min(c.E, c.n)
+        # `E`, not `min(E, n)`. §10 stores the root's **whole edge set**, not only the
+        # edges a simulation happened to reach, so the width is bounded by the edge cap
+        # rather than by the visit budget. Revised 2026-07-31; see below.
+        K = c.E
 
         nvis = self.edge_N[:, 0].to(torch.float32)
         valid = self._e[None, :] < self.node_nedges[:, 0].long()[:, None]
@@ -656,7 +667,14 @@ class Search:
         e = torch.where(self.game_ply < c.tau_plies, sampled, best)
         label = self.edge_move[b, 0, e].to(torch.int64)
 
-        keep = nvis > 0
+        # ⚠️ **Every valid edge, not only the visited ones** (revised 2026-07-31,
+        # `train.md` §3.5). An unvisited edge carries `pi = 0` and contributes nothing
+        # to the training target, but its *label* is what tells the training path which
+        # moves the softmax denominator runs over. Storing it costs nothing — the
+        # arrays are already `E` wide and the tail was zero padding — and it is what
+        # lets the loss stop recomputing `movegen` to rediscover a support the search
+        # already knew. `policy_len` is therefore the root's edge count.
+        keep = valid
         pos = keep.cumsum(-1) - 1
         rows, cols = keep.nonzero(as_tuple=True)
         policy_move = torch.zeros((c.B, K), dtype=torch.int16, device=self.device)
@@ -664,11 +682,17 @@ class Search:
         policy_move[rows, pos[rows, cols]] = self.edge_move[rows, 0, cols]
         policy_prob[rows, pos[rows, cols]] = pi[rows, cols].to(torch.float16)
 
+        # §10's reserved field. `pi` is zero outside the root's own edges and
+        # `_clear_edges` zeroed `edge_Q` there, so this is the visit-weighted mean
+        # over exactly the valid edges, in [0,1], mapped to [-1,1] to match `z`.
+        root_value = (2.0 * (pi * self.edge_Q[:, 0]).sum(-1) - 1.0).float()
+
         record = MoveRecord(
             board=self.game_board.clone(), control=self.game_control.clone(),
             rep=self.root_rep.clone(), policy_move=policy_move, policy_prob=policy_prob,
             policy_len=keep.sum(-1).to(torch.uint8), played=label.to(torch.int16),
-            ply=self.game_ply.clone(), weight_gen=self.weight_gen,
+            ply=self.game_ply.clone(), root_value=root_value,
+            weight_gen=self.weight_gen,
             done=torch.zeros_like(self.game_done), result=torch.zeros_like(self.game_result))
 
         move = label & ((1 << MOVE_BITS) - 1)

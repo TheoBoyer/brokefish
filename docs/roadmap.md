@@ -387,12 +387,13 @@ Both tracks closed on 2026-07-30, so this is where the project now lives. The
 engine and the network are done, tested and measured; C1 is the only thing between
 here and a first curve point, and it is the only phase with no specification.
 
-### C1. MCTS loop, scope to be defined
+### C1. MCTS loop, specified 2026-07-30
 
-Tree pool in VRAM, Gumbel root selection with sequential halving, descent-time
-repetition detection, and integration with the three engine kernels. This phase is
-deliberately unscoped until we design it, since it is the piece with the least prior
-art in our own code.
+Specified in [`mcts.md`](mcts.md), which is normative and supersedes the
+"Gumbel root selection with sequential halving" this section used to name: v0 is
+AlphaZero PUCT at `n = 800`, and Gumbel is a named seam (§11) for the throughput
+work rather than part of the first design. The reference implementation in
+`brokefish/search/torch_impl.py` is done; the CUDA kernels are not.
 
 Gate 1a falls at the end of it: the first sustained evals/s measured inside the
 loop, with the environment live.
@@ -507,7 +508,7 @@ batch 1024 bf16 (measured, against 1.9 GB predicted), 90 MB of optimiser state a
 about 500 MB of context and allocator overhead.
 
 One place it does bind. A dense `[32,64]` fp16 policy target costs 4.2 KB per
-position and caps the replay buffer near 1M positions. Gumbel's target is dense over
+position and caps the replay buffer near 1M positions. The v0 target is dense over
 legal moves rather than over all 2048, and chess positions carry 30 to 40 of those,
 so storing the probabilities alone in the order the legality mask produces, and
 recomputing that mask from the stored board at training time, brings a position to
@@ -541,8 +542,9 @@ no written specification. That is the whole risk profile as of tonight.
   the largest block of work that can start immediately, and the preregistration it
   demands is a decision rather than code.
 * The C1 design: the tree node layout, the descent's interface to the three
-  kernels, the Gumbel schedule, and the per-game repetition ring of spec §6.3,
-  which A1 deliberately left to the search.
+  kernels and the per-game repetition ring of spec §6.3, which A1 deliberately
+  left to the search. All three are settled in [`mcts.md`](mcts.md) and built in
+  `brokefish/search/torch_impl.py`; what remains is the kernels.
 
 **Not parallelisable**: C2 against C1, since the replay buffer schema depends on
 what the search emits. C4 and C5 are GPU time and do not compress.

@@ -45,6 +45,7 @@ nav:
   - Specification: spec.md
   - Roadmap: roadmap.md
   - Engineering:
+      - Search (MCTS v0): mcts.md
       - Environment: env.md
       - Performance ledger: perf.md
   - Prior art: due_diligence.md

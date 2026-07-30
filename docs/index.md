@@ -46,7 +46,8 @@ the network's 32 piece tokens are index-aligned with the engine's 32 legality ma
 and the policy is masked by a device-side AND inside the search.
 
 The network is a transformer over those 32 tokens: `d=256`, 8 layers, 8 heads,
-6.38M parameters, roughly 400 MFLOPs per evaluation. Search is Gumbel MCTS.
+6.38M parameters, roughly 400 MFLOPs per evaluation. Search is AlphaZero PUCT at
+800 simulations a move, specified in [mcts.md](mcts.md).
 
 The hardware is one RTX 4060 Laptop with 8 GB.
 

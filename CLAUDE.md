@@ -45,7 +45,18 @@ Allowed in evaluation only: standard books (UHO/TCEC) — evaluation is measurem
   (1M params was refuted by scaling laws; AlphaGateau plateaus at ~2100 with 1M).
   With the embeddings (47,104), `norm_f` (512) and the three heads (17,664) the
   whole network is **6,383,360 params**, which is the number for the curve.
-- Search: Gumbel MCTS, n=32 sims in training, 800+ at evaluation.
+- Search: **AlphaZero PUCT, n=800**, spec `docs/mcts.md` (2026-07-30, superseding
+  the "Gumbel MCTS, n=32" that sizing had assumed). `n` is chosen for convergence
+  first; the sweep downward is where the throughput work starts, and Gumbel is a
+  named seam for it.
+  ⚠️ **The authority for the search is AlphaGo Zero (Nature 550:354-359), not the
+  AlphaZero paper and not the released `pseudocode.py`.** AZ gives no PUCT formula and
+  says its search is "identical to AlphaGo Zero"; `c_puct`'s value is published
+  nowhere, so the logarithmic form and 19652/1.25 come from an unrefereed file. The
+  pseudocode contradicts AGZ in three silent ways (un-normalised Dirichlet, a visit
+  count one too large at every interior node, a value read that maximises the
+  opponent's outcome), and AGZ has tree reuse and resignation, which v0 does not.
+  `docs/mcts.md` §1.1, §3.1a, §3.6, §3.7 and §13.
 - ~10M games × 80 plies → ~325 µs/move → **100k evals/s** wanted; ~10¹⁹ FLOPs,
   ~100-500 € spot. **The system is NN-bound, not env-bound.**
 
@@ -59,19 +70,22 @@ Jones' law (+500 Elo per 10× compute).
 ```
 brokefish/   Python package — nn/ (model.py is the whole network and the oracle;
              one file per fused implementation, selected by name through
-             `encoder_impl`), env/ (the PyTorch engine); MCTS and training will
-             land here
+             `encoder_impl`), env/ (the PyTorch engine), search/ (the MCTS);
+             training will land here
 csrc/        CUDA C++ — chess.cuh (the 12-bit representation) and encoder.cu (the
              network) are settled; movegen.cuh holds the first order, contract for
              the rest in csrc/README.md. Device tests in csrc/tests/, one nvcc line
              each, no Python and no torch
 tests/       correctness (torch is the oracle)      python -m tests.test_model
              the B2 surface, boards to logits        python -m tests.test_b2
+             the MCTS v0 reference                   python -m tests.test_search
+             it against an independent AZ oracle     python -m tests.test_oracle
+             do those tests bite?                    pytest tests/ --mutation
              boards.py generates positions by random legal play — rules only
 bench/       throughput, interleaved A/B protocol   python -m bench.bench_model
              --path full (default, B2) or backbone (reproduces perf.md rows 0-9)
-docs/        spec.md (normative engine/network contract), perf.md (ledger),
-             due_diligence.md (prior art)
+docs/        spec.md (normative engine/network contract), mcts.md (normative
+             search contract), perf.md (ledger), due_diligence.md (prior art)
 ```
 
 This is a production repository: no staging areas, no step-by-step ladders, no
@@ -240,8 +254,83 @@ tested. Exploratory kernels and learning exercises belong in a scratch directory
   engine tests print the offending position as a board plus a slot-by-slot diff, and
   `tstep.cu` **fails when a rule is uncovered** rather than passing vacuously; the
   dump is random playouts, where en passant is 39 cases out of 322 246.
-- The whole RL layer (MCTS, tree, training loop, Elo protocol, cost accounting) is
-  **untouched** — no line written, no decision frozen.
+- `docs/mcts.md` — **the normative v0 search contract**, written 2026-07-30. v0 is
+  the AlphaZero search adapted to fixed shapes: PUCT with the logarithmic
+  exploration term, Dirichlet root noise, visit counts as the policy target,
+  `n=800`, `B=4096`, `E=64` edges per node, a fresh tree per move. Faithfulness is
+  a correctness lever, since the released pseudocode is an external oracle the way
+  perft was. Gumbel is deferred, not rejected, and §11 prices it at two functions.
+  ⚠️ **Not virtual loss, and there is no seam for it.** One simulation per game per
+  step means the batch is `B` leaves from `B` trees, so there is nothing to
+  deduplicate. §3.1 has the whole argument.
+  ⚠️ `Q` is stored in **[0,1]**, not [-1,1]. PUCT *adds* the value and exploration
+  terms, so halving `Q`'s range doubles effective exploration and `pb_c_init=1.25`
+  stops meaning what the pseudocode means by it.
+  ⚠️ The backup flips by parity: `q = ((L-d) % 2 == 0) ? qleaf : 1 - qleaf`. One
+  leaf evaluation updates edges owned by players who alternate, so the flip is not
+  about the network's convention and does not disappear if the value is read from
+  the other king. Inverting it produces a search that plays the worst move.
+- `brokefish/search/torch_impl.py` — **the MCTS v0 reference, done 2026-07-30**.
+  §6 end to end: `root_init` with Dirichlet, descent, evaluate, expand, backup,
+  `select_and_advance`, the §10 record and the §15 counter block. Batched over
+  games, looped over depth and simulations. `tests/test_search.py`, 35 checks from
+  five angles, because no one of them is an oracle: §6.6 against a scalar
+  transcription of AlphaZero's `ucb_score` over 1200 random tree states and §6.1's
+  noise against the moments of `Dir(alpha)`; exact arithmetic on hand-built state;
+  forced descents over every root edge of four positions; a constant evaluator,
+  under which the tree is a function of the rules alone; and properties of chess.
+  **15 of 16 mutations killed** by `tests/test_mutation_search.py`, the survivor
+  being the designed control (`torch.argmax` happens to return the lowest index, so
+  swapping it for `_lowest_argmax` changes nothing measurable). `docs/mcts.md` §12.1
+  has the table and which mutations only one test catches.
+  ⚠️ **Test the parity at `L >= 3`.** At `L = 2` the correct `(L-d) % 2` and the
+  inverted `d % 2` agree on both levels, so a two-level test cannot see the bug it
+  was written for. The first version of that test could not.
+  ⚠️ **Whether the search reaches a node is the exploration schedule, not
+  correctness.** With FPU at 0 a mate at prior 0.017 needs `n = 800`; the same
+  position mirrored and colour-swapped has prior 0.013 and is missed at 800. Force
+  the descent (zero the other priors and their `Q`) rather than waiting for it, and
+  give the node one visit first, since at `N_v = 0` every score is 0 and §6.6 takes
+  edge 0 whatever the priors say.
+  ⚠️ A vertical mirror is **not** a chess symmetry: pawns are not mirror-symmetric,
+  so `6k1/5ppp/...` mirrored gives White an interposing promotion and stops being
+  mate. Mirror *and* swap colours. This cost an hour of chasing a bug that was in
+  the FEN.
+  Both the environment and the network are injected, so it runs over `env/torch_impl`
+  or `env/cuda_impl` and against `nn/model.py` or a fused encoder, and all four
+  combinations give the same tree — a free differential check on A1 and B2.
+  **27.4k evals/s at B=256, 36.8k at B=1024**, one move at `n=32`, both fused,
+  invariant checks off.
+  ⚠️ **That is not Gate 1a.** A Python reference with a host sync per descent level,
+  measured where trees are shallow. It says C2 can develop against this instead of
+  waiting for the kernel, and nothing about `n=800`.
+  ⚠️ The forced-mate check needs `n=800` and `eps=0`. With first-play urgency at 0
+  an unvisited edge is scored as a loss, so a mate at prior 0.017 is not reached
+  until `pb_c * P * sqrt(N_v)` clears the visited edges' `Q`, between 400 and 800
+  simulations. AlphaZero's behaviour, and §14.2's low-`n` problem in concrete form.
+  ⚠️ The Dirichlet **stream** is not reproducible across implementations yet, only
+  the construction. §12's tree-for-tree comparison has to drive both sides from the
+  same numbers or run at `eps=0`.
+- `tests/oracle.py` + `tests/test_oracle.py` — **the oracle, done 2026-07-30**: a
+  second MCTS written from the AlphaGo Zero Methods, one game at a time in objects and
+  lists, built four ways round from the reference (values per node flipped at read
+  time, the repetition window walked up the parent links, the path as node references,
+  node indices from a counter). Trees compared node for node and edge for edge on seven
+  positions; **they agree exactly at 64 and at 512 simulations**. `docs/mcts.md` §12.2.
+  ⚠️ **The evaluator has to be integer arithmetic, not the network.** The reference
+  calls the net on a batch of B and the oracle on one position, and an fp32 reduction
+  need not give the same last bit at two batch sizes. The shared evaluator is a
+  splitmix64 mix whose outputs are small integers over powers of two, exact in fp32 and
+  fp64, and it reads `rep`, which is what finally tests §7's count end to end.
+  ⚠️ **Agreement is only worth what the precision floor allows.** Measured: priors and
+  node values bit-identical, `Q` within 1e-7 (fp32 running mean vs fp64 mean), closest
+  selection margin 3.4e-6 at n=64 (34x the error) but 9e-8 at n=512, where 4 of 15014
+  selections could have been decided by rounding. The guard is self-calibrating and the
+  deep run reports the count rather than demanding zero.
+  ⚠️ **It checks faithfulness of implementation, not of reading.** Where both follow the
+  same reading of the paper, agreement proves nothing about the reading.
+- The rest of the RL layer (training loop, replay buffer, Elo protocol, cost
+  accounting) is **untouched** — no line written, no decision frozen.
 
 ## Environment
 

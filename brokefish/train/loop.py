@@ -637,7 +637,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "'torch' option, since the reference model returns fp32 and "
                         "the CUDA search reads fp16")
     p.add_argument("--no-wandb", action="store_true")
-    p.add_argument("--wandb-mode", default="offline", choices=("offline", "online"))
+    # Online is the default: wandb persists to disk first and uploads from a retrying
+    # background thread, so a dropped link stalls the sync, not the run. `offline` is
+    # for a box with no credentials — `python -m wandb sync` pushes it later.
+    p.add_argument("--wandb-mode", default="online", choices=("offline", "online"))
     p.add_argument("--nondeterministic", action="store_true",
                    help="faster, and §9's bit-exact resume no longer holds")
     p.add_argument("--smoke", action="store_true",

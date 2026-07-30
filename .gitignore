@@ -7,6 +7,11 @@ __pycache__/
 *.sqlite
 runs/
 checkpoints/
+wandb/
+# Campaign output. The three logs already tracked (gate1a, d1_*) stay tracked --
+# they are the evidence behind numbers in docs/perf.md -- because .gitignore does
+# not apply to files already in the index. Add a new one with `git add -f`.
+logs/
 data/
 .venv/
 site/

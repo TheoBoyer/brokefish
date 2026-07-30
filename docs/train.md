@@ -626,8 +626,12 @@ Both are written per curve point; neither is derived from the other.
 
 ## 11. Instrumentation
 
-wandb, offline mode by default. A run that dies because the network dropped is an
-expensive way to discover a dependency.
+wandb, **online by default** (corrected 2026-07-30 — the previous default was offline,
+justified by a failure mode that does not exist: wandb writes every record to
+`wandb/run-*/` on disk before uploading, and syncs from a background thread that
+retries, so a dropped network stalls the upload and never the run). `--wandb-mode
+offline` is for a machine with no credentials; `python -m wandb sync wandb/offline-run-*`
+pushes it afterwards. The JSONL sink is unconditional either way.
 
 **Per gradient step**: total loss, and the policy, value and L2 terms separately — a
 single scalar hides which head has stopped learning. Learning rate. Global gradient

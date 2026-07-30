@@ -1,9 +1,13 @@
 """Instrumentation, ``docs/train.md`` §11.
 
 Two sinks, and the file one is not optional. Every record goes to a JSONL file that
-survives the process, and to wandb if it is installed — offline by default, because a
-run that dies because the network dropped is an expensive way to discover a
-dependency. A human-readable ``.log`` beside it is what ``tail -f`` is pointed at.
+survives the process, and to wandb — **online by default**. A human-readable ``.log``
+beside it is what ``tail -f`` is pointed at.
+
+Online is safe: wandb writes every record to ``wandb/run-*/`` on disk first and uploads
+from a background thread that retries, so a dropped network stalls the sync, it does not
+stall or kill the run. ``--wandb-mode offline`` is for a machine with no credentials (a
+fresh rented GPU); push it afterwards with ``python -m wandb sync wandb/offline-run-*``.
 
 ⚠️ **wandb is a hard dependency of this module as of 2026-07-31** — it is installed in
 ``.venv`` and imported at the top like anything else. It is **not yet in
@@ -41,7 +45,7 @@ class Logger:
     """JSONL plus an optional wandb run. Nothing here ever raises on a logging path."""
 
     def __init__(self, run: str, log_dir: str = "logs", config: Optional[dict] = None,
-                 use_wandb: bool = True, wandb_mode: str = "offline",
+                 use_wandb: bool = True, wandb_mode: str = "online",
                  project: str = "brokefish", append: bool = False) -> None:
         os.makedirs(log_dir, exist_ok=True)
         self.run = run

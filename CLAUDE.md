@@ -62,7 +62,10 @@ Allowed in evaluation only: standard books (UHO/TCEC) — evaluation is measurem
 
 **Gate 1 (engineering)**: ≥45-50k evals/s sustained **inside a synthetic MCTS loop**
 on the 4060 → GO; <15k after real effort → NO-GO. A pure forward benchmark does not
-count. **Gate 2 (science)**: beat AlphaGateau (~2100 Elo) with an Elo slope matching
+count. **Cleared 2026-07-30, and in the real loop rather than a synthetic one:
+56 996 useful evals/s at n=800, B=4096** (`bench/bench_search.py`,
+`logs/gate1a.log`, `docs/mcts.md` §14.3).
+**Gate 2 (science)**: beat AlphaGateau (~2100 Elo) with an Elo slope matching
 Jones' law (+500 Elo per 10× compute).
 
 ## Layout
@@ -80,12 +83,16 @@ tests/       correctness (torch is the oracle)      python -m tests.test_model
              the B2 surface, boards to logits        python -m tests.test_b2
              the MCTS v0 reference                   python -m tests.test_search
              it against an independent AZ oracle     python -m tests.test_oracle
+             the CUDA search against the reference   python -m tests.test_search_cuda
              do those tests bite?                    pytest tests/ --mutation
              boards.py generates positions by random legal play — rules only
 bench/       throughput, interleaved A/B protocol   python -m bench.bench_model
              --path full (default, B2) or backbone (reproduces perf.md rows 0-9)
+             Gate 1a, the whole of §6 on device      python -m bench.bench_search
 docs/        spec.md (normative engine/network contract), mcts.md (normative
-             search contract), perf.md (ledger), due_diligence.md (prior art)
+             search contract), perf.md (ledger), due_diligence.md (prior art),
+             fidelity.md (where we may be wrong about FIDE and AlphaZero)
+logs/        campaign output, tail -f-able while it runs; gate1a.log is C1's
 ```
 
 This is a production repository: no staging areas, no step-by-step ladders, no
@@ -109,7 +116,9 @@ tested. Exploratory kernels and learning exercises belong in a scratch directory
   ⚠️ The embedding sum's **order is normative** and the CUDA gather is tested
   bit-identical, not to a tolerance: `(square + type_special + color_turn) +
   (clock + rep)`, with clock and rep per position, not per token.
-  ⚠️ `rep` has no producer until C1. It is an argument; tests synthesise it.
+  ⚠️ `rep` was an argument with no producer until C1. `csrc/search.cuh`'s descent
+  now computes it (§7) and stages it for the encoder; `tests/boards.py` still
+  synthesises one for the tests that do not run a search.
 - `brokefish/nn/cuda_impl.py` + `csrc/encoder.cu` — **the shipping kernel.
   61.6k evals/s masked on the backbone benchmark = ×3.02 over torch eager, ×1.43
   over Triton. B1 GO target (45-50k) is cleared**; 71 % of the measured fp16 mma
@@ -243,8 +252,9 @@ tested. Exploratory kernels and learning exercises belong in a scratch directory
   whole node 260.6 ms (**62.9k/s**). The founding "NN-bound, not env-bound" claim is
   now a measurement, and the old 37.7k serialisation arithmetic was wrong by 1.7×.
   ⚠️ **62.9k/s is NOT Gate 1** and must never be quoted as it. No tree: no descent,
-  no backup, no selection, no per-node traffic. It is a **ceiling** on the loop rate.
-  What Gate 1a now measures is what the tree costs, the only unmeasured term left.
+  no backup, no selection, no per-node traffic. It is a **ceiling** on the loop rate,
+  and `bench/bench_search.py` has since produced the real number, 57.0k, of which the
+  tree is 4.4 % and the card's throttling under a 57-second move is most of the rest.
 - ⚠️ **`mask.sum(-1)` is a bug, not just `> 0` and sorting.** Mask words are int64
   carrying uint64 patterns, so summing overflows: two pieces able to reach h8 give
   2 × 2⁶³ = 0. `terminal` used it and called a position with four legal replies
@@ -308,9 +318,57 @@ tested. Exploratory kernels and learning exercises belong in a scratch directory
   an unvisited edge is scored as a loss, so a mate at prior 0.017 is not reached
   until `pb_c * P * sqrt(N_v)` clears the visited edges' `Q`, between 400 and 800
   simulations. AlphaZero's behaviour, and §14.2's low-`n` problem in concrete form.
-  ⚠️ The Dirichlet **stream** is not reproducible across implementations yet, only
-  the construction. §12's tree-for-tree comparison has to drive both sides from the
-  same numbers or run at `eps=0`.
+  ⚠️ The Dirichlet **stream** is now shared: `cuda_impl` subclasses this and
+  inherits §6.1, so one seed drives both and §12's comparison runs at the real `eps`.
+- `csrc/search.cuh` + `csrc/search.cu` + `brokefish/search/cuda_impl.py`: **the CUDA
+  search, C1 closed 2026-07-30. Gate 1a: 56 996 useful evals/s at n=800, B=4096**,
+  a 4.4 % tree overhead over the encoder alone, 57.2 s per move
+  (`bench/bench_search.py`, `logs/gate1a.log`, `docs/mcts.md` §14.3). `descent` fuses
+  select, `step_full`, the repetition scan, `terminal` and the allocation into one
+  launch at **96 registers with no spill**; `expand` is 72, `backup` 20.
+  `cuda_impl.Search` subclasses the reference and replaces only the four
+  per-simulation steps, so the two share tensors and `select_and_advance`, the root
+  noise and `reset` stay in torch on purpose.
+  ⚠️ **The evaluator must return fp16 logits.** `expand` reads `policy` and `promo`
+  as fp16, which is what both fused encoders emit; `nn/model.py` keeps fp32 master
+  weights and returns fp32, and casting it in the driver would silently change the
+  numbers the reference computes in fp32. It raises instead.
+  ⚠️ **The tree reaches the kernel as a dict keyed by name, rebuilt once per move.**
+  `env.push_history` is a pure function and returns a *new* ring, so a dict built once
+  in the constructor points at the ring that stopped being updated after move 0. The
+  symptom was a repetition count too low three moves and eight thousand simulations
+  later. `_check_tree_is_current` turns any future rebinding into a loud failure.
+  ⚠️ `edge_prior` is **not** bit-identical to the reference: the kernel's softmax
+  denominator is a warp reduction over ≤64 survivors and torch's is over the
+  8192-wide masked row, so they differ by one fp16 ULP on about one edge in a
+  hundred. Everything else, `edge_Q` and `node_value` included, is exact.
+  `docs/mcts.md` §12.3 has the margin table and which runs are guaranteed rather
+  than empirical.
+  ⚠️ `E = 64` is compile-time (§6.6's scan is two edges per lane), `B` and `Nmax`
+  runtime. Changing `E` means editing `kE` in `csrc/search.cuh`.
+  ⚠️ **The card throttles harder here than in any earlier benchmark**: 1230-1290 MHz
+  at 82 °C through a 57-second move, so the same encoder call reads 59.9k inside the
+  loop against the 64.1k `docs/perf.md` quotes. Every absolute number in that file is
+  an upper bound on what the kernel does inside a generation, by about 6.7 %.
+- `tests/test_search_cuda.py`: **the kernels against the reference, 19 checks**.
+  both implementations from one seed, every array of §4.2 compared after **every**
+  simulation, up to one move at `n=800` over 462 720 selections. Coverage the start
+  position cannot reach gets its own run: the fifty-move boundary, a threefold from
+  the game ring, checkmate and insufficient material 300 plies in, 218 legal moves for
+  truncation, 189 promotion edges, and a 45-ply path so §7's scan loops twice per lane.
+  `csrc/tests/tselect.cu` pins the PUCT scan and the canonical enumeration on their
+  own against a host reference in double.
+  ⚠️ The bit-exact test needs **pawnless positions**. Constant logits make every prior
+  an exact `1/k`, but a promotion edge picks up `log_softmax` of four equal numbers,
+  which is `-log 4` and not zero.
+  ⚠️ An untouched node-pool slot is all zeros, which decodes as **a live white pawn on
+  a1**. Any scan over the pool has to stop at each game's own `node_count`, not at the
+  batch maximum.
+  ⚠️ **The root's priors are fp16-quantised twice**, by the kernel and again by the
+  torch noise mixing, so they get a 2-ULP tolerance where interior edges get 1. It is
+  a 10⁻⁵ event and only `test_agrees_at_a_self_play_batch` (B=1024, slow) is large
+  enough to see it. Everything else in the file runs at B ≤ 64, which leaves the
+  batch axis otherwise untested.
 - `tests/oracle.py` + `tests/test_oracle.py` — **the oracle, done 2026-07-30**: a
   second MCTS written from the AlphaGo Zero Methods, one game at a time in objects and
   lists, built four ways round from the reference (values per node flipped at read
@@ -329,6 +387,20 @@ tested. Exploratory kernels and learning exercises belong in a scratch directory
   deep run reports the count rather than demanding zero.
   ⚠️ **It checks faithfulness of implementation, not of reading.** Where both follow the
   same reading of the paper, agreement proves nothing about the reading.
+- `docs/fidelity.md` — **where the reproduction may be wrong, written 2026-07-30**.
+  Everything else in `docs/` records what was measured; this records what was not.
+  Two audits: the search against AlphaZero, the engine against FIDE. Nothing in it is
+  a known defect, and every entry names what would settle it.
+  ⚠️ **The two audits have very different strength.** perft is a real external oracle
+  and settles move generation completely: **598M nodes across the six standard
+  positions, all matching published counts, 4.8 s** (deepened 2026-07-30, the five
+  non-startpos positions went from depth 4 to 5-6 because the CUDA engine made it
+  free). The search has no oracle outside our own reading of AGZ.
+  ⚠️ The three entries worth acting on: virtual loss is probably misfiled as an
+  addition when AGZ had it, so it is a *deviation*; `tau_plies` may be plies where
+  AGZ meant move pairs; and **fp16 priors flush to zero below 6e-8**, which is
+  harmless at today's flat policy, unmeasured at a sharp one, and has no counter.
+  That last one turns from a caveat into a bug silently.
 - The rest of the RL layer (training loop, replay buffer, Elo protocol, cost
   accounting) is **untouched** — no line written, no decision frozen.
 

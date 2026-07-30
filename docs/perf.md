@@ -3,8 +3,8 @@
 All measurements come from the RTX 4060 Laptop, 8 GB, sm89, running the
 d=256 / L=8 / H=8 / FFN=1024 model (6.32M parameters, about 400 MFLOPs per
 evaluation) in fp16 at B=16384 boards with T=32 tokens, between 2026-07-27 and
-2026-07-29. Every version was validated numerically against torch at a relative
-error below 5e-3.
+2026-07-30. Every version was validated numerically against torch at a relative
+error below 5e-3. Row 11 is at B=4096, which §4.4 of `mcts.md` measures as flat.
 
 ⚠️ Protocol: clocks fall to 1.38-1.5 GHz under load and drift by ±3 %, so every
 comparison is an order-balanced interleaved A/B. A naive before-and-after produced a
@@ -29,6 +29,7 @@ dwarfed the true delta of 0.35 ms.
 | 9 | **+ ping-pong prefetch, 2 CTAs/SM, row-wise residual, current default** | **267.5** | **61.3k** | **×3.03** vs eager |
 | | GO target | ~350 | 45-50k | **cleared** |
 | 10 | B2: boards in, policy/promo/value out — **a different measurement**, see below | **263.0** | **62.3k** | ×3.25 vs the torch full model |
+| 11 | **Gate 1a: the whole MCTS of `docs/mcts.md` §6 on device** at `n=800`, `B=4096`. **Another different measurement**, see below | 57 220 ms/move | **57.0k useful** | tree costs 4.4 % |
 
 Rows 0-9 all measure the same thing, activations in and activations out, and are
 comparable to each other. **Row 10 is not on that ladder**: it takes 64 bytes of
@@ -54,6 +55,42 @@ same-day eager baseline. Rows 5 and 6 come from the same interleaved run, where 
 read 20.5k on a hot card against the 22-24k it reaches cold. Absolute evals/s move
 with temperature by more than most of the deltas here, so the ratios are the
 transferable part.
+
+## Row 11, Gate 1a, and the clock 2026-07-30
+
+Row 11 is not on the ladder either, and for a larger reason than row 10: it is a
+whole self-play move rather than a forward pass, so it runs `n + 1` encoder calls
+plus the descent, the expansion and the backup of `docs/mcts.md` §6, and its unit is
+the number the project is gated on. `docs/mcts.md` §14.3 has the full table, the
+sweep over `n` and what the §15 counters said. Three things belong here.
+
+**The tree costs 4.4 %, flat in `n`.** 2.84 ms per simulation at `n = 32`, 2.88 at
+128, 3.00 at 800, against an encoder that takes 65 ms for the same batch. The 5 %
+rise across the sweep is the mean tree depth going from 4.1 to 5.8. The baseline is
+`n + 1` encoder calls and not `n`, since a move is `root_init` plus `n` simulations;
+charging the tree for the extra evaluation makes the overhead look like it falls
+with `n`, which it does not.
+
+**The encoder is slower inside the loop than in its own benchmark, and this is the
+transferable finding.** §4.4 of `mcts.md` measured 64 142 evals/s at `B = 4096`. The
+same call in the same process, run 801 times back to back as part of this campaign,
+gives **59 852/s**, 6.7 % lower. The card sits at **1230-1290 MHz and 82 °C** through
+a 57-second block where a short encoder benchmark holds the 1.38-1.5 GHz this
+document assumes. Nothing about the kernel changed.
+
+⚠️ **Every absolute number in this file was taken in blocks of a few hundred
+milliseconds.** They are all upper bounds on what the same kernel does inside a
+self-play generation, and the discount measured here is 6.7 %. The interleaved
+protocol keeps the *ratios* valid regardless, which is the reason it exists.
+
+**Predicted 1.7 ms of tree, measured 3.00.** Scaled to the clock it ran at the
+prediction was 1.84 ms, so the gap is 1.6×. The prediction's dominant term was the
+two `movegen` calls, priced from the perft kernel's 5.01M boards/s. That kernel uses
+71 registers and fits three blocks per SM; inside `descent` the same code runs in a
+96-register kernel at two blocks per SM. Lower occupancy on the dominant term is the
+leading candidate and it is **not measured**: a 1.2 ms gap inside a 4.4 % overhead
+does not justify the profiler run, and saying which it is without running one would
+be a guess dressed as a finding.
 
 ## Why the first CUDA kernel was slower than Triton, 2026-07-29
 

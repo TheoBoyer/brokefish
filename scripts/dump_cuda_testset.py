@@ -182,19 +182,25 @@ def stage_snapshots(boards: torch.Tensor, control: torch.Tensor, out: Path):
 # published values, not something this repository computed, which is what makes
 # perft an oracle rather than a regression test. Dumped from `from_fen` so the
 # CUDA side needs no FEN parser of its own.
+#
+# The five non-startpos positions went one ply deeper on 2026-07-30. They had
+# stopped at depth 4 because the PyTorch engine needs 20 minutes for depth 5 of
+# kiwipete; the CUDA engine does all six to these depths in 4.8 s, so the only
+# reason to stay shallow was gone. That is 598M nodes against published counts,
+# and it is the strongest evidence in the repository that the rules are right.
 PERFT_CASES = [
     ("startpos", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
      [20, 400, 8902, 197281, 4865609, 119060324]),
     ("kiwipete", "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
-     [48, 2039, 97862, 4085603]),
+     [48, 2039, 97862, 4085603, 193690690]),
     ("position3", "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
-     [14, 191, 2812, 43238, 674624]),
+     [14, 191, 2812, 43238, 674624, 11030083]),
     ("position4", "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
-     [6, 264, 9467, 422333]),
+     [6, 264, 9467, 422333, 15833292]),
     ("position5", "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
-     [44, 1486, 62379, 2103487]),
+     [44, 1486, 62379, 2103487, 89941194]),
     ("position6", "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
-     [46, 2079, 89890, 3894594]),
+     [46, 2079, 89890, 3894594, 164075551]),
 ]
 
 

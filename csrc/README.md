@@ -156,6 +156,54 @@ order.
 `legal_ep_file` are each paid twice, before and after the move. That is inherent to
 an incremental hash: both en passant states enter the key.
 
+## `search`, MCTS v0 ✅
+
+`search.cuh` holds the four kernels of [`docs/mcts.md`](../docs/mcts.md) §9 and
+`search.cu` binds them to torch. This is the first thing in `csrc/` that is *on*
+the self-play path rather than beside it: `descent` calls `step_full`, `movegen`
+and `terminal` from inside its own tree walk with no launch between them, which is
+why the engine lives in headers.
+
+One warp owns a game and lane `i` owns slot `i`, the same layout as the engine, so
+the selection scan, the repetition scan, the board mutation and the move generation
+all run on the same 32 lanes with the position never leaving registers.
+
+| kernel | registers | spill | SMEM |
+|---|---|---|---|
+| `descent` (select, `step_full`, repetition, `terminal`, allocate) | 96 | none | 17 512 B |
+| `expand` (`movegen`, enumeration, truncation, softmax) | 72 | none | 11 264 B |
+| `root_init` | 38 | none | none |
+| `backup` | 20 | none | none |
+
+`descent` fusing the whole of §6.2 into one launch was the thing most likely to
+spill: `movegen` alone is 71 registers and `step_full` is 80. It does not, and 96
+registers at 256 threads is two blocks per SM.
+
+⚠️ **`E = 64` is a compile-time constant and `B` and `Nmax` are runtime.** The
+selection scan of §6.6 is then exactly two edges per lane with no predicate on the
+second pass. `search.cu` refuses a tree of any other edge width rather than
+silently reading past the end.
+
+⚠️ **Every step of the selection score is an explicit rounding intrinsic**
+(`__fmul_rn` and friends). The reference is a chain of separate torch elementwise
+kernels, each one a single IEEE-rounded operation, so a compiler-contracted
+`a * b + c` here differs in the last bit and a last-bit difference in a near-tie is
+a different move and a different tree.
+
+⚠️ **The tree arrives as a dict keyed by name, not as a positional list.** Two
+thirds of §4.2's 25 arrays share a dtype and a shape, so a permutation in the
+caller would pass every check and produce a plausible tree.
+
+Truncation to the `E` largest priors (§4.3) is a **radix select on the float bit
+pattern** rather than a sort: IEEE floats compare as integers once the sign is
+folded in, so the `E`-th largest logit falls out of 32 warp-wide counts, and only
+on the one position in 10⁴ that has more than 64 candidates.
+
+Validated two ways. `tests/tselect.cu` pins the PUCT scan and the canonical edge
+enumeration against a host reference written from the document, on inputs a real
+position would take years to reach; `tests/test_search_cuda.py` compares whole
+trees against the PyTorch reference after every simulation.
+
 ## `encoder`, fused transformer forward ⬜ not written
 
 The CUDA C++ replacement for `brokefish/nn/triton_impl.py`, and the only identified path

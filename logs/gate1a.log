@@ -1,0 +1,52 @@
+brokefish Gate 1a: the whole of docs/mcts.md §6 on device
+  B = 4096 games at 30 random plies (4087 distinct live positions), 3 interleaved rounds
+  NVIDIA GeForce RTX 4060 Laptop GPU, 3.19 of 7.62 GiB in use before the tree
+
+  n = 32  (tree 0.11 GiB, 130 launches per move)
+    warm-up search
+    warm-up encoder
+    round 0 search      2.203 s (provisional)
+    round 0 encoder     2.116 s (provisional)
+    round 1 encoder     2.126 s (provisional)
+    round 1 search      2.225 s (provisional)
+    round 2 search      2.234 s (provisional)
+    round 2 encoder     2.139 s (provisional)
+
+  n = 128  (tree 0.42 GiB, 514 launches per move)
+    warm-up search
+    warm-up encoder
+    round 0 search      8.872 s (provisional)
+    round 0 encoder     8.497 s (provisional)
+    round 1 encoder     8.513 s (provisional)
+    round 1 search      8.940 s (provisional)
+    round 2 search      8.914 s (provisional)
+    round 2 encoder     8.602 s (provisional)
+
+  n = 800  (tree 2.62 GiB, 3202 launches per move)
+    warm-up search
+    warm-up encoder
+    round 0 search     56.854 s (provisional)
+    round 0 encoder    54.640 s (provisional)
+    round 1 encoder    54.788 s (provisional)
+    round 1 search     57.371 s (provisional)
+    round 2 search     57.441 s (provisional)
+    round 2 encoder    55.023 s (provisional)
+
+==============================================================================
+    n   useful/s      raw/s  encoder/s    tree  tree ms   s/move  useful       depth
+   32      58942      59021      63547    4.4%     2.84     2.22   99.9%   4.1/15   
+  128      58763      58852      61890    4.3%     2.88     8.91   99.9%   5.1/21   
+  800      56996      57265      59852    4.4%     3.00    57.22   99.5%   5.8/28   
+==============================================================================
+  useful/s gates. raw/s counts every row the encoder ran, including the
+  terminal leaves §6.3 evaluates and discards; encoder/s is the same
+  n+1 calls through forward_full alone, so 'tree' is what all of §6 adds
+  on top of the evaluations a move has to run anyway, in per-simulation ms.
+
+  n = 32: max edges 78 (E = 64), 25 nodes truncated dropping 0.1172 of prior mass, pool high water 33 of 33
+
+  n = 128: max edges 75 (E = 64), 73 nodes truncated dropping 0.4193 of prior mass, pool high water 129 of 129
+
+  n = 800: max edges 77 (E = 64), 443 nodes truncated dropping 2.317 of prior mass, pool high water 801 of 801
+
+  Gate 1: 45-50k evals/s is GO, under 15k is NO-GO. Best here: 58942/s at n = 32.

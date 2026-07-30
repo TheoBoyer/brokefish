@@ -22,6 +22,7 @@ host helpers in front of it, so the marker moved.)
 | `tperft.cu` | **perft against the published node counts**, all six standard positions, startpos to depth 6. The only oracle here that is not this repository | green, 1.01 s |
 | `tstep.cu` | **the board mutation of spec §4.2**: the 32 slot words and the control word after every legal move of every position, promotions expanded to four, one null move each | bit-exact over 322 246 cases |
 | `tmovegen.cu` | **the first-order move generator**, stage by stage against the PyTorch engine's own dump: base bitsets, pawns, sliders, castling, the friendly filter, the control-mode attack map and `in_check` | bit-exact over 10 000 positions |
+| `tselect.cu` | **docs/mcts.md §6.6 and §6.4**: the PUCT scan and its tie-break, and the canonical edge enumeration with promotions and truncation, against a host reference in double | 20 000 selections, 400 enumerations, no dump needed |
 | `tdirect.cu` | **the packed weight layout**: `gemm_direct` against a host reference that reimplements `pack_b` from the fragment definition | bit-exact |
 | `tgemm.cu` | A, B and D fragment layouts for one 32x32 tile | bit-exact |
 | `tg2.cu` | the same at A row pitches 40 and 264 | bit-exact |
@@ -48,6 +49,14 @@ pass vacuously.
 
 `harness.cuh` holds the reading and the printing both engine tests share, so the
 board diagram and the slot-by-slot word diff exist once.
+
+`tselect.cu` needs no dump: it generates its own cases from a host splitmix64 and
+compares against a reference written from `docs/mcts.md` rather than copied from
+the kernel. The stronger check on those two functions is the tree-for-tree
+comparison in `tests/test_search_cuda.py`; this one exists because that comparison
+reports "the trees diverged at simulation 43" and cannot say which of the two
+reductions was wrong. It also reaches inputs a real position does not: every score
+tied, every logit tied, 218 candidates, exactly 64 candidates.
 
 `tperft.cu` matters for a reason the other two cannot cover. They compare the kernel
 to the PyTorch engine, so a bug the two engines share passes both. Perft's counts are

@@ -102,6 +102,13 @@ Perft, which needs no oracle at all, and is what catches a botched translation:
 | position 5 | 3 / 4 | 62 379 / 2 103 487 | 3 by default |
 | position 6 | 3 / 4 | 89 890 / 3 894 594 | 3 by default |
 
+⚠️ **The depths above are this module's, and they are not the strongest evidence any
+more.** They stop where they do because a CPU perft of Kiwipete at depth 5 takes
+about twenty minutes. `csrc/tests/tperft.cu` runs the same six positions one ply
+deeper in **4.8 s total: 598M nodes, every count matching**, and that is what the
+rules claim now rests on. Deepened 2026-07-30; `scripts/dump_cuda_testset.py` holds
+the case table.
+
 Position 5 carries four promotions among its 44 moves at depth 1, so promotion sits
 inside a node count rather than only inside the differential harness. `perft()` runs
 depth-first over chunks and counts the last ply instead of playing it, so depth 6
@@ -147,6 +154,21 @@ is capped by memory: the brute-force second order expands N positions into about
 35N boards, and `first_order_mask` holds several `[35N, 32] int64` intermediates.
 
 Perft timings on CPU, for scale: 197 k positions expanded in 1.4 s, 4.9 M in 30 s.
+
+## Where it departs from FIDE
+
+Three choices every engine makes, none of them a defect, all of them affecting
+self-play results. [`fidelity.md`](fidelity.md) §3.2 has the full argument.
+
+* **Draws are automatic where FIDE makes them claimable.** Threefold and the
+  fifty-move rule are claims under Articles 9.2 and 9.3, with automatic thresholds
+  at fivefold and seventy-five moves. `terminal` ends the game at three and at 100
+  plies, so a position a player would decline to draw is scored 0.
+* **FIDE's "dead position" (5.2.2) is reduced to a material rule.** Blocked
+  positions with material are not called dead and run to the fifty-move rule
+  instead. The approximation errs in the safe direction: nothing is declared drawn
+  that FIDE would let continue.
+* **No claim mechanics, no Chess960, no agreement, resignation or time.**
 
 ## Three places it departs from python-chess, all deliberate
 

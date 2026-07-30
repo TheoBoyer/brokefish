@@ -4,25 +4,27 @@ Written 2026-07-29, after the specification was frozen. Estimates are in working
 days with both of us on the task, and they assume co-implementation with no split
 of ownership between kernels and harnesses.
 
-⚠️ **Both tracks are closed as of 2026-07-30.** A0, A1, A2, B0, B1 and B2 are done:
-the CUDA engine is perft-green and the network runs boards to logits in one launch.
-The measurement that mattered most is that **the environment costs 2.2 % of a node**,
-which turns the project's founding assumption, "the system is NN-bound, not
-env-bound", from an argument about FLOP counts into a number. C1 is the only phase
-left before the pilot, and the only one with no specification.
+⚠️ **Both tracks are closed as of 2026-07-30, and so is C1.** A0, A1, A2, B0, B1 and
+B2 are done: the CUDA engine is perft-green and the network runs boards to logits in
+one launch. The measurement that mattered most is that **the environment costs 2.2 %
+of a node**, which turns the project's founding assumption, "the system is NN-bound,
+not env-bound", from an argument about FLOP counts into a number. The search then
+turned out to cost 4.4 % on top of that, and **Gate 1a cleared at 56 996 useful
+evals/s at `n = 800`, `B = 4096`**. C2, the training loop, is the next phase and the
+first one whose parameters are genuinely open.
 
-⚠️ **The day unit calibrated at about 1.3 wall hours, and that calibration has now
-expired.** A0, A2, B0 and B1 were delivered between 12:00 and 21:00 on 2026-07-29,
-and A1 and B2 on 2026-07-30: 17 to 23 estimated days across two sessions and two
-parallel tracks. It held because every one of those phases had a written
-specification and an oracle to check against before a line was typed. C1 has
-neither, [spec §11](spec.md#11-not-frozen) lists its parameters as explicitly not
-frozen, and there is no reference implementation to be differentially tested against.
-Do not convert the C1 estimate.
+⚠️ **The day unit calibrated at about 1.3 wall hours, and C1 did not break it.** A0,
+A2, B0 and B1 were delivered between 12:00 and 21:00 on 2026-07-29, and A1, B2 and C1
+on 2026-07-30. It held because every one of those phases had a written specification
+and an oracle to check against before a line was typed. C1 started with neither, and
+the fix was to build both first: [`mcts.md`](mcts.md) as the specification, then the
+torch reference, then an independent oracle from the AGZ paper, and only then the
+kernels. That ordering is the reason the kernels found their bugs in minutes rather
+than in a training run, and it is the transferable part.
 
 The two tracks shared only the engine interface in
 [spec §4](spec.md#4-the-engine-contract), which is frozen, and never shared a file.
-What is left does not split that cleanly: C1 and C3 both live in `brokefish/`.
+What is left does not split that cleanly: C1 and Track D both live in `brokefish/`.
 
 ## What steakfish provides
 
@@ -387,32 +389,37 @@ Both tracks closed on 2026-07-30, so this is where the project now lives. The
 engine and the network are done, tested and measured; C1 is the only thing between
 here and a first curve point, and it is the only phase with no specification.
 
-### C1. MCTS loop, specified 2026-07-30
+### C1. MCTS loop ✅ done 2026-07-30, Gate 1a cleared
 
 Specified in [`mcts.md`](mcts.md), which is normative and supersedes the
 "Gumbel root selection with sequential halving" this section used to name: v0 is
 AlphaZero PUCT at `n = 800`, and Gumbel is a named seam (§11) for the throughput
-work rather than part of the first design. The reference implementation in
-`brokefish/search/torch_impl.py` is done; the CUDA kernels are not.
+work rather than part of the first design.
 
-Gate 1a falls at the end of it: the first sustained evals/s measured inside the
-loop, with the environment live.
+Three pieces, in the order §12 asked for. The reference,
+`brokefish/search/torch_impl.py`, with an independent oracle written from the AGZ
+paper. The four kernels, `csrc/search.cuh` and `csrc/search.cu`, driven by
+`brokefish/search/cuda_impl.py`. And the differential harness,
+`tests/test_search_cuda.py`, which compares whole trees after every simulation.
 
-⚠️ **What Gate 1a still has to decide changed on 2026-07-30.** It was going to answer
-"is the encoder the bottleneck it is assumed to be", and `bench/bench_loop.py` has
-now answered that part: the environment is 2.2 % of a node, so the encoder is. What
-Gate 1a measures instead is **what the tree costs**, which is the only unmeasured
-term left. `bench_loop.py` reads 62.9k node/s with no tree at all, and that is a
-ceiling: the descent, the backup, the selection and the per-node memory traffic all
-come out of it. Gate 1's band is 45-50k, so the question is whether the tree costs
-more than about 25 % of a node.
+**Gate 1a: 56 996 useful evals/s at `n = 800`, `B = 4096`, against a band of
+45-50k.** `bench/bench_search.py`, `logs/gate1a.log`, and `mcts.md` §14.3 has the
+sweep and the counters.
 
-Everything C1 needs now exists and is tested: `csrc/movegen.cuh`, `csrc/step.cuh`,
-`csrc/zobrist.cuh` and `csrc/terminal.cuh` expose warp-collective device functions
-that can be called from inside a kernel, which was the constraint that put A1 ahead
-of C1 in the first place. Two pieces were deliberately left here rather than in A1:
-the per-game repetition ring of spec §6.3, and `rep` for spec §7.2's embedding, which
-B2 currently takes as a synthesised argument.
+The question it was rewritten to answer, "what does the tree cost", comes out at
+**4.4 % over the encoder alone and flat in `n`**, 3.00 ms per simulation at
+`B = 4096`. The prediction was 2.7 % and the estimate in `mcts.md` §14.1 was 0.05 %;
+§14.3 says where each was wrong.
+
+⚠️ **The card throttles harder inside the loop than in any benchmark that sized
+it.** 1230-1290 MHz at 82 °C through a 57-second move, where the encoder benchmark
+holds 1.38-1.5 GHz, so the same encoder call reads 59.9k here against the 64.1k in
+[`perf.md`](perf.md). Every absolute figure in that file is an upper bound on what
+the kernel does inside a generation, by about 6.7 %. Ratios are unaffected, which is
+what the interleaved protocol is for.
+
+Two pieces spec §6.3 and §7.2 left to the search are now filled: the per-game
+repetition ring, and `rep`, which B2 had been taking as a synthesised argument.
 
 ### C2. Training loop, 3-4 days
 
@@ -424,11 +431,13 @@ Learner placement is settled: GPU, alternating with self-play. Measured throughp
 is 5000 positions per second on the 4060 against 130 on the CPU, both fwd+bwd+AdamW
 at d=256 and L=8.
 
-### C3. Evaluation protocol, 3-4 days
+### ~~C3. Evaluation protocol~~ → [Track D](#track-d-evaluation)
 
-See [Measuring strength](#measuring-strength) below. This is a build-once item, and
-it has to span 1500 to 3000 Elo because the pilot targets AlphaGateau's range while
-the full run targets the top.
+**Promoted to its own track on 2026-07-30.** C3 was one 3-4 day line item covering
+everything from a PGN writer to a preregistered superhuman claim, which is six
+pieces with different dependencies, and two of them can start today while two cannot
+start until C2 produces checkpoints. It is now Track D, specified in
+[`evals.md`](evals.md), and the honest estimate is **8-12 days**, not 3-4.
 
 ### C4. Pilot, 3-5 days
 
@@ -438,9 +447,152 @@ protocol to be measured against. Gate 2 falls here.
 
 ### C5. Full run and write-up, 10-20 days
 
-Mostly waiting. The write-up starts during C3.
+Mostly waiting. The write-up starts during D2, as soon as the first curve points
+have error bars.
+
+## Track D: evaluation
+
+Specified in [`evals.md`](evals.md), which is the contract for this track the way
+`spec.md` is for A and B. It is a **draft**: §2 and §3 are ready to freeze, the rest
+firms up as the track is built. `eval_prior_art.md` at the repository root holds the
+verification of every claim it borrows from AlphaZero, KataGo, SAI and lc0.
+
+The deliverable is not a rating. It is a **sequence of (euros, Elo) points with error
+bars and a stated configuration**, which is a harder object than "measure how strong
+it is" and drives the whole decomposition.
+
+Four evaluation layers, four different questions, four different costs — `evals.md`
+§1 has the table. The steps below are ordered by dependency, not by layer number.
+
+### D0. Position and game I/O, 0.5-1 day
+
+`to_fen`, move → UCI long-algebraic string, and a PGN writer. `brokefish/env/` has
+`from_fen`, `parse_san` and `from_pgn` and **none of the three inverses**, so nothing
+in the repository can currently emit a game.
+
+⚠️ **This blocks every external-opponent layer and it depends on nothing.** It is
+also immediately useful for debugging the search, which is why it goes first despite
+being the least interesting item in the track.
+
+### D1. Self-contained diagnostics: layer 0 and layer 3, 1-2 days
+
+Everything that needs no second process and no external data.
+
+The rule-level suites of `evals.md` §8.1, generated by our own move generator: mate
+in 1, stalemate avoidance, insufficient material, threefold, underpromotion. These
+test the search against the *rules*, import zero chess opinion, and are therefore
+inside the tabula rasa boundary even during training.
+
+The four layer-0 scalars of §4: value-head calibration against realised outcomes,
+policy entropy, `max |post-scale attention logit|` (which `perf.md`'s fp16 ceiling
+needs logged independently), and draw rate with mean game length.
+
+The external puzzle curve of §8.2 lands here too: the Lichess CC0 export, 6 014 381
+puzzles carrying a Glicko-2 rating and a deviation, giving a solve-rate-versus-
+difficulty curve rather than one opaque percentage.
+
+⚠️ Puzzle results **never select a checkpoint** — §2's third prohibition, and the one
+most likely to be violated by accident, since "keep the checkpoint with the best
+puzzle score" looks like good practice and is distillation through a one-bit channel.
+
+Cost arithmetic, not a measurement: the whole of layer 0 is ~6 s per checkpoint at
+the loop rate C1 measured, so it runs on every checkpoint and never blocks.
+
+### D2. The league and the rating fit — layer 2, 2-3 days
+
+The curve itself. A checkpoint league where the opponent is our own past self, so the
+opponent strength escalates for free and no external process is involved.
+
+- the **frozen anchor**: the random-init network, pinned at Elo 0 in the fit. It is
+  the origin of the cost-versus-Elo curve by construction and it detects scale drift.
+  Precedent: lc0 anchors its chart at "the first net".
+- one **global** Bradley-Terry / BayesElo fit over the whole graph of games, never a
+  chain of pairwise deltas (`evals.md` §5.2).
+- **variance-proportional pairing**: play a pairing with frequency proportional to
+  `p(1−p)` under the current fit. KataGo's rule; SAI's fixed ±1,2,3,6,8,12 schedule
+  is the fallback if the online fit is not ready.
+- the curve-point record of §5.3, in which **`euros_spent` is written by the same
+  writer as `elo`** — two files means a hand join six weeks later.
+
+⚠️ **Buildable before C2.** The league needs a set of nets of differing strength, not
+a training run: a random-init net plus a few deliberately-degraded copies gives a
+synthetic ladder with a known ordering, which is a better test of the fit than real
+checkpoints because the right answer is known in advance.
+
+Cost arithmetic: 1000 league games at `n = 800` ≈ 6.4×10⁷ evals ≈ 17 minutes, both
+players on device. Layer 2 is not a budget problem.
+
+### D3. The external match harness, 2-3 days
+
+Layers 2b and 1 need something this repository has never had: **one game at a time,
+against a process**. Everything here is throughput-shaped — `B = 4096` in the search,
+`B = 16384` in `bench_loop` — and at `B = 1` the encoder runs one CTA on 24 SMs.
+
+So this is an **async scheduler**, not a loop: `N` games in flight against `N` UCI
+processes, our side batching whichever games are currently waiting on us. Needs D0.
+
+⚠️ **Our opponents are CPU-only, which is a gift.** CCRL-rated engines run on the
+CPU while our net runs on the GPU, so the process pool and the self-play loop do not
+contend. The 8 GB budget is untouched by this track.
+
+### D4. Calibration — layer 2b, 1-2 days plus wall clock
+
+Converting the self-anchored scale to a published one. `evals.md` §6 and §7.1.
+
+⚠️ **Submission to CCRL is closed** (§7.1): the list is CPU-only and refused a GPU
+exception for Lc0. The anchor is therefore a rating we *borrow*, not one we are
+awarded, and a borrowed rating only transfers if our match reproduces the conditions
+it was measured under.
+
+Two parts, because "reproducible" and "rated" are different properties:
+
+- **the ladder** — one strong engine at fixed node counts. Reproducible on any
+  machine, spans roughly 1500-3000 monotonically, and keeps every internal number
+  free of a time control. ⚠️ Not `UCI_Elo`: its mechanism is a randomised bias over
+  MultiPV candidates, so it plays strong-with-blunders, and beating a blunderer is a
+  different skill from beating a 2000-rated engine — the *measurement* does not
+  transfer, whatever the label says.
+- **the anchors** — 3-4 distinct CCRL-rated engines at ~300-400 Elo spacing, run at
+  their rated configuration. These convert node counts to absolute Elo.
+
+Each anchor also plays one match under CCRL conditions, which measures the offset
+between our protocol and theirs. Measured once, own error bar, converts the ladder.
+
+**Which engines is the open decision**, and it is the next one due (`evals.md` §11).
+Selection criteria: frozen public release, single-threaded, CPU-only, ≥150 games in
+CCRL's "pure" list, UCI, open source.
+
+### D5. The gate — layer 1, 1 day plus match time
+
+The preregistered claim: threshold, list, time control, hardware and search budget,
+fixed **before** the run. A basket of three or four rated engines rather than one,
+since a basket costs the same per game and cannot be defeated by a single
+anti-computer blind spot.
+
+Sizing from `evals.md` §9: `se(Elo) ≈ 347·√(1−d)/√N`. At the top of the scale draws
+dominate, so 100 games resolves ±37 Elo — enough only if the claimed margin clears
+~40. A gate expecting to land near its threshold needs ~750 games for ±25.
+
+### What Track D has already settled
+
+| | |
+|---|---|
+| **no checkpoint gating** | AZ's choice. It keeps the x-axis well defined — a rejected candidate costs euros and yields no curve point — and SAI names gating as an aggravating factor for Elo inflation. **C2 therefore does not depend on this track.** KataGo's 200-game check still runs in layer 0 as a non-blocking logged diagnostic |
+| **fixed simulations per move**, not time control, in layers 0/2/2b | thermal drift, hardware independence, and it makes `n` an axis rather than a confound. ⚠️ AZ is *not* precedent — it rated at 1 s/move |
+| **greedy move selection in evaluation** | temperature 0, no Dirichlet, following AZ. Not the same protocol as self-play |
+| **target a CI width, not a game count** | the draw fraction drifts over the run, so fixed `N` over-measures early points and under-measures late ones |
+| **two cost numbers** | training compute only on the curve's x-axis, which is what makes it comparable to AlphaGateau; total project cost published separately |
+| **tablebases: never ours, whatever the opponent is rated with** | §7.2, superseding the two-option sentence in [Measuring strength](#measuring-strength) below |
 
 ## Measuring strength
+
+⚠️ **Partly superseded by [`evals.md`](evals.md) as of 2026-07-30.** Two statements
+below no longer hold: submission to CCRL is not available (§7.1 — the list is
+CPU-only and refused a GPU exception for Lc0), and "no tablebases on either side or
+the same on both" omits the option AlphaZero actually used and that §7.2 adopts. The
+"SPRT or fixed-N" phrasing is also split in §9, since they answer different
+questions. What survives unchanged is everything about the scale conversion, which is
+why the section stays.
 
 Engine rating lists and FIDE ratings are separate scales, and the conversion between
 them is contested. Two rules of thumb in common use disagree materially: one holds
@@ -455,9 +607,11 @@ Three consequences for the protocol.
 on which list, at which time control, on which inference hardware, at which search
 budget, before the run rather than after it. Strength varies with all of them.
 
-**Anchor to a third party.** Getting listed on CCRL or CEGT removes the methodology
-argument entirely, since their procedure is established and independent. Failing
-that, reproduce their conditions and say so.
+**Anchor to a third party.** ⚠️ **Only the fallback is available.** Getting listed
+would remove the methodology argument entirely, but CCRL is CPU-only and declined a
+GPU exception for Lc0, so the remaining option is the second one: reproduce their
+conditions and say so. `evals.md` §7.1 and D4 build the protocol-offset measurement
+that makes a borrowed rating transfer.
 
 **Choose the threshold with margin.** Since the conversion is disputed by roughly
 150 Elo at the relevant point, a target that clears the highest FIDE rating ever
@@ -482,7 +636,10 @@ engine never touches a training tensor.
 | the per-game repetition ring (spec §6.3) | start of C1; A1 left it to the search on purpose |
 | value target: outcome, bootstrapped search value, or a mix | start of C2 |
 | reuse factor R and training window | start of C2 |
-| preregistered superhuman threshold and configuration | start of C3 |
+| ~~checkpoint gating in the training loop~~ | settled 2026-07-30: **no gating**, so C2 does not depend on Track D (`evals.md` §11) |
+| **which calibration engines** | start of D4, and the next one due |
+| whether the external anchor is a node in the league fit or a separate affine map | start of D2; folding it in deletes the two-scale hazard but pulls D0 and D3 earlier |
+| preregistered superhuman threshold and configuration | start of D5 |
 | simulations per move | measured in C4 |
 | adaptive budget by KL on completed Q | after C4, as an optimisation |
 
@@ -526,8 +683,8 @@ shape of the project changes here: what is left is one loop, and almost nothing 
 parallel any more.
 
 ```
-C1 (5-8 d, unscoped) ──> C2 (3-4 d) ──> C4 ──> C5
-C3 (3-4 d) ──────────────┘   off the path, startable now
+C1 ✅ ──> C2 (3-4 d) ──> C4 ──> C5
+D0 ──> D1 ──> D2 ──> D3 ──> D4 ──> D5     off the path; D0 and D1 startable now
 ```
 
 **On the path**: C1, then C2, then C4, then C5. C1 is now the *only* item on it
@@ -536,11 +693,12 @@ no written specification. That is the whole risk profile as of tonight.
 
 **Off it, and parallelisable now**:
 
-* C3, the evaluation protocol, which needs a network to play games and nothing
-  else. Both halves of the engine now exist behind a Python API, so C3 can be
-  built and debugged against random-weight self-play without waiting for C1. It is
-  the largest block of work that can start immediately, and the preregistration it
-  demands is a decision rather than code.
+* **Track D**, the whole of it. D0 (the exporters) depends on nothing at all, and D1
+  (the self-contained diagnostics) needs only the engine, which exists. D2 can be
+  built and tested against a *synthetic* ladder of degraded random-init nets, so it
+  does not wait for C2's checkpoints either. Track D is now the largest block of
+  work that can start immediately, and two of its remaining items — the calibration
+  engines and the preregistration — are decisions rather than code.
 * The C1 design: the tree node layout, the descent's interface to the three
   kernels and the per-game repetition ring of spec §6.3, which A1 deliberately
   left to the search. All three are settled in [`mcts.md`](mcts.md) and built in
@@ -549,7 +707,7 @@ no written specification. That is the whole risk profile as of tonight.
 **Not parallelisable**: C2 against C1, since the replay buffer schema depends on
 what the search emits. C4 and C5 are GPU time and do not compress.
 
-**Ownership**: with `csrc/` quiet, the natural split is C1 to one instance and C3
+**Ownership**: with `csrc/` quiet, the natural split is C1 to one instance and Track D
 plus the open decisions to the other. Both will be editing `brokefish/`, which A1
 and B2 never had to share, so that is the first time the two tracks actually
 collide on files.
@@ -567,7 +725,8 @@ session hours, not calendar hours.
 | network complete, boards to logits | ✅ 2026-07-30 | B2, 62.3k evals/s |
 | environment cost measured | ✅ 2026-07-30 | **2.2 % of a node**, `bench/bench_loop.py` |
 | first in-loop number, Gate 1a | +12 to 20 h | end of C1, two or three sessions |
-| training and evaluation in place | +8 to 12 h after C1 | C2 and C3 in parallel |
+| training in place | +4 to 6 h after C1 | C2 |
+| evaluation in place | +10 to 16 h, parallel to C2 | Track D, D0 through D3; D4 and D5 need the pilot |
 | first curve points, Gate 2 | +30 h from now | end of C4, plus the pilot's own GPU time |
 | full run | 5 days of GPU, floor | see below |
 

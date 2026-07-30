@@ -769,18 +769,48 @@ not from chess.
 
 ## 9. Kernel decomposition
 
-Per simulation, three launches, and per move `3n + 2`:
+Four launches per simulation, and `4n + 2` per move. Built 2026-07-30 in
+`csrc/search.cuh` and `csrc/search.cu`, driven by
+`brokefish/search/cuda_impl.py`; the register and shared-memory columns are what
+`-Xptxas -v` reports.
 
-| kernel | grid | what |
-|---|---|---|
-| `root_init` | `B / W` blocks | once per move, then reuses `evaluate` and `expand` |
-| `descent` | `B / W` blocks of `W * 32` threads | select, `step_full`, repetition, `terminal`, allocate |
-| `evaluate` | one CTA per board | `forward_full`, the existing encoder kernel |
-| `expand` | `B / W` blocks | `movegen`, edge enumeration, prior softmax |
-| `backup` | `B / W` blocks | the walk of §6.5 |
-| `select_and_advance` | `B / W` blocks | once per move |
+| kernel | grid | registers | SMEM | what |
+|---|---|---|---|---|
+| `root_init` | `B / W` blocks | 38 | none | node 0 and the encoder staging, once per move |
+| `descent` | `B / W` blocks of `W * 32` threads | 96 | 17 512 B | select, `step_full`, repetition, `terminal`, allocate |
+| `evaluate` | one CTA per board | | | `forward_full`, the existing encoder kernel |
+| `expand` | `B / W` blocks | 72 | 11 264 B | `movegen`, edge enumeration, prior softmax |
+| `backup` | `B / W` blocks | 20 | none | the walk of §6.5 |
+| `select_and_advance` | torch | | | §6.7, once per move |
 
-`W` is warps per block, 8 in the engine kernels.
+`W` is warps per block, 8 in the engine kernels. **Nothing spills.** Fusing the
+whole of §6.2 into `descent` was the thing most likely to: `movegen` alone is 71
+registers and `step_full` is 80. At 96 registers and 256 threads it fits twice on an
+SM, and the fallback of splitting the terminal test into a fifth launch was not
+needed.
+
+Two departures from the table as it was written, both taken deliberately.
+
+**`select_and_advance` stays in torch.** It runs once per move, has no tree state in
+it, and needs a `multinomial` for §6.7's temperature branch. Two launches out of
+3202 at `n = 800`, and it means the CUDA search inherits the reference's §6.7 and
+§10 rather than reimplementing them.
+
+**The root's noise is drawn in torch** and handed over as a tensor, for the reason
+§12 gives: one seed then drives both implementations and the differential test runs
+at the real `eps`.
+
+⚠️ **`descent` writes the leaf out to a contiguous `[B, 32]` buffer.** The encoder is
+one CTA per board over a contiguous batch and a simulation's leaf sits at a different
+node index in every game, so the descent stages it as it creates it rather than the
+encoder learning to gather. That buffer is also what carries `rep`, and comparing it
+against the reference's gather is what catches a wrong repetition count, which is
+otherwise invisible in the tree until it changes the evaluator's output several
+simulations later.
+
+⚠️ **`E = 64` is compile-time and `B` and `Nmax` are runtime.** §6.6's scan is then
+exactly two edges per lane with no predicate on the second pass, and §12's harness
+still runs at `B = 8`.
 
 ### 9.1 The fusion v0 does not take
 
@@ -927,13 +957,15 @@ canonical edge order of §6.4, tie-breaking by lowest edge index in §6.6 and §
 and the shared Dirichlet construction of §6.1. Any of the three left loose turns the
 comparison into a distributional one, which is much weaker.
 
-⚠️ The third is the one that is not yet closed. The reference builds its Dirichlet
-noise by §6.1's construction, but torch draws one global sequence where a kernel
-gives each lane its own cuRAND state, so the same seed gives different noise. The
-comparison therefore has to drive both implementations from the same numbers, which
-is why the noise is a method on the reference rather than inline code. A
-counter-based generator on both sides would remove the caveat and is the cleaner
-fix if the differential test needs the root's noise rather than `eps = 0`.
+The third was open until the kernel landed and is now closed, by the decision of
+2026-07-30 that the root noise is drawn in torch and handed to the kernel as a
+`[B, E]` tensor rather than generated on device. Marsaglia-Tsang with the
+`alpha < 1` boost needs a normal variate and therefore a Box-Muller of its own,
+which is forty lines of hard-to-test device code for one launch out of 3202 per
+move; drawing it in torch means the CUDA search inherits §6.1 unchanged and the two
+implementations consume one stream from one seed. The differential test therefore
+runs at the real `eps = 0.25` rather than needing `eps = 0`, and device generation
+stays a named seam that nothing depends on.
 
 **Independent checks** the reference cannot provide, because it is the same
 algorithm. `tests/test_search.py` is these, and it comes at the search from five
@@ -1092,6 +1124,99 @@ comparison passes and says nothing about whether that is what AlphaZero did.
 check, one at a time, plus the node count, and requires every perturbation to be
 reported.
 
+### 12.3 The kernels against the reference
+
+`tests/test_search_cuda.py`, **done 2026-07-30**, 19 checks. Both implementations
+run the same batch from the same seed and every array of §4.2 is compared **after
+every simulation**, so a divergence names the simulation that caused it rather than
+the four hundred that followed. `brokefish/search/cuda_impl.py` is a subclass of
+the reference and shares its tensors, which is what makes that cheap.
+
+**What comes out bit-identical, and what does not.** Every integer field, `edge_Q`
+and `node_value` agree exactly, at every simulation of every run below, including
+one move at `n = 800` over 64 games and 462,720 selections. `edge_prior` does not
+always: the kernel's softmax denominator is a warp reduction over at most 64
+surviving candidates and the reference's is a torch reduction over the 8192-wide
+masked candidate row, so the two land on opposite sides of an fp16 rounding
+boundary on roughly one edge in a hundred.
+
+That difference is one fp16 ULP and it is **not** provably too small to change a
+selection. Every run therefore measures both sides of the question, the same way
+§12.2 does: the closest gap between the best and the second-best PUCT score at any
+selection, and the largest score perturbation the prior rounding could have caused.
+
+| run | selections | closest non-tie | rounding worth |
+|---|---|---|---|
+| start position, `eps = 0` | 6 008 | 5.1e-5 | 0 |
+| root noise, `eps = 0.25` | 8 504 | 2.7e-5 | 0 |
+| three moves through the temperature switch | 12 064 | 1.5e-5 | 0 |
+| 218 legal moves, truncating | 384 | 1.3e-3 | 0 |
+| random positions, 189 promotion edges | 48 696 | 5.3e-6 | 1.9e-5 |
+| a threefold inside the tree | 6 176 | 8.6e-6 | 5.6e-4 |
+| endgames, 300 random plies | 84 892 | 1.1e-6 | 3.0e-4 |
+| `n = 800`, `B = 64` | 462 720 | 6.0e-8 | 2.5e-4 |
+
+Where the last column is zero the agreement is guaranteed and where it exceeds the
+margin the agreement is empirical: the rounding *could* have changed a decision and
+over those runs it did not. Saying so is the point of the table.
+
+**One test has a hard guarantee.** With constant logits every prior is an exact
+`1/k` on both sides, because the kernel's denominator is a sum of `k` ones and so is
+the reference's, and an integer sum in fp32 does not care about reduction order.
+That comparison is exact, with no tolerance anywhere in it. It runs on **pawnless
+positions**, since a promotion edge picks up `log_softmax` of four equal numbers,
+which is `-log 4` and not zero. It is also the hardest exercise of §6.6's tie-break
+available, since equal priors make every score at a fresh node tie: 4 196 exact ties
+in 8 516 selections.
+
+⚠️ **The root's priors get twice the tolerance, and it is not a fudge.** They are
+quantised to fp16 twice: the kernel writes them, then §6.1's noise reads them back,
+mixes `0.75 p + 0.25 eta` in fp32 and writes fp16 again. A one-ULP difference in `p`
+survives the 0.75 and picks up the output's own half-ULP rounding, so the two can
+land two fp16 steps apart. Interior edges go through fp16 once and stay inside one.
+Measured at exactly 2.00 ULP, at the root, on about one edge in 10⁵ with the noise
+on, and it only appears at batch sizes large enough to see a 10⁻⁵ event.
+
+⚠️ **The batch axis needs its own test and did not have one until it found this.**
+Everything else here runs at `B <= 64`, because the reference costs a torch launch
+per descent level and the comparison a synchronisation per simulation, which leaves
+untested the axis where an index that fits in 32 bits at `B = 8` stops fitting, a
+grid is sized wrong, or blocks race. `test_agrees_at_a_self_play_batch` runs
+`B = 1024` for two moves and is the only thing in the file that saw the paragraph
+above.
+
+⚠️ **A tie is not a rounding risk and the margin excludes it.** At a freshly created
+node `sqrt(N_v)` is zero, so every score is `0 * prior + 0`, exactly zero whatever
+the prior rounded to, and the tie-break decides it identically on both sides by
+construction. That is also why ties are so common: one per node created, about a
+quarter of all selections.
+
+Coverage the start position cannot reach gets its own run: the fifty-move boundary
+at clock 99, a threefold whose hash is already twice in the game ring, checkmate and
+insufficient material 300 random plies in, 218 legal moves for the truncation of
+§4.3, 189 promotion edges for §6.4's four-per-move fan-out, and a 45-ply path so
+that §7's scan and §6.5's backup loop more than once per lane.
+
+Three guards, because the rest of the file would pass without them.
+`test_the_comparison_is_not_vacuous` perturbs each of the 21 fields it claims to
+check and requires every perturbation to be reported.
+`test_a_rebound_tree_tensor_is_caught` covers the one bug this harness found:
+`env.push_history` is a pure function and returns a *new* ring, so a dict of tensors
+built once in the constructor points at the ring that stopped being updated after
+move 0, and the symptom is a repetition count that is too low three moves and eight
+thousand simulations later. And `test_every_tree_field_reaches_the_kernel` checks
+that the name-keyed tree the binding reads covers every array of §4.2.
+
+**`csrc/tests/tselect.cu`** pins the two warp reductions on their own, with no
+Python and no torch, against a host reference in double written from §6.4 and §6.6
+rather than copied from the kernel. The tree comparison is the stronger check and
+cannot say *which* reduction was wrong; this one can, and it reaches inputs a real
+position would take years to produce. 20 000 random selections across four regimes
+with 9 587 exact ties and none inside the fp32 floor, six all-tied nodes where the
+lowest index has to win as an equality, and 400 enumerations of which 199 truncate
+and 80 have every logit identical, so the tie-break inside the radix select is
+exercised rather than assumed.
+
 ---
 
 ## 13. Not frozen
@@ -1106,6 +1231,9 @@ reported.
 | `sqrt(sum_b N(s,b))` or `sqrt(node visits)` | AGZ's formula in v0, which makes the first descent below every new node ignore the policy and take the lowest-index edge (§3.1a). The released pseudocode's form removes that. One line either way, and worth an A/B once Elo can be measured, because AGZ's form spends about 2 % of all selections on a systematically chosen move |
 | tree reuse | absent in v0 and present in AlphaZero (§3.6). Worth some fraction of `n` for free, which is the most expensive number here, and it costs a free list |
 | resignation | absent in v0 and present in AlphaZero (§3.7). A cost mechanism with a self-calibrating threshold, which C2 should have before any long run |
+| virtual loss | `mcts.md` §1.1 files it as an addition, and [`fidelity.md`](fidelity.md) §2.1(a) argues it is a deviation: AGZ's search ran threaded with virtual loss and AZ defers to AGZ, so v0's tree is slightly more concentrated than AlphaZero's at the same `n`. Ten minutes with the AGZ Methods settles it |
+| `tau_plies` in plies or moves | 30 plies in v0. AGZ says "the first 30 moves", which is a ply in Go and a pair in chess. [`fidelity.md`](fidelity.md) §2.1(c) |
+| fp16 priors under a trained policy | §4.2 stores priors as fp16, where a prior below 6e-8 flushes to zero and its exploration term is zero forever. Harmless at today's flat policy, unmeasured at a sharp one, and §15 has no counter for it. [`fidelity.md`](fidelity.md) §2.2 |
 | the game-length cap | absent in v0. AZ's Domain Knowledge item 5 terminates chess games "exceeding a maximum number of steps (determined by typical game length)" and scores them drawn; the pseudocode uses 512 plies. Our rules end games only as chess does, which is stricter and can produce longer games |
 
 ---
@@ -1169,6 +1297,81 @@ about 31 edges at the root and `n` visits to spread over them, `N / n` approache
 uniform-with-noise. The reference implementation shows this long before the kernel
 exists, which is a reason to look at it there.
 
+### 14.3 What the tree actually costs, measured 2026-07-30
+
+`bench/bench_search.py`, `logs/gate1a.log`. `B = 4096` games at 30 random plies,
+three interleaved rounds with the order reversed on alternate ones. The whole of §6
+runs on device: `root_init`, `n` simulations of descent, encoder, expansion and
+backup, and `select_and_advance`.
+
+| `n` | useful evals/s | raw evals/s | encoder alone | tree | tree, ms/simulation | s per move | mean/max depth |
+|---|---|---|---|---|---|---|---|
+| 32 | **58 942** | 59 021 | 63 547 | 4.4 % | 2.84 | 2.22 | 4.1 / 15 |
+| 128 | **58 763** | 58 852 | 61 890 | 4.3 % | 2.88 | 8.91 | 5.1 / 21 |
+| 800 | **56 996** | 57 265 | 59 852 | 4.4 % | 3.00 | 57.22 | 5.8 / 28 |
+
+**Gate 1 wanted 45-50k and gets 57.0k at the full `n = 800`.** The gated number is
+*useful* evaluations: a descent that ended on a stored terminal, or that created a
+terminal child, has nothing for the network to say, and §6.3 evaluates it anyway to
+keep the launch shape static. That waste is 0.5 % at `n = 800` and 0.1 % below it.
+
+The baseline is `n + 1` calls through `forward_full` and nothing else, because a
+move is `root_init` plus `n` simulations and each calls the encoder once. Charging
+the tree for one extra evaluation makes the overhead look like it falls with `n`
+(7.5 % → 4.5 %); it does not, it is flat.
+
+**The tree costs 3.00 ms per simulation at `B = 4096`, 0.73 µs per game.** Nearly
+flat in `n`: the 5 % rise from 32 to 800 is the mean depth going from 4.1 to 5.8,
+which is the only term that should grow and does.
+
+**Predicted 1.7 ms and 2.7 %, measured 3.00 ms and 4.4 %.** Two separate gaps.
+
+The absolute rate misses its 62.5k prediction because the encoder in this campaign
+is **59 852/s, not the 64 142/s of §4.4**. A 57-second block holds the card at
+1230-1290 MHz where the shorter encoder benchmark sits at 1.38-1.5 GHz, and 82 °C is
+where it settles. Sustained MCTS load throttles harder than the benchmark that sized
+it, which is a fact about the card and not about the search. The interleaved protocol
+is what keeps the *ratio* meaningful anyway.
+
+Scaled to the clock it actually ran at, the prediction was 1.84 ms against 3.00
+measured, so the tree is 1.6× more expensive than the arithmetic said. The
+prediction's dominant term was the two `movegen` calls, priced at the perft kernel's
+5.01M boards/s. That kernel uses 71 registers and fits three blocks per SM; inside
+`descent` the same code runs in a 96-register kernel at two blocks per SM, and inside
+`expand` at 72 with a different instruction mix. Lower occupancy on the dominant term
+is the leading candidate and it is **not measured**, because a 1.2 ms gap inside a
+4.4 % overhead is not worth a profiler run.
+
+⚠️ **§14.1 was wrong by two orders of magnitude, in the optimistic direction.** It
+put the tree near 0.05 % of a move; it is 4.4 %. Its error is not the 300-cycle guess
+for a descent level, which if anything was generous, since the measured mean depth is
+5.8 and not the 40 it assumed. Its error is scope: it costed the descent alone and
+explicitly set aside the two `movegen` calls, the expansion and the launches, which
+are the bulk of the 3.00 ms. The conclusion it drew still holds, since 4.4 % is not
+worth attacking, but the number it drew it from should not be quoted.
+
+**What §14's cost table becomes**, now that the tree is in it. The measured rate of
+real plies is `4096 / (s per move)`:
+
+| `n` | plies/s, arithmetic | plies/s, measured | 10M games (80 plies) |
+|---|---|---|---|
+| 32 | 2006 | 1845 | 120 h |
+| 128 | 502 | 460 | 483 h |
+| 800 | 80 | 71.6 | 3103 h |
+
+12 % above the arithmetic at every point, which is the tree plus the throttling.
+§14's ordering is unchanged: a full run at `n = 800` is out of the question on this
+card and the search budget is still the first thing to attack.
+
+**What the counters say about §4's fixed sizes**, over one instrumented move at each
+point. `E = 64` holds: 443 of 3 276 800 expansions truncated at `n = 800`, 0.0135 %
+against §4.3's estimate of 0.01 %, dropping 2.32 of prior mass in total across those
+443 nodes. The largest candidate count seen was **77**, above the 65 maximum in
+`data/cuda_testset`, which is the reminder §4.3 asks for that the histogram was
+measured on random playouts. And the node pool ends every move at exactly
+`801 of 801`: `Nmax = n + 1` is tight, not generous, and every simulation created a
+node.
+
 ---
 
 ## 15. Instrumentation
@@ -1217,6 +1420,22 @@ terms that feed it, and Gate 1a is the first read.
 ---
 
 ## Changelog
+
+**2026-07-30, the kernels land and Gate 1a is measured.** `csrc/search.cuh`,
+`csrc/search.cu` and `brokefish/search/cuda_impl.py` implement §9's four kernels;
+§12.3 is the differential harness and §14.3 the measurement. Trees agree with the
+reference field for field after every simulation, including one move at `n = 800`
+over 462,720 selections.
+
+Four things §9 had wrong or open, and each is now decided in the section: it is
+four launches per simulation and not three; `select_and_advance` stays in torch,
+since it runs once per move and needs a `multinomial`; the root's Dirichlet is drawn
+in torch and handed over as a tensor, which is what closes §12's open caveat and
+lets the differential test run at the real `eps`; and `descent` stages the leaf into
+a contiguous buffer for the encoder, which is also where `rep` is checkable.
+
+The tree costs less than §14.1 guessed and more than nothing. §14.3 has the numbers
+and where the estimate was wrong.
 
 **2026-07-30, the oracle lands, and the papers get read properly.**
 `tests/oracle.py` and `tests/test_oracle.py`: a second MCTS written from AGZ's

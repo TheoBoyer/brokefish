@@ -47,6 +47,7 @@ nav:
   - Engineering:
       - Search (MCTS v0): mcts.md
       - Environment: env.md
+      - Evaluation: evals.md
       - Performance ledger: perf.md
   - Prior art: due_diligence.md
   - Legacy:

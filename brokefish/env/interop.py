@@ -95,6 +95,27 @@ def list_legal_moves(words: torch.Tensor, mask: torch.Tensor) -> List[chess.Move
     return moves
 
 
+def label_to_move(words: torch.Tensor, label: int) -> chess.Move:
+    """One edge label ([spec §3](../../docs/spec.md), promotion field included)
+    -> a python-chess Move.
+
+    The single-label inverse of :func:`list_legal_moves`, which the search's edges
+    need because a tree edge already carries the promotion choice that a legality
+    mask leaves open. Source comes from the slot's own word rather than from the
+    label, since the label names a slot and not a square.
+    """
+    move = int(label) & ((1 << 11) - 1)
+    promo = (int(label) >> 11) & 0b11
+    slot, target = divmod(move, 64)
+    word = int(words[slot])
+    source = word & SQUARE
+    is_pawn = ((word >> 6) & 0b111) == PAWN
+    if is_pawn and target >> 3 in (0, 7):
+        # spec §3 order 0:N 1:B 2:R 3:Q; python-chess types run 2:N .. 5:Q.
+        return chess.Move(source, target, promotion=promo + 2)
+    return chess.Move(source, target)
+
+
 def move_to_args(moves: Union[chess.Move, List[Optional[chess.Move]]],
                  words: torch.Tensor) -> Dict[str, Optional[torch.Tensor]]:
     """python-chess Moves -> the `move` and `promo` tensors `step` takes.

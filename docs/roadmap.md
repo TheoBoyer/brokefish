@@ -464,15 +464,37 @@ it is" and drives the whole decomposition.
 Four evaluation layers, four different questions, four different costs — `evals.md`
 §1 has the table. The steps below are ordered by dependency, not by layer number.
 
-### D0. Position and game I/O, 0.5-1 day
+### D0. Position and game I/O ✅ 2026-07-30
 
-`to_fen`, move → UCI long-algebraic string, and a PGN writer. `brokefish/env/` has
-`from_fen`, `parse_san` and `from_pgn` and **none of the three inverses**, so nothing
-in the repository can currently emit a game.
+`brokefish/env/notation.py`: `to_fen`, `to_uci`, `to_san`, `to_pgn` and
+`GameRecorder`, the inverses of the `from_fen` / `parse_san` / `from_pgn` that
+already existed. Nothing in the repository could emit a game before this.
 
-⚠️ **This blocks every external-opponent layer and it depends on nothing.** It is
-also immediately useful for debugging the search, which is why it goes first despite
-being the least interesting item in the track.
+`tests/test_notation.py`, **30 tests**, python-chess as the oracle the way it is for
+the engine: FEN, UCI and SAN are compared **string for string** over ~600 positions
+and ~13 000 moves from random legal play, and the PGN test hands the output back to
+`chess.pgn` and checks the replayed position equals ours.
+
+⚠️ **SAN was the whole job.** UCI is a square-pair; SAN has three independent ways to
+be plausibly wrong — the disambiguation rule, the en passant capture that lands on an
+empty square, and the check/mate suffix — and each produces a move a human reader
+accepts. The disambiguation rule is also stated backwards easily: a rival on our
+*rank* forces the *file*. `test_disambiguation_by_file_rank_and_both` carries the
+case where neither hint alone resolves, which the first two cases pass without.
+
+⚠️ **A FEN round trip does not preserve slots.** `from_fen` assigns slots in FEN scan
+order while the engine keeps a piece in the slot it started the game in, so after
+1. Nh3 the two disagree: same position, permuted piece list. Pinned by
+`test_the_round_trip_does_not_preserve_slots`. **A FEN cannot resume anything that
+indexes by slot**, which includes the 32 policy tokens of spec §7.
+
+⚠️ The en passant field follows the **legal** convention — printed only when the
+capture is actually available, king safety included — matching `legal_ep_file`
+(spec §6.1) and python-chess's default. The other convention makes real repetitions
+invisible.
+
+`to_fen` takes the full-move number as an argument, because spec §2.2's control word
+carries the side to move and the halfmove clock and nothing else.
 
 ### D1. Self-contained diagnostics: layer 0 and layer 3, 1-2 days
 
@@ -684,7 +706,7 @@ parallel any more.
 
 ```
 C1 ✅ ──> C2 (3-4 d) ──> C4 ──> C5
-D0 ──> D1 ──> D2 ──> D3 ──> D4 ──> D5     off the path; D0 and D1 startable now
+D0 ✅ ──> D1 ──> D2 ──> D3 ──> D4 ──> D5     off the path; D1 startable now
 ```
 
 **On the path**: C1, then C2, then C4, then C5. C1 is now the *only* item on it
@@ -693,7 +715,7 @@ no written specification. That is the whole risk profile as of tonight.
 
 **Off it, and parallelisable now**:
 
-* **Track D**, the whole of it. D0 (the exporters) depends on nothing at all, and D1
+* **Track D**, the whole of it. D0 is closed, and D1
   (the self-contained diagnostics) needs only the engine, which exists. D2 can be
   built and tested against a *synthetic* ladder of degraded random-init nets, so it
   does not wait for C2's checkpoints either. Track D is now the largest block of

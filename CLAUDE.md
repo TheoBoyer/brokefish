@@ -82,6 +82,7 @@ csrc/        CUDA C++ — chess.cuh (the 12-bit representation) and encoder.cu (
 tests/       correctness (torch is the oracle)      python -m tests.test_model
              the B2 surface, boards to logits        python -m tests.test_b2
              the MCTS v0 reference                   python -m tests.test_search
+             FEN/UCI/SAN/PGN, python-chess oracle    python -m tests.test_notation
              it against an independent AZ oracle     python -m tests.test_oracle
              the CUDA search against the reference   python -m tests.test_search_cuda
              do those tests bite?                    pytest tests/ --mutation
@@ -90,8 +91,10 @@ bench/       throughput, interleaved A/B protocol   python -m bench.bench_model
              --path full (default, B2) or backbone (reproduces perf.md rows 0-9)
              Gate 1a, the whole of §6 on device      python -m bench.bench_search
 docs/        spec.md (normative engine/network contract), mcts.md (normative
-             search contract), perf.md (ledger), due_diligence.md (prior art),
-             fidelity.md (where we may be wrong about FIDE and AlphaZero)
+             search contract), evals.md (the evaluation contract, draft — Track D
+             in roadmap.md), perf.md (ledger), due_diligence.md (prior art),
+             fidelity.md (where we may be wrong about FIDE and AlphaZero),
+             debugger.md (normative trace format and viewer contract, no code yet)
 logs/        campaign output, tail -f-able while it runs; gate1a.log is C1's
 ```
 
@@ -401,8 +404,40 @@ tested. Exploratory kernels and learning exercises belong in a scratch directory
   AGZ meant move pairs; and **fp16 priors flush to zero below 6e-8**, which is
   harmless at today's flat policy, unmeasured at a sharp one, and has no counter.
   That last one turns from a caveat into a bug silently.
-- The rest of the RL layer (training loop, replay buffer, Elo protocol, cost
-  accounting) is **untouched** — no line written, no decision frozen.
+- `brokefish/env/notation.py` — **D0, the output side, done 2026-07-30**: `to_fen`,
+  `to_uci`, `to_san`, `to_pgn` and a batched `GameRecorder`, the inverses of the
+  `from_fen`/`parse_san`/`from_pgn` that already existed. Nothing could emit a game
+  before this, which blocked every external-opponent layer of `docs/evals.md`.
+  `tests/test_notation.py`, 30 tests, python-chess as the oracle **string for
+  string** over ~600 positions and ~13 000 moves of random legal play, plus a PGN
+  handed back to `chess.pgn` and replayed.
+  ⚠️ **SAN is the only hard part.** Three independent ways to be plausibly wrong:
+  disambiguation, the en passant capture landing on an empty square, and the
+  check/mate suffix. The disambiguation rule inverts easily — a rival on our *rank*
+  forces the *file* — and the test carries the case neither hint alone resolves.
+  ⚠️ **A FEN round trip does not preserve slots**: `from_fen` assigns them in scan
+  order, the engine keeps a piece where it started, so after 1. Nh3 the piece lists
+  are a permutation of each other. A FEN cannot resume anything indexed by slot.
+  ⚠️ En passant uses the **legal** convention (`legal_ep_file`, spec §6.1), matching
+  python-chess's default; the full-move number is an argument, since spec §2.2 does
+  not carry one. Binds to `torch_impl` on purpose: host-side I/O for evaluation,
+  never on the self-play path, so a PGN writer needs no CUDA toolchain.
+- `docs/evals.md` — the evaluation contract, **draft**, and Track D in the roadmap.
+  Four layers: regression (every checkpoint, ~6 s), the self-anchored checkpoint
+  league that produces the curve, external calibration, and the preregistered gate.
+  `eval_prior_art.md` at the root verifies every borrowed claim against the papers.
+  Settled so far: **no checkpoint gating** (so C2 does not depend on Track D), fixed
+  simulations per move rather than a time control, greedy move selection in
+  evaluation, target a CI width rather than a game count, and two cost numbers with
+  training-only on the curve's x-axis.
+  ⚠️ **Submission to CCRL is closed** — the list is CPU-only and refused a GPU
+  exception for Lc0 — so the anchor is a *borrowed* rating and our matches have to
+  reproduce the conditions it was measured under.
+  ⚠️ Evaluation output may never flow backwards. The prohibition that will actually
+  get violated is checkpoint selection: "keep the checkpoint with the best puzzle
+  score" is distillation through a one-bit channel and looks like good practice.
+- The rest of the RL layer (training loop, replay buffer, cost accounting) is
+  **untouched** — no line written, no decision frozen.
 
 ## Environment
 

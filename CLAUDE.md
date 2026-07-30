@@ -473,9 +473,15 @@ tested. Exploratory kernels and learning exercises belong in a scratch directory
 - `brokefish/eval/` — **layers 0 and 3 of `evals.md`, D1 done 2026-07-30**. The six
   rule suites (200 items each, cached in `data/suites.pt`), the layer-0 scalars, the
   Lichess puzzle curve, and `layer0_report()`, one call per checkpoint and one JSON
-  record out. `tests/test_eval.py` (29 tests) checks every answer key against
+  record out. `tests/test_eval.py` (33 tests) checks every answer key against
   python-chess; `bench/bench_eval.py` times it phase by phase into
   `logs/d1_layer0.log`.
+  ⚠️ **The Lichess CSV's column names and its "the first move is the opponent's"
+  convention are the one thing in the package with no oracle**: the reader is
+  tested against a CSV built from our own rules in the format `puzzles.py` claims,
+  which proves the reader, not the claim. It stays unverified until the real export
+  is on disk. `eval_prior_art.md` §8 confirms the licence, the count and the
+  Glicko-2 deviation field, and not the schema.
   ⚠️ **`max |post-scale attention logit|` is not here**, though `evals.md` §4 listed
   it as a fourth layer-0 scalar. It is an fp16 overflow watch on the kernels rather
   than a measurement of a net, it would be the only thing in `eval/` reaching inside

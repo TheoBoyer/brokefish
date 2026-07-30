@@ -31,6 +31,12 @@ the position to solve. Lichess's convention is that the *first* move in `Moves`
 is played for you and the solution starts at the second. Scoring the first move
 is scoring the opponent, which passes tests and measures nothing.
 
+⚠️ **This is the most expensive thing in `brokefish/eval/`, by a lot.** One puzzle
+costs a whole search, so `puzzles x n` evaluations is the bill: 2 000 puzzles at
+`n = 800` is 1.6M evals and about half a minute, and 20 000 is 16.4M and over five
+minutes of GPU at 100 %. On a laptop whose GPU also drives the display that is not
+a background job. Size it on the command line, deliberately.
+
 ⚠️ **A puzzle is a line, not a move.** We score the first solution move only, and
 say so: multi-move scoring needs the opponent's replies played from `Moves`,
 which is another layer of harness and is not what the curve is for. A first-move
@@ -195,3 +201,76 @@ def score_puzzles(puzzles: PuzzleSet, net, n: int = 800, impl: Optional[str] = N
     k = int(correct.sum())
     return {"n_puzzles": total, "n_sims": n, "solve_rate": k / total if total else 0.0,
             "ci95": list(_wilson(k, total)), "bins": bins}
+
+
+def uniform_baseline(puzzles: PuzzleSet) -> float:
+    """What a net that picks uniformly among the legal moves would score.
+
+    The null for the whole curve. Without it a solve rate is unreadable: 3 % looks
+    catastrophic and is exactly what "no chess knowledge at all" produces, because
+    a puzzle position has ~30 legal moves and one of them is the answer.
+    """
+    mask, _ = env.movegen(puzzles.boards, puzzles.control)
+    n_legal = env.bitset_to_bool(mask).reshape(len(puzzles), -1).sum(-1).float()
+    return float((1.0 / n_legal.clamp(min=1)).mean())
+
+
+def main() -> None:
+    import argparse
+    import json
+
+    import torch
+
+    from brokefish.nn.model import BrokefishNet
+
+    ap = argparse.ArgumentParser(description="the §8.2 solve-rate-versus-rating curve")
+    ap.add_argument("checkpoint", nargs="?", help="a torch state_dict; random init if absent")
+    ap.add_argument("--puzzles", default=DEFAULT_PUZZLE_PATH)
+    # ⚠️ Deliberately small. The 4060 in this machine is also the display
+    # adapter, and `limit=20000 --sims 800` is 16.4M evaluations -- five-plus
+    # minutes of pinned GPU, which took the desktop down with it on 2026-07-30.
+    # The defaults here are a ~30 s job; scale up only on a machine whose GPU is
+    # not driving a screen, and say so on the command line rather than in a file.
+    ap.add_argument("--limit", type=int, default=2_000)
+    ap.add_argument("--sims", type=int, default=800)
+    ap.add_argument("--batch", type=int, default=128)
+    ap.add_argument("--bin-width", type=int, default=200)
+    ap.add_argument("--max-deviation", type=int, default=100)
+    ap.add_argument("--impl", default="cuda")
+    ap.add_argument("--search-impl", default="cuda")
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--json", default=None)
+    args = ap.parse_args()
+
+    net = BrokefishNet().to(args.device)
+    if args.checkpoint:
+        net.load_state_dict(torch.load(args.checkpoint, map_location=args.device))
+    net.eval()
+
+    puzzles = load_puzzles(path=args.puzzles, limit=args.limit,
+                           max_deviation=args.max_deviation, device=args.device)
+    null = uniform_baseline(puzzles)
+    print(f"{len(puzzles)} puzzles, rating {int(puzzles.rating.min())}-"
+          f"{int(puzzles.rating.max())}, n={args.sims}", flush=True)
+    print(f"uniform-random baseline: {null:.4f}", flush=True)
+
+    out = score_puzzles(puzzles, net, n=args.sims, impl=args.impl,
+                        search_impl=args.search_impl, batch=args.batch,
+                        bin_width=args.bin_width, device=args.device)
+    out["uniform_baseline"] = null
+
+    print(f"\n{'rating':>12}  {'n':>6}  {'solved':>6}  {'rate':>7}  95% CI", flush=True)
+    for b in out["bins"]:
+        print(f"{b['rating_lo']:>5}-{b['rating_hi']:<6} {b['n']:>6}  {b['solved']:>6}  "
+              f"{b['rate']:>7.4f}  [{b['ci95'][0]:.4f}, {b['ci95'][1]:.4f}]", flush=True)
+    print(f"\noverall {out['solve_rate']:.4f} "
+          f"[{out['ci95'][0]:.4f}, {out['ci95'][1]:.4f}]  "
+          f"vs uniform {null:.4f}", flush=True)
+
+    if args.json:
+        with open(args.json, "a") as fh:
+            fh.write(json.dumps(out) + "\n")
+
+
+if __name__ == "__main__":
+    main()

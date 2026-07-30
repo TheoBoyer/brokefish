@@ -419,3 +419,142 @@ class TestPuzzles:
         from brokefish.eval.puzzles import load_puzzles
         with pytest.raises(FileNotFoundError, match="database.lichess.org"):
             load_puzzles(path="/nonexistent/puzzles.csv")
+
+    def test_the_setup_move_is_played_and_the_solution_is_the_second(self, tmp_path):
+        """The whole reader, on a CSV in Lichess's format built from our own rules.
+
+        ⚠️ This proves the reader does what the format says, **not** that the
+        format is what Lichess writes. The column names and the
+        first-move-is-the-opponent's convention are the one part of `puzzles.py`
+        with no oracle here, and they stay unverified until the real export is
+        on disk. Everything downstream of parsing is covered.
+        """
+        from brokefish.eval.puzzles import load_puzzles
+
+        path, expect = _write_puzzle_csv(tmp_path / "p.csv", n=64, seed=15)
+        puzzles = load_puzzles(path=str(path), device=DEVICE, max_deviation=100)
+        assert len(puzzles) == len(expect)
+
+        for i, (fen_after, solution) in enumerate(expect):
+            # The setup move was applied: the position the net is asked about is
+            # the one *after* Lichess's first move, not the one in the FEN column.
+            assert to_fen(puzzles.boards[i:i + 1], puzzles.control[i:i + 1],
+                          fullmove=1)[0].rsplit(" ", 1)[0] == fen_after.rsplit(" ", 1)[0]
+            # And the answer is the second move, in our label encoding. Compared
+            # as UCI because a FEN round trip permutes slots, so the label itself
+            # is not stable across the reader.
+            assert _to_move(puzzles.boards[i:i + 1],
+                            int(puzzles.answer[i])) == solution
+
+    def test_the_deviation_and_rating_filters_bite(self, tmp_path):
+        from brokefish.eval.puzzles import load_puzzles
+
+        path, expect = _write_puzzle_csv(tmp_path / "p.csv", n=64, seed=16,
+                                         deviation=lambda i: 40 if i % 2 else 400)
+        kept = load_puzzles(path=str(path), device=DEVICE, max_deviation=100)
+        # `_write_puzzle_csv` already drops the wide-deviation rows from `expect`.
+        assert len(kept) == len(expect) == 32
+        assert int(kept.deviation.max()) <= 100
+
+        narrow = load_puzzles(path=str(path), device=DEVICE, max_deviation=100,
+                              min_rating=1200, max_rating=1600)
+        assert 0 < len(narrow) < len(kept)
+        assert 1200 <= int(narrow.rating.min()) and int(narrow.rating.max()) <= 1600
+
+    def test_the_curve_is_binned_by_rating_and_the_bins_partition(self, tmp_path):
+        from brokefish.eval.puzzles import load_puzzles, score_puzzles
+
+        path, _e = _write_puzzle_csv(tmp_path / "p.csv", n=48, seed=17)
+        puzzles = load_puzzles(path=str(path), device=DEVICE)
+
+        rigged = _RiggedNet(_rigged_evaluator(
+            suites.Suite("p", "", puzzles.boards, puzzles.control,
+                         puzzles.answer[:, None], puzzles.answer[:, None],
+                         *env.empty_history(len(puzzles), device=DEVICE)),
+            puzzles.answer))
+        out = score_puzzles(puzzles, rigged, n=16, batch=48, device=DEVICE,
+                            bin_width=200)
+        assert out["solve_rate"] == 1.0
+        assert out["n_puzzles"] == len(puzzles)
+        # Every puzzle lands in exactly one bin, or the curve's x-axis is a lie.
+        assert sum(b["n"] for b in out["bins"]) == len(puzzles)
+        assert len(out["bins"]) > 1
+        for b in out["bins"]:
+            assert b["rating_lo"] <= b["rating_hi"] and b["rate"] == 1.0
+
+    def test_a_net_that_plays_something_else_scores_zero(self, tmp_path):
+        from brokefish.eval.puzzles import load_puzzles, score_puzzles
+
+        path, _e = _write_puzzle_csv(tmp_path / "p.csv", n=24, seed=18)
+        puzzles = load_puzzles(path=str(path), device=DEVICE)
+        wrong = _other_legal_move(puzzles.boards, puzzles.control, puzzles.answer)
+        rigged = _RiggedNet(_rigged_evaluator(
+            suites.Suite("p", "", puzzles.boards, puzzles.control,
+                         wrong[:, None], wrong[:, None],
+                         *env.empty_history(len(puzzles), device=DEVICE)),
+            wrong))
+        out = score_puzzles(puzzles, rigged, n=16, batch=24, device=DEVICE)
+        assert out["solve_rate"] == 0.0
+
+
+def _write_puzzle_csv(path, n: int, seed: int, deviation=None):
+    """A CSV in Lichess's column order, built from random legal play.
+
+    Each row is a position, one legal move played for the solver (Lichess's
+    convention: the first move in `Moves` is the opponent's), and one legal move
+    of the resulting position as the "solution". The solution is an arbitrary
+    legal move rather than a good one — this file tests the reader and the
+    scorer, and neither of them has an opinion about which move is right.
+    """
+    import csv as _csv
+
+    boards, control = positions.random_positions(n * 2, seed=seed, device=DEVICE)
+    game, label = probe.enumerate_moves(boards, control)
+    take = torch.tensor([int(label[(game == i).nonzero()[0]])
+                         for i in range(boards.shape[0])], device=DEVICE)
+    fens = to_fen(boards, control)
+    setup = [_to_move(boards[i:i + 1], int(take[i])) for i in range(boards.shape[0])]
+
+    after, after_c, _m, _c = env.play(boards, control, take & probe.MOVE_MASK,
+                                      promo=(take >> probe.PROMO_SHIFT) & 0b11)
+    g2, l2 = probe.enumerate_moves(after, after_c)
+
+    rows, expect = [], []
+    fens_after = to_fen(after, after_c)
+    for i in range(after.shape[0]):
+        if len(expect) >= n:
+            break
+        moves = (g2 == i).nonzero()
+        # At least two, so a "wrong move" exists: with one legal reply a net that
+        # is trying to be wrong still solves the puzzle, and a scorer test built
+        # on such a row measures nothing.
+        if moves.numel() < 2:
+            continue
+        sol = _to_move(after[i:i + 1], int(l2[moves[0]]))
+        dev = deviation(len(expect)) if deviation else 40
+        rows.append({"PuzzleId": f"p{len(expect):05d}", "FEN": fens[i],
+                     "Moves": f"{setup[i]} {sol}",
+                     "Rating": 800 + 50 * (len(expect) % 20), "RatingDeviation": dev,
+                     "Popularity": 90, "NbPlays": 1000, "Themes": "mateIn1",
+                     "GameUrl": "https://example.invalid", "OpeningTags": ""})
+        expect.append((fens_after[i], sol))
+
+    with open(path, "w", newline="") as fh:
+        w = _csv.DictWriter(fh, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    if deviation:
+        expect = [e for i, e in enumerate(expect) if deviation(i) <= 100]
+    return path, expect
+
+
+def _other_legal_move(boards, control, answer):
+    """Any legal label that is not the answer, per position."""
+    game, label = probe.enumerate_moves(boards, control)
+    out = answer.clone()
+    for i in range(boards.shape[0]):
+        for lab in label[game == i].tolist():
+            if lab != int(answer[i]):
+                out[i] = lab
+                break
+    return out

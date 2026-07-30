@@ -271,7 +271,7 @@ def _run(ref, cu, moves=1, prior_ulps=1.0, label=""):
                                + "\n  ".join(diffs[:6]))
         r1, r2 = ref.select_and_advance(), cu.select_and_advance()
         for f in ("board", "control", "rep", "policy_move", "policy_prob", "policy_len",
-                  "played", "ply", "done", "result"):
+                  "played", "ply", "root_value", "done", "result"):
             x, y = getattr(r1, f), getattr(r2, f)
             same = ((x.float() - y.float()).abs().max() == 0 if x.dtype.is_floating_point
                     else bool((x == y).all()))

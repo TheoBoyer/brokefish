@@ -404,6 +404,14 @@ Built in D1, `brokefish/eval/puzzles.py`. The CSV is not in the repository — 3
 of zstd, and not ours — so `load_puzzles` raises with the `curl` line rather than
 silently returning nothing.
 
+⚠️ **The schema is the one unverified thing in Track D's code.** The reader, the
+setup move, the deviation and rating filters and the rating binning are all tested,
+but against a CSV this repository writes itself in the format `puzzles.py` claims.
+That proves the reader and not the claim. `eval_prior_art.md` §8 verified the
+licence, the 6 014 381 count and the Glicko-2 deviation field against
+database.lichess.org; the column names and the two conventions below came from
+memory and stay unconfirmed until the export is on disk.
+
 ⚠️ **Lichess's `FEN` column is not the position to solve.** The first move in
 `Moves` is the opponent's and is played for you; the solution starts at the second.
 Scoring the first move scores the opponent, passes every test, and measures

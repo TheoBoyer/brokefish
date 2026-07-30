@@ -514,7 +514,13 @@ carries the side to move and the halfmove clock and nothing else.
   of a whole batch, one `step` and one `movegen` over the flattened move list.
 - `metrics.py` — the layer-0 scalars of §4 and the self-play run they come from.
 - `puzzles.py` — §8.2's Lichess curve. The 300 MB CSV is not in the repository and
-  `load_puzzles` raises with the `curl` line rather than returning nothing.
+  `load_puzzles` raises with the `curl` line rather than returning nothing. Tested
+  against a CSV built from our own rules in the format the module claims, which
+  covers the reader, the setup move, the filters and the binning. ⚠️ **What it does
+  not cover is whether that format is the one Lichess writes** — the column names
+  and the first-move-is-the-opponent's convention are unverified until the real
+  export is on disk, and `eval_prior_art.md` §8 checked the licence, the count and
+  the deviation field but not the schema.
 
 ⚠️ Puzzle results **never select a checkpoint** — §2's third prohibition, and the one
 most likely to be violated by accident, since "keep the checkpoint with the best

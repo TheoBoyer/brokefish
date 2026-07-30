@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>brokefish debugger</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>brokefish</h1>
+    <nav>
+      <button data-tab="traces" class="on">traces</button>
+      <button data-tab="viewer">viewer</button>
+      <button data-tab="play">play</button>
+    </nav>
+    <span id="status"></span>
+  </header>
+
+  <div id="banner" hidden></div>
+
+  <!-- traces ------------------------------------------------------------- -->
+  <section id="traces">
+    <form id="new-search">
+      <label>FEN <input name="fen" size="60" placeholder="start position"></label>
+      <label>n <input name="n" type="number" value="128" min="1" max="4096"></label>
+      <label>eps <input name="eps" type="number" value="0.25" step="0.05" min="0" max="1"></label>
+      <label>seed <input name="seed" type="number" value="0"></label>
+      <label>checkpoint <input name="checkpoint" size="24" placeholder="untrained"></label>
+      <button type="submit">search</button>
+      <button type="button" id="do-eval">evaluate only</button>
+    </form>
+    <div id="eval-out"></div>
+    <table id="trace-list">
+      <thead><tr><th>id<th>kind<th>n<th>played<th>checkpoint<th>position<th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <!-- viewer ------------------------------------------------------------- -->
+  <section id="viewer" hidden>
+    <div class="cols">
+      <div class="left">
+        <div id="board"></div>
+        <div id="board-caption"></div>
+        <div id="scrubber">
+          <input type="range" id="k" min="0" value="0">
+          <div class="row">
+            <button data-step="-100">&laquo;</button>
+            <button data-step="-1">&lsaquo;</button>
+            <span id="k-label">0</span>
+            <button data-step="1">&rsaquo;</button>
+            <button data-step="100">&raquo;</button>
+            <button id="play-sims">play</button>
+          </div>
+        </div>
+        <div id="sim-detail"></div>
+      </div>
+      <div class="right">
+        <div id="trace-header"></div>
+        <h2>root <span class="dim" id="root-sub"></span></h2>
+        <div id="root-table"></div>
+        <h2>node <span class="dim" id="node-sub"></span></h2>
+        <div id="node-detail"></div>
+        <h2>run</h2>
+        <div id="run-summary"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- play --------------------------------------------------------------- -->
+  <section id="play" hidden>
+    <form id="new-game">
+      <label>side
+        <select name="human_color"><option value="white">white</option>
+        <option value="black">black</option></select>
+      </label>
+      <label>n <input name="n" type="number" value="128" min="1" max="4096"></label>
+      <label>checkpoint <input name="checkpoint" size="24" placeholder="untrained"></label>
+      <label>FEN <input name="fen" size="40" placeholder="start position"></label>
+      <button type="submit">new game</button>
+      <button type="button" id="takeback">takeback</button>
+      <button type="button" id="search-here">search this position</button>
+    </form>
+    <div class="cols">
+      <div class="left">
+        <div id="game-board"></div>
+        <div id="game-caption"></div>
+      </div>
+      <div class="right">
+        <div id="game-moves"></div>
+      </div>
+    </div>
+  </section>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

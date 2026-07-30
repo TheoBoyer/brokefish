@@ -46,8 +46,10 @@ nav:
   - Roadmap: roadmap.md
   - Engineering:
       - Search (MCTS v0): mcts.md
+      - Training loop: train.md
       - Environment: env.md
       - Evaluation: evals.md
+      - Search debugger: debugger.md
       - Performance ledger: perf.md
   - Prior art: due_diligence.md
   - Legacy:

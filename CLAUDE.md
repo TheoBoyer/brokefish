@@ -85,6 +85,7 @@ tests/       correctness (torch is the oracle)      python -m tests.test_model
              FEN/UCI/SAN/PGN, python-chess oracle    python -m tests.test_notation
              it against an independent AZ oracle     python -m tests.test_oracle
              the CUDA search against the reference   python -m tests.test_search_cuda
+             the debugger's recorder and format      python -m tests.test_trace
              do those tests bite?                    pytest tests/ --mutation
              boards.py generates positions by random legal play — rules only
 bench/       throughput, interleaved A/B protocol   python -m bench.bench_model
@@ -94,7 +95,9 @@ docs/        spec.md (normative engine/network contract), mcts.md (normative
              search contract), evals.md (the evaluation contract, draft — Track D
              in roadmap.md), perf.md (ledger), due_diligence.md (prior art),
              fidelity.md (where we may be wrong about FIDE and AlphaZero),
-             debugger.md (normative trace format and viewer contract, no code yet)
+             debugger.md (normative trace format and viewer contract)
+debugger/    the web viewer, the only part not importable from `brokefish`
+             FastAPI + ES modules, no build step   README.md has the two commands
 logs/        campaign output, tail -f-able while it runs; gate1a.log is C1's
 ```
 
@@ -390,6 +393,31 @@ tested. Exploratory kernels and learning exercises belong in a scratch directory
   deep run reports the count rather than demanding zero.
   ⚠️ **It checks faithfulness of implementation, not of reading.** Where both follow the
   same reading of the paper, agreement proves nothing about the reading.
+- `brokefish/search/trace.py` + `debugger/` — **the search debugger, done 2026-07-30**.
+  `TracingSearch` records one `B = 1` reference search as the per-simulation deltas of
+  `docs/debugger.md` §4, and the web app replays them: root table with `Q` and `U`
+  split, a scrubber over the `n` simulations with the score that decided each descent
+  step, a node inspector, a run summary, and play against a checkpoint.
+  `tests/test_trace.py`, 18 checks. **1360 B per simulation, 18 ms per simulation** at
+  `B = 1`, so an `n = 800` move is about 15 s and the forms default to `n = 128`.
+  ⚠️ **FastAPI and uvicorn are not installed and not in `requirements.lock`**, because
+  nothing in the package imports them: `.venv/bin/pip install fastapi uvicorn`. The
+  reverse import, `brokefish` reaching into `debugger/`, is a defect.
+  ⚠️ **Every override in `TracingSearch` captures and returns unchanged.** Nothing
+  copies the reference's simulation body, and `_RecordingStats` exists because
+  `n_legal` and the truncated mass leave `_expand` only as arguments to the counter
+  block. `test_recording_does_not_change_the_search` compares a traced run against an
+  untraced one tensor for tensor; a recorder that halves the reference's speed is fine
+  and one that moves a bit of `edge_Q` is not.
+  ⚠️ **The viewer's replay is a second implementation the suite does not run.**
+  `static/trace.js` was checked against `trace.py` over three traces to 1e-12 with
+  node, which makes it a thing that was true on 2026-07-30. Change one, check both.
+  ⚠️ Torch only. The kernels agree with the reference tree for tree, so a trace is a
+  trace of what the kernel does *wherever `tests/test_search_cuda.py` covers*, and the
+  debugger is not evidence about the kernels.
+  ⚠️ No external engine evaluation in it, ever: not Stockfish, not a tablebase, not an
+  opening name. The operator is the route by which engine opinion would enter, and no
+  test covers that route (`docs/debugger.md` §8).
 - `docs/fidelity.md` — **where the reproduction may be wrong, written 2026-07-30**.
   Everything else in `docs/` records what was measured; this records what was not.
   Two audits: the search against AlphaZero, the engine against FIDE. Nothing in it is

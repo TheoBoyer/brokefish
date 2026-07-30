@@ -11,3 +11,4 @@ data/
 .venv/
 site/
 tests/_mutants/
+traces/

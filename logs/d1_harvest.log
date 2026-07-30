@@ -1,0 +1,8 @@
+<frozen runpy>:128: RuntimeWarning: 'brokefish.eval.suites' found in sys.modules after import of package 'brokefish.eval', but prior to execution of 'brokefish.eval.suites'; this may result in unpredictable behaviour
+mate_in_1                200  a mate in 1 is available
+avoid_stalemate          200  a mate in 1 is available and so is a stalemate
+avoid_fifty              200  a mate in 1 is available at halfmove clock 99
+avoid_threefold          199  a mate in 1 is available and one reply repeats a position twice seen
+avoid_insufficient       200  a mate in 1 is available and so is a dead-drawn material split
+underpromotion           200  every mating move is a promotion to a knight, bishop or rook
+-> ~/brokefish/data/suites.pt

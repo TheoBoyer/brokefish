@@ -102,6 +102,42 @@ pseudocode, which contradicts AGZ in three other places. `mcts.md` §1.1 already
 this; it is repeated here because it puts a ceiling on every other number in the
 table above. No amount of testing raises it.
 
+### 2.1a Raised and closed: the temperature does not enter the training target
+
+Recorded because the papers overload one symbol in a way that invites a wrong reading,
+and someone will re-derive it.
+
+AGZ names **one** object, `π_a ∝ N(s,a)^(1/τ)`, and uses it in both of the sentences
+that matter: the move is played "by sampling the search probabilities `π_t`", and "the
+data for each time-step `t` is stored as `(s_t, π_t, z_t)`". Methods, Self-Play then
+sets `τ = 1` for the first 30 moves and `τ → 0` afterwards. Read literally, that would
+make the *training target* one-hot on the most-visited move for the rest of every
+game — about 60 % of all positions at our game lengths.
+
+**It does not, and three first-hand sources agree.**
+
+- AGZ's own gloss on the schedule gives `τ` one job: "the temperature is set to
+  `τ = 1`; this **selects moves** proportionally to their visit count in MCTS, and
+  ensures a diverse set of positions are encountered".
+- AGZ frames MCTS as a **policy improvement operator** whose output *is* the improved
+  distribution, and trains "to maximise the similarity of the policy vector `p_t` to
+  the search probabilities `π_t`".
+- the released pseudocode separates the two explicitly. `store_search_statistics`
+  records `visit_count / sum_visits` — raw counts, **no temperature** — `make_target`
+  returns exactly that, and `num_sampling_moves = 30` appears only inside
+  `select_action`.
+
+So [`mcts.md`](mcts.md) §6.7's `pi(a) = N(a)/n` as the stored target, with `tau_plies`
+affecting only which move gets played, is what AlphaZero did. **No deviation.**
+[`train.md`](train.md) §3.1.
+
+⚠️ The same file bears on (c) above: `select_action` tests
+`len(game.history) < config.num_sampling_moves`, and `history` holds one entry per
+*action*, so the released code counts **30 plies**, not 30 move pairs — which is what
+v0 does. That does not settle what AGZ's prose meant, since in Go a move is a ply, but
+it removes the reading under which our exploration window is half the intended one.
+(c) stays open on the paper and is closed on the code.
+
 ### 2.2 One thing that is ours and has no AlphaZero analogue
 
 **fp16 priors.** [`mcts.md`](mcts.md) §4.2 stores `edge_prior` as fp16, where
@@ -251,7 +287,54 @@ none is a silent omission.
 
 ---
 
-## 4. How to use this document
+## 4. The training loop against AlphaZero
+
+Written 2026-07-30 alongside [`train.md`](train.md), before any C2 code exists, so
+every row is a statement about the *specification* and none of them is yet a
+statement about an implementation.
+
+⚠️ **The evidence here is weaker than anywhere else in this file, and structurally so.**
+§2's search had an independent AGZ transcription to check against and §3's engine has
+perft. A training loop has neither. [`train.md`](train.md) §12 lists eight necessary
+conditions that replace an oracle, and passing all eight is consistent with training a
+subtly wrong objective competently.
+
+### 4.1 Not in doubt
+
+Closed by the papers' own text rather than by a choice of ours, so they are recorded
+here only so the sheet below is not mistaken for the whole difference.
+
+**The value target** is the final game outcome in `{−1, 0, +1}` from the mover's point
+of view, quoted verbatim in `train.md` §4. **The loss** is AZ eq. (1) with the
+cross-entropy and mean-squared error weighted equally, which AGZ Methods states
+explicitly. **No checkpoint gating**: AZ removed AGZ's evaluator, and `evals.md` §11
+arrived at the same place independently. **Batch 4096 by gradient accumulation** is
+not a deviation at all — with LayerNorm and a mean loss it is arithmetically the same
+batch (`train.md` §7.2), which is what lets AZ's learning rate schedule be inherited
+rather than invented.
+
+### 4.2 Deviations, ranked by how much they could matter
+
+| | what | confidence it is harmless | why it stops there |
+|---|---|---|---|
+| a | **`lr = 0.2` under SGD+momentum** | low | AZ's value for a 20-block, ~46M-parameter convolutional resnet at batch 4096. Ours is a 6.38M-parameter pre-norm transformer initialised at `std = 1/sqrt(d)`. Nothing about that tuning transfers, and it will be re-tuned. **The re-tuned value is a deviation from AZ and must be recorded here with the number actually used** |
+| b | **the learning rate drop points** | medium | Published in neither paper. AZ p.14 says the rate "was dropped three times" and gives no steps; Figure 1's axis is not annotated. AGZ's Extended Data Table 3 is verified but has two drops at different values (57 % and 86 % of 700k steps). `train.md` §7.3 takes the released pseudocode's `learning_rate_schedule`, read 2026-07-30 as `{0: 2e-1, 100e3: 2e-2, 300e3: 2e-3, 500e3: 2e-4}` — three drops at AZ's four published values, i.e. **14 %, 43 %, 71 %**. Still the file §1.1 of `mcts.md` refuses as an authority, but here it *agrees* with the paper and supplies only what the paper omits |
+| c | ~~the replay window~~ | **not a deviation** | Settled 2026-07-30: the full AGZ figure of **500,000 games** is kept. ≈13.2 GB, which no machine here holds in RAM, but the buffer is a disk-backed memory mapping and the access pattern needs 1.6 MB/s — so the constraint was never RAM. `train.md` §5.2. Two things stay live: 13.2 GB of free disk is a precondition of a long run, and the sizing assumes an 80-ply mean game length that is an assumption rather than a measurement |
+| d | **strict phase alternation** | medium | AZ runs self-play and training concurrently and continuously, 5000 TPUs against 64, so self-play always holds the newest parameters. We have one GPU and the 8 GB budget was measured on the premise that the two activation blocks never coexist. Staleness is therefore bounded by a generation rather than by parameter-server lag. Measurable after the fact: `weight_gen` is stamped into every record |
+| e | **the game-length cap at 512 plies** | high | AZ's Domain Knowledge item 5 caps chess games and scores them drawn but does not give the number; 512 is the pseudocode's. Our rules are *stricter* than AZ's plane encoding implies (we implement the fifty-move rule and threefold), so the cap should rarely fire. `train.md` §5.4 makes its firing rate a logged counter rather than an assumption |
+| f | **`samples_per_game = 65.2`** | high | Not a published parameter — a ratio *derived* from two published counts (700,000 × 4,096 minibatch positions against 44M training games, AZ Table S3 and p.4). It reproduces AZ's data economics exactly if our mean game length matches theirs, and approximately if it does not, since the per-position reuse is the derived quantity and the per-game one is what we hold fixed |
+| g | **the masked policy softmax** | high | `train.md` §3.3. AZ's Representation section says illegal moves are masked and renormalised, and our search's prior is a masked softmax, so training on the same support is the faithful reading. The unmasked alternative is *coherent* rather than wrong — softmax is consistent under restriction — so this is a choice between two defensible readings, not a departure |
+| h | **SGD+momentum, if it is ever replaced** | n/a today | AGZ Methods: momentum 0.9, `c = 10⁻⁴`, and AZ defers to it. `train.md` §7.1 specifies it. Our measured 5000 positions/s was AdamW; **if AdamW is kept for throughput or stability that is a real deviation and belongs in this table with the reason** |
+
+⚠️ **(a) and (b) are the two the project will actually depart on**, and they compound:
+a re-tuned learning rate makes the inherited drop *points* mean something different
+again, since both were AZ's for a schedule we are no longer running. The honest
+description of what ships is "AZ's schedule shape, our magnitudes", and that sentence
+should appear next to any Elo number that depends on it.
+
+---
+
+## 5. How to use this document
 
 An entry here should either be closed or be re-argued when the thing it depends on
 changes. In particular:
@@ -261,6 +344,9 @@ changes. In particular:
 * §2.2's fp16 prior underflow becomes measurable the moment a trained network
   exists, and the counter that would measure it does not exist yet. That is the one
   entry that turns from a caveat into a bug silently.
+* §4.2(a) is the entry whose *value* is not yet known: the re-tuned learning rate. It
+  must be written back here with the number actually used, or the table records an
+  intention rather than the run.
 * §3.2(a) is fixed by choice and should be revisited only if evaluation against an
   external engine ever needs FIDE claim semantics.
 * §3.3's coverage assertions are cheap and would remove the only place where the

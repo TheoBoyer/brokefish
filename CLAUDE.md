@@ -73,8 +73,8 @@ Jones' law (+500 Elo per 10× compute).
 ```
 brokefish/   Python package — nn/ (model.py is the whole network and the oracle;
              one file per fused implementation, selected by name through
-             `encoder_impl`), env/ (the PyTorch engine), search/ (the MCTS);
-             training will land here
+             `encoder_impl`), env/ (the PyTorch engine), search/ (the MCTS),
+             eval/ (layers 0 and 3 of evals.md); training will land here
 csrc/        CUDA C++ — chess.cuh (the 12-bit representation) and encoder.cu (the
              network) are settled; movegen.cuh holds the first order, contract for
              the rest in csrc/README.md. Device tests in csrc/tests/, one nvcc line
@@ -86,11 +86,13 @@ tests/       correctness (torch is the oracle)      python -m tests.test_model
              it against an independent AZ oracle     python -m tests.test_oracle
              the CUDA search against the reference   python -m tests.test_search_cuda
              the debugger's recorder and format      python -m tests.test_trace
+             the rule suites and layer-0 scalars     python -m tests.test_eval
              do those tests bite?                    pytest tests/ --mutation
              boards.py generates positions by random legal play — rules only
 bench/       throughput, interleaved A/B protocol   python -m bench.bench_model
              --path full (default, B2) or backbone (reproduces perf.md rows 0-9)
              Gate 1a, the whole of §6 on device      python -m bench.bench_search
+             layer 0's cost, phase by phase          python -m bench.bench_eval
 docs/        spec.md (normative engine/network contract), mcts.md (normative
              search contract), evals.md (the evaluation contract, draft — Track D
              in roadmap.md), perf.md (ledger), due_diligence.md (prior art),
@@ -98,7 +100,10 @@ docs/        spec.md (normative engine/network contract), mcts.md (normative
              debugger.md (normative trace format and viewer contract)
 debugger/    the web viewer, the only part not importable from `brokefish`
              FastAPI + ES modules, no build step   README.md has the two commands
-logs/        campaign output, tail -f-able while it runs; gate1a.log is C1's
+data/        cuda_testset (the A1 differential dump) and suites.pt (D1's rule
+             suites, regenerate with `python -m brokefish.eval.suites`)
+logs/        campaign output, tail -f-able while it runs; gate1a.log is C1's,
+             d1_layer0.log is layer 0's cost ledger
 ```
 
 This is a production repository: no staging areas, no step-by-step ladders, no
@@ -451,8 +456,9 @@ tested. Exploratory kernels and learning exercises belong in a scratch directory
   not carry one. Binds to `torch_impl` on purpose: host-side I/O for evaluation,
   never on the self-play path, so a PGN writer needs no CUDA toolchain.
 - `docs/evals.md` — the evaluation contract, **draft**, and Track D in the roadmap.
-  Four layers: regression (every checkpoint, ~6 s), the self-anchored checkpoint
-  league that produces the curve, external calibration, and the preregistered gate.
+  Four layers: regression (every checkpoint, **44.4 s measured**), the self-anchored
+  checkpoint league that produces the curve, external calibration, and the
+  preregistered gate.
   `eval_prior_art.md` at the root verifies every borrowed claim against the papers.
   Settled so far: **no checkpoint gating** (so C2 does not depend on Track D), fixed
   simulations per move rather than a time control, greedy move selection in
@@ -464,6 +470,45 @@ tested. Exploratory kernels and learning exercises belong in a scratch directory
   ⚠️ Evaluation output may never flow backwards. The prohibition that will actually
   get violated is checkpoint selection: "keep the checkpoint with the best puzzle
   score" is distillation through a one-bit channel and looks like good practice.
+- `brokefish/eval/` — **layers 0 and 3 of `evals.md`, D1 done 2026-07-30**. The six
+  rule suites (200 items each, cached in `data/suites.pt`), the layer-0 scalars, the
+  Lichess puzzle curve, and `layer0_report()`, one call per checkpoint and one JSON
+  record out. `tests/test_eval.py` (29 tests) checks every answer key against
+  python-chess; `bench/bench_eval.py` times it phase by phase into
+  `logs/d1_layer0.log`.
+  ⚠️ **`max |post-scale attention logit|` is not here**, though `evals.md` §4 listed
+  it as a fourth layer-0 scalar. It is an fp16 overflow watch on the kernels rather
+  than a measurement of a net, it would be the only thing in `eval/` reaching inside
+  `net.encoder.layers`, and it can only read the torch oracle's logits rather than
+  the accumulator that overflows. It belongs to C2 and `docs/train.md` §11 already
+  carries it. Dropped 2026-07-30.
+  ⚠️ **Every suite's answer key is a spec §4.3 terminal code**, never a material
+  count and never an evaluation, which is what keeps them inside the tabula rasa
+  boundary during training. `evals.md`'s original definitions of stalemate
+  avoidance and underpromotion both needed something else — a material count and a
+  search — and were restated one ply deep: a mate must exist, the wrong move must be
+  a named draw. There is deliberately no "best move" suite.
+  ⚠️ **`tests/boards.py`'s random legal play cannot generate five of the six.** In
+  170 924 positions from the start: 2 150 mate-in-1, 85 stalemate-avoidance, 3
+  threefold, **0** underpromotion. `eval/positions.py` samples sparse endgames
+  directly and lets `movegen` reject the illegal ones — 18× the yield, a bias in
+  which positions are looked at and never in the key. `avoid_fifty` sets the clock
+  to 99 and `avoid_threefold` **plants the repetition ring**; nothing else in the
+  repository plants a ring.
+  ⚠️ **The promotion field does not identify a promotion**: spec §3 is `0:N 1:B 2:R
+  3:Q` and a non-promotion move also carries field 0, so testing `promo == 0` for
+  "knight promotion" silently deletes the whole underpromotion motif. Ask the board,
+  through `promotion_targets`.
+  ⚠️ **44.4 s, against §4's predicted ~6 s** (fused encoder, CUDA search). The
+  estimate assumed 80-ply games where a random-init net plays 125, and costed the
+  mean game where the loop pays for the longest in the batch. Both fixes failed and
+  are written down: collecting the first `N` games *to finish* is 1.5× cheaper and
+  biases mean game length short by 24 plies — disqualifying, since game length is
+  one of the three metrics — and `batch < games` came out marginally worse. Layer 0
+  still never blocks. The suites are 2.8 s of the 44.4; self-play is 41.4.
+  ⚠️ Evaluation must run under `no_grad`. The first version did not, and the fp32
+  master weights built an autograd graph across a 300-ply run that OOM'd an 8 GB
+  card at 8 games.
 - The rest of the RL layer (training loop, replay buffer, cost accounting) is
   **untouched** — no line written, no decision frozen.
 

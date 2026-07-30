@@ -1,0 +1,93 @@
+suites: mate_in_1=200, avoid_stalemate=200, avoid_fifty=200, avoid_insufficient=200, underpromotion=200, avoid_threefold=199
+
+encoder=cuda  search=cuda
+  self-play games                       42.45 s
+  value calibration                      0.01 s
+  policy entropy                         0.06 s
+  game statistics                        0.01 s
+  attention logit scan                   0.73 s
+  suite mate_in_1 (search)               0.48 s
+  suite avoid_stalemate (search)         0.48 s
+  suite avoid_fifty (search)             0.47 s
+  suite avoid_insufficient (search)      0.45 s
+  suite underpromotion (search)          0.47 s
+  suite avoid_threefold (search)         0.48 s
+  suite mate_in_1 (policy)               0.03 s
+  suite avoid_stalemate (policy)         0.02 s
+  suite avoid_fifty (policy)             0.03 s
+  suite avoid_insufficient (policy)      0.02 s
+  suite underpromotion (policy)          0.02 s
+  suite avoid_threefold (policy)         0.01 s
+  TOTAL                                 46.23 s   (64 games, 7996 scored plies, 0 unfinished)
+suites: mate_in_1=200, avoid_stalemate=200, avoid_fifty=200, avoid_insufficient=200, underpromotion=200, avoid_threefold=199
+
+encoder=cuda  search=cuda
+  self-play games                      279.77 s
+  value calibration                      0.01 s
+  policy entropy                         0.06 s
+  game statistics                        0.01 s
+  attention logit scan                   0.67 s
+  suite mate_in_1 (search)               0.49 s
+  suite avoid_stalemate (search)         0.48 s
+  suite avoid_fifty (search)             0.47 s
+  suite avoid_insufficient (search)      0.46 s
+  suite underpromotion (search)          0.47 s
+  suite avoid_threefold (search)         0.49 s
+  suite mate_in_1 (policy)               0.03 s
+  suite avoid_stalemate (policy)         0.02 s
+  suite avoid_fifty (policy)             0.02 s
+  suite avoid_insufficient (policy)      0.01 s
+  suite underpromotion (policy)          0.01 s
+  suite avoid_threefold (policy)         0.01 s
+  TOTAL                                283.48 s   (512 games, 68395 scored plies, 12 unfinished)
+--- after: games is a count, not a batch size ---
+suites: mate_in_1=200, avoid_stalemate=200, avoid_fifty=200, avoid_insufficient=200, underpromotion=200, avoid_threefold=199
+
+encoder=cuda  search=cuda
+  self-play games                       26.00 s
+  value calibration                      0.01 s
+  policy entropy                         0.05 s
+  game statistics                        0.01 s
+  attention logit scan                   0.67 s
+  suite mate_in_1 (search)               0.48 s
+  suite avoid_stalemate (search)         0.46 s
+  suite avoid_fifty (search)             0.46 s
+  suite avoid_insufficient (search)      0.44 s
+  suite underpromotion (search)          0.46 s
+  suite avoid_threefold (search)         0.46 s
+  suite mate_in_1 (policy)               0.03 s
+  suite avoid_stalemate (policy)         0.01 s
+  suite avoid_fifty (policy)             0.01 s
+  suite avoid_insufficient (policy)      0.01 s
+  suite underpromotion (policy)          0.01 s
+  suite avoid_threefold (policy)         0.01 s
+  TOTAL                                 29.62 s   (64 games, 6465 scored plies, 64 unfinished)
+--- collection by start order (unbiased), batch = games ---
+  suite underpromotion (policy)          0.01 s
+  suite avoid_threefold (policy)         0.01 s
+  TOTAL                                 44.99 s   (64 games, 7996 scored plies, 0 abandoned, 64 in flight)
+--- same, batch = 16 ---
+  suite underpromotion (policy)          0.01 s
+  suite avoid_threefold (policy)         0.01 s
+  TOTAL                                 45.82 s   (62 games, 8246 scored plies, 2 abandoned, 16 in flight)
+--- attention logit scan dropped (out of scope for eval; docs/train.md 11 owns it) ---
+suites: mate_in_1=200, avoid_stalemate=200, avoid_fifty=200, avoid_insufficient=200, underpromotion=200, avoid_threefold=199
+
+encoder=cuda  search=cuda  games=64 batch=64
+  self-play games                       41.43 s
+  value calibration                      0.02 s
+  policy entropy                         0.09 s
+  game statistics                        0.02 s
+  suite mate_in_1 (search)               0.45 s
+  suite avoid_stalemate (search)         0.45 s
+  suite avoid_fifty (search)             0.46 s
+  suite avoid_insufficient (search)      0.43 s
+  suite underpromotion (search)          0.46 s
+  suite avoid_threefold (search)         0.46 s
+  suite mate_in_1 (policy)               0.06 s
+  suite avoid_stalemate (policy)         0.01 s
+  suite avoid_fifty (policy)             0.01 s
+  suite avoid_insufficient (policy)      0.01 s
+  suite underpromotion (policy)          0.01 s
+  suite avoid_threefold (policy)         0.01 s
+  TOTAL                                 44.39 s   (64 games, 7996 scored plies, 0 abandoned, 64 in flight)

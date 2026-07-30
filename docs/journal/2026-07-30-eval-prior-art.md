@@ -1,15 +1,14 @@
 # Evaluation prior art — verification pass
 
-**2026-07-30.** Written to check the claims in [`docs/evals.md`](docs/evals.md) §12
+**2026-07-30.** Written to check the claims in [`evaluation.md`](../reference/evaluation.md) §12
 against the papers rather than against memory, and to look at what the other
-from-scratch projects actually do. Deliberately **not** in the MkDocs nav (`mkdocs.yml`):
-working material, not part of the published site.
+from-scratch projects actually do.
 
 Everything below was read this session. Where a claim could not be sourced it says so.
 
 ---
 
-## 1. Scorecard: what `evals.md` §12 claimed, and what is true
+## 1. Scorecard: what `evaluation.md` §12 claimed, and what is true
 
 | claim as written | verdict |
 |---|---|
@@ -20,7 +19,7 @@ Everything below was read this session. Where a claim could not be sourced it sa
 | AZ's training curve is self-anchored | ⚠️ **half wrong** — see §2.4 |
 | AZ's training curve uses BayesElo | ✅ **confirmed** (marked "medium confidence"; it is stated outright) |
 | KataGo fits BT/BayesElo over a graph rather than chaining | ✅ **confirmed**, with a better pairing rule than I proposed |
-| **KataGo does not gate** — implied by `evals.md` §11's "AZ says no" | ❌ **wrong**. KataGo gates: 100 wins out of 200 |
+| **KataGo does not gate** — implied by `evaluation.md` §11's "AZ says no" | ❌ **wrong**. KataGo gates: 100 wins out of 200 |
 | lc0 gated early and dropped it later | ❌ **not verified, and probably backwards** — see §4 |
 | lc0 has visibly hit self-anchored Elo inflation | ✅ **confirmed from lc0's own FAQ** |
 | Lichess puzzles: CC0, ~4M, Glicko-rated | ⚠️ **stale** — CC0 ✅, but 6.01M and Glicko-2 with a deviation field |
@@ -56,7 +55,7 @@ For contrast, the thing that was removed
 > player.
 
 400 games at 55 % is a ~35 Elo detection threshold — consistent with the §9
-arithmetic in `evals.md`, and worth noting that AGZ chose a *margin*, not a
+arithmetic in `evaluation.md`, and worth noting that AGZ chose a *margin*, not a
 significance test.
 
 ### 2.2 800 simulations — confirmed
@@ -75,7 +74,7 @@ control **3 h + 15 s increment**. Openings: 12 common human openings plus the TC
 S9 superfinal positions. Result **155 W / 6 L** (so ~839 draws). Additional matches
 at time odds of 1/3 and 1/10.
 
-⚠️ **AZ gave Stockfish tablebases.** `docs/roadmap.md` and `evals.md` §7 say "no
+⚠️ **AZ gave Stockfish tablebases.** `roadmap.md` and `evaluation.md` §7 say "no
 tablebases on either side or the same on both". The precedent we cite is the third
 option: tablebases for the opponent only. That is defensible (it strengthens the
 opponent) but it is not what our sentence says, and it should be a deliberate choice.
@@ -86,21 +85,21 @@ opponent) but it is not what our sentence says, and it should be a deliberate ch
 > between iterations of AlphaZero during training, and also a baseline player" using
 > "BayesElo" with "standard constant c_elo = 1/400".
 
-Two corrections to `evals.md` §12:
+Two corrections to `evaluation.md` §12:
 
 1. **It is not purely self-anchored.** The tournament includes a baseline player
    alongside the AZ iterations. The self-anchored part is right — most games are
    between checkpoints — but there is an external anchor *in the fit*, which is
    closer to what §6 (calibration) proposes than to a pure checkpoint league.
 2. **It is a time control, not a simulation count.** One second per move.
-   `evals.md` §3 recommends fixed simulations per move and does not cite AZ for
+   `evaluation.md` §3 recommends fixed simulations per move and does not cite AZ for
    it — correctly, as it turns out, but the doc should say so explicitly so nobody
    later assumes AZ backs it. The reasons in §3 (thermal drift, hardware
    independence, `n` as an axis) stand on their own; AZ is simply silent, or mildly
    against.
 
 Also worth having: at evaluation AZ "selects moves greedily with respect to the root
-visit count" — temperature 0, no Dirichlet. That is a protocol detail `evals.md`
+visit count" — temperature 0, no Dirichlet. That is a protocol detail `evaluation.md`
 does not currently state and should.
 
 ---
@@ -116,7 +115,7 @@ Source: David J. Wu, *Accelerating Self-Play Learning in Go*,
 > "a global Bayesian maximum-likelihood Elo based on all game results so far", via
 > "a custom implementation of BayesElo"
 
-A global fit over all games, not a chain of pairwise deltas. This is what `evals.md`
+A global fit over all games, not a chain of pairwise deltas. This is what `evaluation.md`
 §5.2 claims and it holds.
 
 **The pairing rule is better than what I proposed.** Games are played
@@ -126,7 +125,7 @@ A global fit over all games, not a chain of pairwise deltas. This is what `evals
 where `p` is the win probability predicted by the current global fit. That is an
 information-maximising schedule: it spends games on pairings whose outcome is
 genuinely uncertain and stops burning games on pairings the fit already resolves.
-`evals.md` §5.2 currently says "predecessor plus several much older checkpoints",
+`evaluation.md` §5.2 currently says "predecessor plus several much older checkpoints",
 which is a hand-specified approximation of the same idea. Variance-proportional
 sampling is strictly better and is not harder to implement — it needs the fit to be
 online, which it has to be anyway.
@@ -144,7 +143,7 @@ versions and ELF, anchored so that ELF is about Elo 0." Not a random-init net.
 So the two references we follow disagree: **AZ removed gating, KataGo kept it**, and
 KataGo is the one that is explicitly optimising for wall-clock efficiency on a small
 budget — which is our situation, not AZ's. That makes the open question in
-`evals.md` §11 sharper rather than settled, and it means the eval harness may well be
+`evaluation.md` §11 sharper rather than settled, and it means the eval harness may well be
 a C2 dependency.
 
 200 games at a 50 % bar is a much weaker filter than AGZ's 400 at 55 %; it is closer
@@ -170,7 +169,7 @@ and
 > "Self-play tends to exaggerate gains in Elo compared to gains when playing other
 > chess engines."
 
-Two things follow for us. The inflation warning in `evals.md` §5.2 is well founded
+Two things follow for us. The inflation warning in `evaluation.md` §5.2 is well founded
 and comes from the project that lived it. And **lc0 anchors its scale at the first
 net = Elo 0**, which is exactly the frozen-random-init anchor of §5.1 — that
 proposal now has a precedent rather than being invented here.
@@ -183,7 +182,7 @@ and secondary material describes gating as an ongoing part of Leela Zero's proce
 including as a defence against value-head overfitting. There is no document I found
 saying it was removed.
 
-⚠️ **This claim should come out of `evals.md` §12 rather than be softened.** It is
+⚠️ **This claim should come out of `evaluation.md` §12 rather than be softened.** It is
 the kind of half-remembered project-lore that is worse than saying nothing, because
 it reads as evidence for dropping gating when it is not.
 
@@ -212,7 +211,7 @@ Their concrete schedule: each promoted network plays generations at offsets
 panel and across the two training runs, fitted by maximum likelihood with a
 draw-aware Bayesian model.
 
-This is the citation `evals.md` §5.2 should carry — it states the failure mode, names
+This is the citation `evaluation.md` §5.2 should carry — it states the failure mode, names
 gating as an aggravating factor, and gives a ready-made pairing schedule. Note the
 graph density: **13 000 edges over 1 000 nodes**, i.e. ~13 pairings per network, which
 is a useful sizing number for our own league.
@@ -233,12 +232,12 @@ open-source Go AI at the time — both sides at 50 s per move, final record 980:
 
 The relevance is negative and useful: ELF is the pattern where the whole evaluation
 rests on one external opponent, and the resulting number ("98.2 % against LZ") does
-not place the engine on any transferable scale. That is what `evals.md` §7's
+not place the engine on any transferable scale. That is what `evaluation.md` §7's
 "basket, not one opponent" is trying to avoid.
 
 ---
 
-## 7. CCRL, since §7 of `evals.md` proposes anchoring to it
+## 7. CCRL, since §7 of `evaluation.md` proposes anchoring to it
 
 Source: [CCRL 40/15 about page](https://computerchess.org.uk/4040/about.html).
 
@@ -255,7 +254,7 @@ Source: [CCRL 40/15 about page](https://computerchess.org.uk/4040/about.html).
 awkward for a GPU engine — the equivalence is defined by a Stockfish benchmark, so
 our own hardware normalisation is undefined and would have to be argued. And their
 12-move generic book is not UHO or TCEC, so "UHO/TCEC books" and "CCRL conditions"
-are not the same protocol; `evals.md` currently implies they compose.
+are not the same protocol; `evaluation.md` currently implies they compose.
 
 ---
 
@@ -271,11 +270,11 @@ Source: [database.lichess.org](https://database.lichess.org/),
 
 The rating-deviation field is worth using rather than ignoring: filtering to puzzles
 with low deviation gives a much cleaner difficulty axis for the solve-rate curve of
-`evals.md` §8.2.
+`evaluation.md` §8.2.
 
 ---
 
-## 9. What this changes in `docs/evals.md`
+## 9. What this changes in `evaluation.md`
 
 Applied in the same pass as this report:
 

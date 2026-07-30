@@ -51,7 +51,7 @@ pass vacuously.
 board diagram and the slot-by-slot word diff exist once.
 
 `tselect.cu` needs no dump: it generates its own cases from a host splitmix64 and
-compares against a reference written from `docs/mcts.md` rather than copied from
+compares against a reference written from `docs/reference/search.md` rather than copied from
 the kernel. The stronger check on those two functions is the tree-for-tree
 comparison in `tests/test_search_cuda.py`; this one exists because that comparison
 reports "the trees diverged at simulation 43" and cannot say which of the two
@@ -61,7 +61,7 @@ tied, every logit tied, 218 candidates, exactly 64 candidates.
 `tperft.cu` matters for a reason the other two cannot cover. They compare the kernel
 to the PyTorch engine, so a bug the two engines share passes both. Perft's counts are
 published values. Porting the movegen found exactly such a shared bug, an int64
-overflow in `terminal` that `docs/env.md` records.
+overflow in `terminal` that `docs/reference/environment.md` records.
 
 `tzobrist.cu`'s last check is the one that cannot be faked, and it uses no oracle:
 hashing a child position from scratch has to agree with having arrived at it by an

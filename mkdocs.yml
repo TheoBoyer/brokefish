@@ -1,10 +1,13 @@
 site_name: Brokefish
 site_description: The cheapest superhuman chessbot from scratch
-# site_url and repo_url are unset on purpose: the repo is not under git yet and the
+# site_url and repo_url are unset on purpose: the repository is not published and the
 # domain is not chosen. Both are cosmetic (canonical link, "edit this page" button).
 
-# Build:  .venv/bin/mkdocs build   ->  site/
-# Serve:  .venv/bin/mkdocs serve   ->  http://127.0.0.1:8000 with live reload
+# mkdocs is not in .venv and does not belong there: .venv is the frozen stack every
+# number in docs/ledger/perf.md was measured on. It runs ephemerally through uvx.
+#
+# Build:  uvx --with mkdocs-material mkdocs build --strict   ->  site/
+# Serve:  uvx --with mkdocs-material mkdocs serve            ->  127.0.0.1:8000, live reload
 #
 # Markdown under docs/ is the source of truth; the HTML in site/ is generated and
 # is not committed. Deploying to GitHub Pages is `mkdocs gh-deploy`.
@@ -40,18 +43,30 @@ theme:
     - search.highlight
     - search.suggest
 
+# The nav mirrors docs/, and the directory is the kind of document:
+#   reference/  normative — what the code must do. No dates, no measurements.
+#   ledger/     the measured numbers, one place each.
+#   journal/    dated and append-only. Never edited to stay true.
 nav:
   - Brokefish: index.md
-  - Specification: spec.md
   - Roadmap: roadmap.md
-  - Engineering:
-      - Search (MCTS v0): mcts.md
-      - Training loop: train.md
-      - Environment: env.md
-      - Evaluation: evals.md
-      - Search debugger: debugger.md
-      - Performance ledger: perf.md
-  - Prior art: due_diligence.md
+  - Reference:
+      - Specification: reference/spec.md
+      - Search: reference/search.md
+      - Training loop: reference/training.md
+      - Evaluation: reference/evaluation.md
+      - Environment: reference/environment.md
+      - Search debugger: reference/debugger.md
+  - Ledger:
+      - State: ledger/state.md
+      - Performance: ledger/perf.md
+  - Journal:
+      - journal/index.md
+      - 2026-07-31 · Build log, A0 through D1: journal/2026-07-31-build-log.md
+      - 2026-07-30 · Eval prior art: journal/2026-07-30-eval-prior-art.md
+      - 2026-07-30 · Fidelity audit: journal/2026-07-30-fidelity.md
+      - 2026-07-29 · Writing the encoder kernel: journal/2026-07-29-encoder-kernel.md
+      - 2026-07-28 · Prior art survey: journal/2026-07-28-prior-art.md
   - Legacy:
       - Board representation (superseded): legacy/representation.md
 

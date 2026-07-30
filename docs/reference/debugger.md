@@ -1,7 +1,7 @@
 # The search debugger
 
 **Status: implemented, 2026-07-30.** Normative for the trace format, the recorder and
-the server API. It does not modify [`mcts.md`](mcts.md), which owns the search, or
+the server API. It does not modify [`search.md`](search.md), which owns the search, or
 [`spec.md`](spec.md), which owns the engine and network contracts. Where it needs a
 quantity those documents do not name, it derives it and says from what.
 
@@ -18,7 +18,7 @@ already exists and is better at it. Nothing in this document produces a time ser
 The search is the part of the system whose failures are silent. A wrong kernel
 crashes or disagrees with the reference; a search that spends 780 of 800 simulations
 on a move it was already certain about produces a perfectly valid tree and a bad
-game. The counters in `mcts.md` §15 detect that in aggregate. They do not answer the
+game. The counters in `search.md` §15 detect that in aggregate. They do not answer the
 question a human actually asks, which is why *this* move in *this* position.
 
 Answering it needs three things visible at once: the root's edges with `Q` and `U`
@@ -52,7 +52,7 @@ trace, and the viewer then reads it like any other.
 ## 3. What is recorded, and what is derived
 
 Recording a full tree snapshot per simulation is 800 copies of a 686 KB tree
-(`mcts.md` §4.2), which is not a format, it is a memory dump.
+(`search.md` §4.2), which is not a format, it is a memory dump.
 
 Backup touches only the edges on the current path, adding 1 to `N` and folding the
 leaf value into a running mean. Expansion touches only the node being created. So the
@@ -218,7 +218,7 @@ the depth, since a trained policy is what makes the trees deep and the paths lon
 
 ## 5. Replay
 
-The viewer holds a tree of the shape `mcts.md` §4.2 describes and applies simulations
+The viewer holds a tree of the shape `search.md` §4.2 describes and applies simulations
 in order. To show the state after simulation `k`, replay `0..k`.
 
 ```
@@ -231,7 +231,7 @@ apply(sim):
         Q[v][e] += (q - Q[v][e]) / N[v][e]
 ```
 
-This is `mcts.md` §6.5 transcribed. The parity flip is the same one, and the same
+This is `search.md` §6.5 transcribed. The parity flip is the same one, and the same
 warning applies: inverting it produces a viewer that shows the search preferring its
 worst moves, and at `L = 2` the wrong parity agrees with the right one, so nothing
 shallow catches it.
@@ -295,7 +295,7 @@ One row per root edge, sorted by `N` descending, ties by edge index.
 one term dominating, and a combined score hides which.
 
 ⚠️ An edge with `N = 0` displays `Q` as blank, not as 0. First-play urgency scores it
-as 0 (`mcts.md` §6.6), and a blank says "no estimate" where a 0 says "estimated as a
+as 0 (`search.md` §6.6), and a blank says "no estimate" where a 0 says "estimated as a
 loss". Both readings are used in the literature and confusing them is how people
 misdiagnose exploration.
 
@@ -328,7 +328,7 @@ argmax-visits agrees with argmax-`Q` at the root.
 
 That last one earns its place: `edge_Q` lives in [0,1] and PUCT adds it to the
 exploration term, so a `pb_c_init` tuned for a [-1,1] convention explores half as
-much as intended (`mcts.md` §3.5). Visits and `Q` disagreeing at the root is the
+much as intended (`search.md` §3.5). Visits and `Q` disagreeing at the root is the
 cheapest visible symptom.
 
 ### 7.5 Play
@@ -424,7 +424,7 @@ the freedom, with all the instrumentation on the implementation nothing is measu
 against.
 
 The two are validated to produce the same tree node for node
-(`tests/test_search_cuda.py`, `mcts.md` §12.3), so a trace of the reference is a
+(`tests/test_search_cuda.py`, `search.md` §12.3), so a trace of the reference is a
 trace of what the kernel does, to within the one fp16 ULP §12.3 records on
 `edge_prior`.
 
@@ -444,7 +444,7 @@ speed. Slowing it down to record a trace is free.
 which is a wait but not a job queue, and it puts an interactive game at `n = 128` at
 roughly two seconds a move.
 
-The reference runs at 27.4k evals/s at `B = 256` (`mcts.md` §12) and this is 55/s, so
+The reference runs at 27.4k evals/s at `B = 256` (`search.md` §12) and this is 55/s, so
 the per-simulation cost at `B = 1` is not that number divided by anything: a `B = 1`
 search is bound by per-op launch overhead rather than by the network.
 
@@ -459,7 +459,7 @@ with the `n` recorded in the trace, which the format already carries.
 
 ⚠️ **No optimisation of `torch_impl.py` may be justified by this document.** The
 reference exists to be readable and to be the thing the kernels are checked against.
-A change that makes it faster and harder to compare against `mcts.md` §6 costs more
+A change that makes it faster and harder to compare against `search.md` §6 costs more
 than the seconds it saves.
 
 ## 12. Validation
@@ -511,7 +511,7 @@ a thing that was true on 2026-07-30 rather than a thing that stays true.
 - **Trace diff.** Same position, same seed, two encoder implementations or two
   `pb_c_init` values, with the first divergent simulation reported. Cheap given the
   format, and it turns the viewer into a bisection tool.
-- **UCI adapter.** Track D needs one for the external match harness (`evals.md`
+- **UCI adapter.** Track D needs one for the external match harness (`evaluation.md`
   §10.2). It shares the move translation of §6 and nothing else, and belongs there.
 
 ## Changelog

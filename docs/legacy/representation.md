@@ -1,6 +1,6 @@
 # Board representation
 
-!!! warning "Superseded by [`spec.md`](../spec.md) on 2026-07-29"
+!!! warning "Superseded by [`spec.md`](../reference/spec.md) on 2026-07-29"
 
     This document is **no longer normative**. It describes the encoding as it was
     implemented before the v1 freeze, and it is kept only as a record of what

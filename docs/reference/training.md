@@ -2,7 +2,7 @@
 
 **Status: draft, 2026-07-30.** Normative for C2: the replay buffer, the loss, the
 optimiser, the alternation between self-play and gradient phases, checkpointing and
-the euro counter. It does not modify [`mcts.md`](mcts.md), which owns the search, or
+the euro counter. It does not modify [`search.md`](search.md), which owns the search, or
 [`spec.md`](spec.md), which owns the engine and network contracts. Where it needs a
 quantity those documents leave open, it closes it here and says on whose authority.
 
@@ -12,7 +12,7 @@ quantity those documents leave open, it closes it here and says on whose authori
 
 C2 is the outer loop: play games with the current weights, store what the search
 produced, sample from the store, take gradient steps, publish new weights, repeat.
-Everything inside one move is already specified and built — `mcts.md` §6 for the
+Everything inside one move is already specified and built — `search.md` §6 for the
 search, `spec.md` §7 for the network.
 
 ⚠️ **The authority for training is the AlphaZero paper (arXiv:1712.01815) for what it
@@ -22,7 +22,7 @@ and parameters are identical to AlphaGo Zero."* So AZ owns the loss form, the va
 target, the batch size, the learning rate values and the number of steps; AGZ owns the
 optimiser, the momentum, the L2 constant, the loss weighting and the replay window.
 
-The same warning `mcts.md` §1.1 carries applies here: **the released `pseudocode.py`
+The same warning `search.md` §1.1 carries applies here: **the released `pseudocode.py`
 is not an authority.** It is used below exactly once, for the learning rate drop
 points, which neither paper publishes, and it is labelled where it is used.
 
@@ -38,7 +38,7 @@ oracle, and it is the part of this document to argue with.
 ## 2. Where v0 differs from AlphaZero, and why
 
 Everything else in this document reproduces AZ. These are the departures, all forced,
-all with a named cause. Each one also belongs in [`fidelity.md`](fidelity.md).
+all with a named cause. Each one also belongs in [the fidelity audit](../journal/2026-07-30-fidelity.md).
 
 | | AZ | v0 | cause |
 |---|---|---|---|
@@ -51,7 +51,7 @@ all with a named cause. Each one also belongs in [`fidelity.md`](fidelity.md).
 
 Not a departure, and worth stating because it looks like one: **there is no
 checkpoint gating.** AZ removed AGZ's evaluator and updates a single network
-continually. `evals.md` §11 settled this independently on the grounds that gating
+continually. `evaluation.md` §11 settled this independently on the grounds that gating
 makes the curve's x-axis ill-defined. The two agree.
 
 ---
@@ -74,7 +74,7 @@ distribution, and importing it here would be reproducing the wrong experiment.
 ### 3.1 What the target is
 
 `π` is the **root visit distribution**, `π(a) = N(a) / n` over the root's edges —
-`mcts.md` §6.7, already normalised and already stored in the record as
+`search.md` §6.7, already normalised and already stored in the record as
 `(policy_move, policy_prob)`.
 
 **Not the move that was played.** AZ p.3 trains "to maximise the similarity of the
@@ -90,8 +90,8 @@ Three first-hand sources say otherwise: AGZ's own gloss ("this **selects moves**
 proportionally to their visit count"), the policy-improvement framing, and the
 released pseudocode, where `store_search_statistics` stores
 `visit_count / sum_visits` with **no temperature**, `make_target` returns that, and
-`num_sampling_moves` appears only in `select_action`. `fidelity.md` §2.1a has the
-quotes; it is **not** a deviation, and `mcts.md` §6.7 already does the right thing.
+`num_sampling_moves` appears only in `select_action`. `2026-07-30-fidelity.md` §2.1a has the
+quotes; it is **not** a deviation, and `search.md` §6.7 already does the right thing.
 
 ### 3.2 Cross-entropy or KL — the same thing, and log the other one
 
@@ -122,7 +122,7 @@ weight:
 - AZ Methods, Representation: *"Illegal moves are masked out by setting their
   probabilities to zero, and re-normalising the probabilities for remaining moves."*
 - it is the distribution the **search** consumes — `expand` builds its prior as a
-  softmax over the surviving edges (`mcts.md` §6.4) — so training and search calibrate
+  softmax over the surviving edges (`search.md` §6.4) — so training and search calibrate
   the same object;
 - the ~2000 permanently-illegal logits then receive no gradient at all, instead of
   being pushed towards `−∞` forever for no benefit.
@@ -198,7 +198,7 @@ direction:
   `az_loss` does not take an `env` argument;
 - it is cheaper by two orders of magnitude in the tensor that dominates it — an
   `[N, 64]` gather where the masked form built two `[N, 8192]` fp32 tensors;
-- the canonical enumeration order of `mcts.md` §6.4 never enters the training path.
+- the canonical enumeration order of `search.md` §6.4 never enters the training path.
   No sort, no `topk`, and no host synchronisation to discover whether a sort was
   needed.
 
@@ -213,7 +213,7 @@ comparison against a live search settles the ordering, and that is check 3.
 moves the denominator is the search's 64 rather than every legal move, which is what AZ
 Methods renormalises over. Softmax is consistent under restriction, so training exactly
 the distribution the search consumes is coherent — but it is ours and not the paper's,
-and it is in [`fidelity.md`](fidelity.md) §4.2(i).
+and it is in [the fidelity audit](../journal/2026-07-30-fidelity.md) §4.2(i).
 
 ⚠️ **One thing the label alone cannot tell you.** `promo == 0` does not mean "not a
 promotion": spec §3 numbers the types `0:N 1:B 2:R 3:Q` and a quiet move carries field
@@ -250,9 +250,9 @@ z(t) = r  if (T - t) is even, else -r
 ```
 
 with `z = 0` for every draw regardless of parity. This is the same parity argument as
-`mcts.md` §6.5's backup flip and fails the same way if inverted.
+`search.md` §6.5's backup flip and fails the same way if inverted.
 
-**The ablation seam stays open at zero cost.** `mcts.md` §10 already reserves
+**The ablation seam stays open at zero cost.** `search.md` §10 already reserves
 `weight_gen` plus one `f32` for a bootstrapped target. C2 writes the search's root
 value into that field and trains on nothing but `z`. Two bytes of a 330 B record buys
 the ability to run the KataGo mix later without regenerating a corpus.
@@ -263,7 +263,7 @@ the ability to run the KataGo mix later without regenerating a corpus.
 
 ### 5.1 Schema
 
-The record is `mcts.md` §10, unchanged, produced by
+The record is `search.md` §10, unchanged, produced by
 `search.select_and_advance()` as a `MoveRecord`, one row per game per move:
 
 ```
@@ -289,7 +289,7 @@ kernels already write `edge_N` and `edge_Q`.
 the raw network evaluation the root started from. The improved estimate is what a
 KataGo-style mix would bootstrap against; the raw one is already recoverable from the
 network. Stored in `[-1, 1]` to match `z`, while the tree works in `[0, 1]` (§3.5 of
-`mcts.md`).
+`search.md`).
 
 ### 5.2 Window
 
@@ -333,7 +333,7 @@ exists.
 ### 5.4 The game-length cap
 
 **512 plies, scored as a draw, counted as a completed game.** This closes the row
-`mcts.md` §13 leaves open ("absent in v0").
+`search.md` §13 leaves open ("absent in v0").
 
 AZ's Domain Knowledge item 5 terminates over-long chess games and assigns them a drawn
 outcome; the paper does not give the number and the pseudocode uses 512. Our rules are
@@ -452,11 +452,11 @@ steps and AZ's was 700,000 (§13). Two candidate sets:
 - the released `pseudocode.py`'s `learning_rate_schedule`, **read 2026-07-30** as
   `{0: 2e-1, 100e3: 2e-2, 300e3: 2e-3, 500e3: 2e-4}`, i.e. **14 %, 43 %, 71 %** of
   700k steps. Three drops, matching AZ's prose, at exactly AZ's four values. ⚠️ Still
-  the file `mcts.md` §1.1 refuses as an authority — but here it agrees with the paper
+  the file `search.md` §1.1 refuses as an authority — but here it agrees with the paper
   rather than contradicting it, and supplies only the numbers the paper omits.
 
 **Default: the pseudocode fractions**, because they are the only source with three
-drops and AZ's prose says three. Recorded in `fidelity.md` as a parameter taken from
+drops and AZ's prose says three. Recorded in `2026-07-30-fidelity.md` as a parameter taken from
 an unrefereed file.
 
 ⚠️ **`lr = 0.2` under plain SGD is the single most likely value in this document to be
@@ -480,7 +480,7 @@ initialisation and one frozen batch:
 `lr = 0.002` wins on both heads, **two orders of magnitude below AZ's value**. At
 `lr = 0.2` the value loss *rises* and then sits at exactly 1.383 while the gradient
 norm falls to 0.1: that is a **saturated `tanh`**, which stops producing gradient
-entirely — `mcts.md` §15.3 already watches for it, and here it is a training pathology
+entirely — `search.md` §15.3 already watches for it, and here it is a training pathology
 rather than a search one.
 
 ⚠️ **This is a rate comparison and not yet a pass of check 1.** No rate reached
@@ -488,7 +488,7 @@ rather than a search one.
 SGD+momentum over 1024 positions is not enough to conclude either way. And the batch
 was harvested at `n = 16`, where the mean `policy_len` is 3.5 — the targets are far
 sparser than the `n = 800` ones a real run produces. The verdict on `lr` is provisional
-until check 1 is run at §12's own size, and the row in [`fidelity.md`](fidelity.md)
+until check 1 is run at §12's own size, and the row in [the fidelity audit](../journal/2026-07-30-fidelity.md)
 §4.2(a) stays open until it is.
 
 ---
@@ -604,13 +604,13 @@ weeks later as an unexplained kink in the Elo curve.
 
 ## 10. The euro counter
 
-`evals.md` §5.3 requires `euros_spent` to be written by the same writer as `elo`,
+`evaluation.md` §5.3 requires `euros_spent` to be written by the same writer as `elo`,
 because two files means a hand join six weeks later. The training loop is that writer
 for the cost half.
 
 Accumulate **device-seconds**, split by phase (self-play, gradient), multiply by a
 configured €/h stored in the checkpoint. Wall clock, not an estimate from FLOPs: the
-card throttles to 1230-1290 MHz inside the loop (`mcts.md` §14.3) and any FLOP-derived
+card throttles to 1230-1290 MHz inside the loop ([the Gate 1a measurement](../ledger/perf.md#what-the-tree-actually-costs-measured-2026-07-30)) and any FLOP-derived
 figure would be an upper bound on work and a lower bound on cost.
 
 **Two numbers, per Track D's settled decisions:**
@@ -641,7 +641,7 @@ norm and weight norm.
 batches; buffer occupancy in games and in sampleable positions; achieved
 samples-per-game against the 65.2 target; positions/s.
 
-**Per self-play phase**: the whole of `mcts.md` §15's counter block, which
+**Per self-play phase**: the whole of `search.md` §15's counter block, which
 `SearchStats.snapshot()` already produces. Plus the target distribution — win/draw/loss
 fractions of completed games and mean game length, which is the earliest signal that
 self-play has collapsed — and the **game-length cap firing rate** (§5.4).
@@ -684,7 +684,7 @@ sense `roadmap.md` uses for perft.
    removes a game with live pending records; occupancy never exceeds the window.
 6. **Value-parity on a hand-built game.** A short game with a known result, records
    checked ply by ply against the §4 parity rule. The `L >= 3` warning from
-   `mcts.md` applies: use a game of odd *and* even length, since a two-ply game cannot
+   `search.md` applies: use a game of odd *and* even length, since a two-ply game cannot
    distinguish the correct rule from its inverse.
 7. **A rules-only supervised smoke test.** Train the network to predict the legality
    mask, or material balance, from the position — quantities the *rules* define, so it
@@ -723,7 +723,7 @@ steps.
 plan is to find out whether the configuration hill-climbs before making it cheap.**
 `roadmap.md`'s full-run estimate — 113 hours, and the €100-500 figure derived from
 it — assumes **32 simulations per move**, from the superseded Gumbel sizing.
-`mcts.md` froze `n = 800`. At 800:
+`search.md` froze `n = 800`. At 800:
 
 | | evals | at 57.0k/s |
 |---|---|---|
@@ -736,7 +736,7 @@ $3.95/h ≈ $2,500, against a stated €100-500.
 
 **Sequenced, not unreconciled (decided 2026-07-30).** The order is: establish that the
 AZ configuration *hill-climbs at all* at `n = 800`, then bring the simulation count
-down with the throughput work — `mcts.md` §11's Gumbel seam, playout cap
+down with the throughput work — `search.md` §11's Gumbel seam, playout cap
 randomisation, and the sims sweep `roadmap.md` schedules in C4 — until the wall-clock
 is acceptable. Demonstrating the climb is the scientific claim; making it cheap is
 engineering that follows it, and doing them in the other order risks debugging a
@@ -762,8 +762,8 @@ aside.
 | **checkpoint frequency `K`** | AGZ used every 1,000 steps; ours has no evaluator to feed, so it is a resume-granularity choice |
 | **the unmasked policy softmax** | §3.3's alternative: denominator over all 2048 logits, no movegen at training time. Coherent with a masked search by conditioning, and cheaper. Not the default because AZ masks and because it spends gradient on permanently illegal moves |
 | **the bootstrapped value ablation** | KataGo's mix. The field is written and unused from generation 0, so it costs nothing to defer |
-| **playout cap randomisation** | `mcts.md` §11 seam; changes the cadence of §6, since positions would no longer cost the same |
-| **simulations per move** | §13. `n = 800` for the hill-climbing run, reduced afterwards by the `mcts.md` §11 seams and C4's sweep. Not a C2 parameter either way |
+| **playout cap randomisation** | `search.md` §11 seam; changes the cadence of §6, since positions would no longer cost the same |
+| **simulations per move** | §13. `n = 800` for the hill-climbing run, reduced afterwards by the `search.md` §11 seams and C4's sweep. Not a C2 parameter either way |
 
 ---
 
@@ -772,7 +772,7 @@ aside.
 **draft, 2026-07-30.** First version. Two things it closes that `spec.md` §11 listed
 as open — the value target (§4, closed by the AZ paper's own text rather than by a
 choice) and the reuse factor (§6, derived from AZ's published step and game counts) —
-and one that `mcts.md` §13 listed as absent, the game-length cap (§5.4). The
+and one that `search.md` §13 listed as absent, the game-length cap (§5.4). The
 accumulation identity of §7.2 is what lets AZ's learning-rate schedule be inherited
 rather than invented, and is the reason batch 4096 is a reproduction and not an
 aspiration. §12 exists because C2 is the first phase with no external oracle, and §13
@@ -785,21 +785,21 @@ truncation when a position exceeds 64 legal moves. §3.2 was added because the l
 often described as a KL against the visit distribution, which is the same optimisation
 — the two differ by the target's own entropy, a constant — and because the KL form is
 the one worth logging. Every deviation this document introduces is tabulated in
-[`fidelity.md`](fidelity.md) §4.
+[the fidelity audit](../journal/2026-07-30-fidelity.md) §4.
 
 §3.1 was also revised the same day, in the other direction. The first draft read AGZ
 literally and concluded that `τ → 0` past move 30 made the *training target* one-hot,
 making v0's stored `N/n` a deviation affecting ~60 % of positions. It is not a
 deviation: the released pseudocode stores untempered visit counts and applies
 `num_sampling_moves` only in `select_action`, and AGZ's own gloss on the schedule says
-`τ` selects moves. Retracted to `fidelity.md` §2.1a, where it is kept as a closed item
+`τ` selects moves. Retracted to `2026-07-30-fidelity.md` §2.1a, where it is kept as a closed item
 because the symbol overloading will invite the same wrong reading again. The same read
 of `select_action` narrowed §2.1(c): the released code counts 30 **plies**.
 
 **§3.5 revised again, 2026-07-31, and the second revision deleted the problem.** The
 first two drafts both had the training path *recomputing* the softmax support — one by
 rebuilding the search's truncation, one by rebuilding the full legal set — and neither
-asked why it was recomputing anything the rollout already knew. It was: `mcts.md` §10's
+asked why it was recomputing anything the rollout already knew. It was: `search.md` §10's
 policy arrays are `E` wide and zero-padded, so storing the root's whole edge set rather
 than only its visited edges costs **no bytes**. The record now carries its own support,
 `az_loss` takes no `env`, the dominant tensor went from two `[N, 8192]` fp32 arrays to

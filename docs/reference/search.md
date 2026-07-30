@@ -63,7 +63,7 @@ Not present, and each one is an addition to this rather than a deviation from it
 virtual loss, first-play-urgency reduction, WDL values, a moves-left head, certainty
 propagation, transposition merging, playout cap randomisation, forced playouts,
 lower-confidence-bound root selection, Gumbel root selection.
-[`due_diligence.md`](due_diligence.md) covers where each comes from and
+[the prior-art survey](../journal/2026-07-28-prior-art.md) covers where each comes from and
 §11 says which function it replaces.
 
 ⚠️ **Tree reuse and resignation are deviations, not additions**, and this section
@@ -230,7 +230,7 @@ reuses. The released pseudocode builds a fresh root every move and is wrong abou
 v0 discards the whole tree every move, which is a real loss and not a simplification
 with no cost. The subtree under the played move typically holds a large share of the
 `n` simulations already spent, so reuse is worth some fraction of `n` for free, and
-`n` is the most expensive number in this project (§14). What it costs to implement is
+`n` is the most expensive number in this project ([the cost arithmetic](../ledger/perf.md#the-search-in-the-loop)). What it costs to implement is
 node lifetime: a bump pointer becomes a free list, or a copy-compact pass moves the
 retained subtree to the front of the pool. §11 has it as a real change rather than a
 seam.
@@ -342,7 +342,7 @@ each level is fixed by parity.
 `node_parent` and `node_pedge` are kept for invariant 3 and for debugging rather than
 for traversal.
 
-⚠️ §14 argues that none of this is likely to matter for throughput, because the
+⚠️ [the cost arithmetic](../ledger/perf.md#the-search-in-the-loop) argues that none of this is likely to matter for throughput, because the
 network dominates a node by three orders of magnitude. The reason to keep the path
 array anyway is that a parallel scatter over an array is simpler code than a pointer
 chase, and Gate 1a will say whether the argument holds.
@@ -408,7 +408,7 @@ order reversed on alternate rounds:
 
 One CTA per board over 24 SMs means even 1024 boards is more than twenty waves, so
 there is nothing to saturate that a larger batch would saturate better. Every
-throughput number in [`perf.md`](perf.md) was taken at 16384 and the table says they
+throughput number in [`perf.md`](../ledger/perf.md) was taken at 16384 and the table says they
 transfer unchanged.
 
 The tree cost is `856 · (n+1) · B`:
@@ -438,7 +438,7 @@ sampling does not. The replay buffer samples across plies, so this matters only 
 ever trains directly on a step's output.
 
 ⚠️ The learner runs on the same card, alternating with self-play
-([`roadmap.md`](roadmap.md)), and its peak footprint at a gradient batch of 4096 has
+([`roadmap.md`](../roadmap.md)), and its peak footprint at a gradient batch of 4096 has
 never been measured. Backward activations at 4096 × 32 tokens × 256 across 8 layers are
 plausibly a few GB against 2.81 GB of tree. If the two do not fit together, `B` is one
 line and is the first thing to cut.
@@ -751,7 +751,7 @@ positions where the difference bites, which are exactly the positions where one 
 is trying to escape a repetition.
 
 Evaluation is against engines playing real chess under real arbitration
-([`roadmap.md`](roadmap.md#measuring-strength)). A divergence that helps during
+([`roadmap.md`](../roadmap.md#measuring-strength)). A divergence that helps during
 training has to be unlearned or specially handled at evaluation time, and a
 train-test mismatch on a rule is a hard bug to attribute.
 
@@ -760,7 +760,7 @@ training boundary. The rules are allowed; judgements about them are what has to 
 learned.
 
 ⚠️ Not a rules divergence, and worth distinguishing: `irreversible` omits
-python-chess's en passant clause ([`env.md`](env.md#three-places-it-departs-from-python-chess-all-deliberate)).
+python-chess's en passant clause ([`environment.md`](environment.md#three-places-it-departs-from-python-chess-all-deliberate)).
 That only ever makes the repetition window longer, never shorter, so no repetition
 can be missed and no rule is bent. It is a divergence from another implementation,
 not from chess.
@@ -834,7 +834,7 @@ registers across the backup and the descent instead of round-tripping through gl
 memory.
 
 v0 does not do it. At `n = 800` the saving is 800 launches, about 4 ms against a
-25.5 s move by §14.1, so it buys nothing measurable, and it costs the property that
+25.5 s move by [the tree-cost prediction](../ledger/perf.md#how-much-the-tree-is-likely-to-cost), so it buys nothing measurable, and it costs the property that
 every kernel is separately checkable against the reference implementation, which §12
 depends on. The fusion is a late optimisation with a known shape, which is the right
 state for it to be in.
@@ -872,7 +872,7 @@ reached** (revised 2026-07-31). An edge with `N(a) = 0` is stored with `π = 0`.
 carries nothing for the training *target* and everything for the training
 *denominator*: it is what tells C2 which moves the softmax normalises over, without
 which the training path has to recompute `movegen` and re-derive a truncation it
-cannot reproduce (`train.md` §3.5). The array is `E` wide and zero-padded either way,
+cannot reproduce (`training.md` §3.5). The array is `E` wide and zero-padded either way,
 so this costs **no bytes at all** — which is why the earlier `[min(E, n)]` width, and
 the "at most `min(E, n)` nonzero entries" reasoning behind it, was a false economy.
 
@@ -882,7 +882,7 @@ A record is 64 + 2 + 1 + 128 + 128 + 1 + 4 + 2 + 4 = **334 B** independently of 
 `board`, in `[-1, 1]`. It is written when the game terminates, so a record is
 incomplete until then and the buffer needs a per-game index of its own pending
 records. The spare fields for a bootstrapped or mixed value target are `weight_gen`
-plus one reserved `f32`; [spec §11](spec.md#11-not-frozen) leaves that choice open
+plus one reserved `f32`; [spec §11](spec.md#11-the-rl-layer) leaves that choice open
 and this schema is meant not to force a migration when it is made.
 
 ---
@@ -1229,156 +1229,28 @@ exercised rather than assumed.
 
 | open question | state |
 |---|---|
-| `n`, simulations per move | 800 in v0, AlphaZero's number, chosen so convergence is not in question. §14 makes it the most expensive number in the project and the sweep downward is where the throughput work starts |
+| `n`, simulations per move | 800 in v0, AlphaZero's number, chosen so convergence is not in question. [the cost arithmetic](../ledger/perf.md#the-search-in-the-loop) makes it the most expensive number in the project and the sweep downward is where the throughput work starts |
 | `B`, games in flight | 4096 in v0, matching AlphaZero's SGD batch per §4.4, since throughput is flat in `B` and the tree fits |
-| value target | final outcome in v0. [spec §11](spec.md#11-not-frozen) owns the choice; §10 is shaped not to force a migration |
+| value target | final outcome in v0. [spec §11](spec.md#11-the-rl-layer) owns the choice; §10 is shaped not to force a migration |
 | game start positions | startpos in v0, with Dirichlet and temperature as the only diversity, as in AlphaZero. Randomised openings are allowed by the training boundary and are a change to `select_and_advance` |
-| whether to revisit Gumbel | deferred, not rejected. §14 is the argument for revisiting it, and §11 says it costs two functions |
+| whether to revisit Gumbel | deferred, not rejected. [the cost arithmetic](../ledger/perf.md#the-search-in-the-loop) is the argument for revisiting it, and §11 says it costs two functions |
 | `sqrt(sum_b N(s,b))` or `sqrt(node visits)` | AGZ's formula in v0, which makes the first descent below every new node ignore the policy and take the lowest-index edge (§3.1a). The released pseudocode's form removes that. One line either way, and worth an A/B once Elo can be measured, because AGZ's form spends about 2 % of all selections on a systematically chosen move |
 | tree reuse | absent in v0 and present in AlphaZero (§3.6). Worth some fraction of `n` for free, which is the most expensive number here, and it costs a free list |
 | resignation | absent in v0 and present in AlphaZero (§3.7). A cost mechanism with a self-calibrating threshold, which C2 should have before any long run |
-| virtual loss | `mcts.md` §1.1 files it as an addition, and [`fidelity.md`](fidelity.md) §2.1(a) argues it is a deviation: AGZ's search ran threaded with virtual loss and AZ defers to AGZ, so v0's tree is slightly more concentrated than AlphaZero's at the same `n`. Ten minutes with the AGZ Methods settles it |
-| `tau_plies` in plies or moves | 30 plies in v0. AGZ says "the first 30 moves", which is a ply in Go and a pair in chess. [`fidelity.md`](fidelity.md) §2.1(c) |
-| fp16 priors under a trained policy | §4.2 stores priors as fp16, where a prior below 6e-8 flushes to zero and its exploration term is zero forever. Harmless at today's flat policy, unmeasured at a sharp one, and §15 has no counter for it. [`fidelity.md`](fidelity.md) §2.2 |
+| virtual loss | `search.md` §1.1 files it as an addition, and [the fidelity audit](../journal/2026-07-30-fidelity.md) §2.1(a) argues it is a deviation: AGZ's search ran threaded with virtual loss and AZ defers to AGZ, so v0's tree is slightly more concentrated than AlphaZero's at the same `n`. Ten minutes with the AGZ Methods settles it |
+| `tau_plies` in plies or moves | 30 plies in v0. AGZ says "the first 30 moves", which is a ply in Go and a pair in chess. [the fidelity audit](../journal/2026-07-30-fidelity.md) §2.1(c) |
+| fp16 priors under a trained policy | §4.2 stores priors as fp16, where a prior below 6e-8 flushes to zero and its exploration term is zero forever. Harmless at today's flat policy, unmeasured at a sharp one, and §15 has no counter for it. [the fidelity audit](../journal/2026-07-30-fidelity.md) §2.2 |
 | the game-length cap | absent in v0. AZ's Domain Knowledge item 5 terminates chess games "exceeding a maximum number of steps (determined by typical game length)" and scores them drawn; the pseudocode uses 512 plies. Our rules end games only as chess does, which is stricter and can produce longer games |
 
 ---
-
 ## 14. Cost arithmetic
 
-From the measured 64.2k evals/s, ignoring the learner's share and assuming the tree
-costs nothing. A move costs `n` evaluations per game, so the rate of real moves is
-`64.2e3 / n` across the whole batch:
+Moved to [`perf.md`](../ledger/perf.md#the-search-in-the-loop) on 2026-07-31: the
+prediction of what the tree would cost, and the Gate 1a measurement that settled it,
+are numbers and belong in the ledger. What §13 needs from them is one sentence —
+**`n` is the most expensive number in the project**, linearly, and the sweep downward
+is where the throughput work starts.
 
-| `n` | moves/s | 10k games (80 plies) | 128k games | 10M games |
-|---|---|---|---|---|
-| 32 | 2006 | 6.6 min | 1.4 h | 111 h |
-| 128 | 502 | 27 min | 5.7 h | 444 h |
-| 400 | 161 | 1.4 h | 17.7 h | 1386 h |
-| 800 | 80 | 2.8 h | 35.4 h | 2772 h |
-
-⚠️ Arithmetic from a measurement and not a measurement. It is a floor: the tree's
-cost is what Gate 1a exists to measure, and it comes out of these numbers rather than
-being added to them.
-
-The `n = 800` column is what makes the ordering in §4.4 workable rather than
-reckless. A convergence check does not need 10M games; the first evidence that the
-loss is falling and that self-play Elo is rising arrives in the low thousands of
-games, which is under three hours. A full run at `n = 800` is out of the question on
-this card, and that is the point: the search budget is the first thing the
-optimisation work will attack, with a converging baseline to regress against.
-
-The reduction path, in the order it should be tried: bring `n` down and watch Elo per
-game, since AlphaZero's 800 was chosen on hardware where evaluations were nearly
-free; then Gumbel, whose entire purpose is to make small `n` behave, and which §11
-prices at two functions; then playout cap randomisation, which pays the large budget
-on only a fraction of moves.
-
-### 14.1 How much the tree is likely to cost
-
-Rough arithmetic, to set expectations for Gate 1a rather than to substitute for it.
-
-A descent step reads one node's edge statistics, 64 × (2 + 2 + 4) = 512 B, and picks
-an argmax. Taking 300 cycles for the load-and-reduce and a real depth of 40, one
-simulation's descent is about 12k cycles, and a move's 800 simulations about 9.6M
-cycles per game. At `B = 4096` over roughly 1150 concurrent warp slots that is about
-3.6 waves, so 34M cycles, or **24 ms per move** at 1.4 GHz.
-
-The same move costs 800 encoder launches at 63.9 ms each, which is **51.1 s**.
-
-So the arithmetic puts the tree near 0.05 % of a move, against the 2.2 % the
-environment measured. If that survives contact with a profiler, then the block tail of
-§9, the path array of §4.2 and the parallel backup of §6.5 are all decisions about
-code clarity and none of them is a throughput decision.
-
-⚠️ The 300 cycles is a guess, not a measurement, and the estimate ignores the
-repetition scan, the expansion and every launch overhead. Treat it as an order of
-magnitude. Gate 1a is what settles it, and the reason to write it down now is that it
-argues against optimising any of this before measuring.
-
-### 14.2 The low-`n` policy target
-
-At small `n` the policy target degrades in a specific way worth watching for: with
-about 31 edges at the root and `n` visits to spread over them, `N / n` approaches
-uniform-with-noise. The reference implementation shows this long before the kernel
-exists, which is a reason to look at it there.
-
-### 14.3 What the tree actually costs, measured 2026-07-30
-
-`bench/bench_search.py`, `logs/gate1a.log`. `B = 4096` games at 30 random plies,
-three interleaved rounds with the order reversed on alternate ones. The whole of §6
-runs on device: `root_init`, `n` simulations of descent, encoder, expansion and
-backup, and `select_and_advance`.
-
-| `n` | useful evals/s | raw evals/s | encoder alone | tree | tree, ms/simulation | s per move | mean/max depth |
-|---|---|---|---|---|---|---|---|
-| 32 | **58 942** | 59 021 | 63 547 | 4.4 % | 2.84 | 2.22 | 4.1 / 15 |
-| 128 | **58 763** | 58 852 | 61 890 | 4.3 % | 2.88 | 8.91 | 5.1 / 21 |
-| 800 | **56 996** | 57 265 | 59 852 | 4.4 % | 3.00 | 57.22 | 5.8 / 28 |
-
-**Gate 1 wanted 45-50k and gets 57.0k at the full `n = 800`.** The gated number is
-*useful* evaluations: a descent that ended on a stored terminal, or that created a
-terminal child, has nothing for the network to say, and §6.3 evaluates it anyway to
-keep the launch shape static. That waste is 0.5 % at `n = 800` and 0.1 % below it.
-
-The baseline is `n + 1` calls through `forward_full` and nothing else, because a
-move is `root_init` plus `n` simulations and each calls the encoder once. Charging
-the tree for one extra evaluation makes the overhead look like it falls with `n`
-(7.5 % → 4.5 %); it does not, it is flat.
-
-**The tree costs 3.00 ms per simulation at `B = 4096`, 0.73 µs per game.** Nearly
-flat in `n`: the 5 % rise from 32 to 800 is the mean depth going from 4.1 to 5.8,
-which is the only term that should grow and does.
-
-**Predicted 1.7 ms and 2.7 %, measured 3.00 ms and 4.4 %.** Two separate gaps.
-
-The absolute rate misses its 62.5k prediction because the encoder in this campaign
-is **59 852/s, not the 64 142/s of §4.4**. A 57-second block holds the card at
-1230-1290 MHz where the shorter encoder benchmark sits at 1.38-1.5 GHz, and 82 °C is
-where it settles. Sustained MCTS load throttles harder than the benchmark that sized
-it, which is a fact about the card and not about the search. The interleaved protocol
-is what keeps the *ratio* meaningful anyway.
-
-Scaled to the clock it actually ran at, the prediction was 1.84 ms against 3.00
-measured, so the tree is 1.6× more expensive than the arithmetic said. The
-prediction's dominant term was the two `movegen` calls, priced at the perft kernel's
-5.01M boards/s. That kernel uses 71 registers and fits three blocks per SM; inside
-`descent` the same code runs in a 96-register kernel at two blocks per SM, and inside
-`expand` at 72 with a different instruction mix. Lower occupancy on the dominant term
-is the leading candidate and it is **not measured**, because a 1.2 ms gap inside a
-4.4 % overhead is not worth a profiler run.
-
-⚠️ **§14.1 was wrong by two orders of magnitude, in the optimistic direction.** It
-put the tree near 0.05 % of a move; it is 4.4 %. Its error is not the 300-cycle guess
-for a descent level, which if anything was generous, since the measured mean depth is
-5.8 and not the 40 it assumed. Its error is scope: it costed the descent alone and
-explicitly set aside the two `movegen` calls, the expansion and the launches, which
-are the bulk of the 3.00 ms. The conclusion it drew still holds, since 4.4 % is not
-worth attacking, but the number it drew it from should not be quoted.
-
-**What §14's cost table becomes**, now that the tree is in it. The measured rate of
-real plies is `4096 / (s per move)`:
-
-| `n` | plies/s, arithmetic | plies/s, measured | 10M games (80 plies) |
-|---|---|---|---|
-| 32 | 2006 | 1845 | 120 h |
-| 128 | 502 | 460 | 483 h |
-| 800 | 80 | 71.6 | 3103 h |
-
-12 % above the arithmetic at every point, which is the tree plus the throttling.
-§14's ordering is unchanged: a full run at `n = 800` is out of the question on this
-card and the search budget is still the first thing to attack.
-
-**What the counters say about §4's fixed sizes**, over one instrumented move at each
-point. `E = 64` holds: 443 of 3 276 800 expansions truncated at `n = 800`, 0.0135 %
-against §4.3's estimate of 0.01 %, dropping 2.32 of prior mass in total across those
-443 nodes. The largest candidate count seen was **77**, above the 65 maximum in
-`data/cuda_testset`, which is the reminder §4.3 asks for that the histogram was
-measured on random playouts. And the node pool ends every move at exactly
-`801 of 801`: `Nmax = n + 1` is tight, not generous, and every simulation created a
-node.
-
----
 
 ## 15. Instrumentation
 
@@ -1394,7 +1266,7 @@ read once per generation, so nothing here costs a host synchronisation.
 |---|---|---|
 | `max_edges` over all expanded nodes | the `E = 64` bet of §4.3 | a trained policy steers into different position types, and open middlegames carry more legal moves than the random playouts `E` was measured on |
 | `n_truncated` nodes, and the sum of prior mass discarded | the cost of the bet, not just its frequency | the mass matters more than the count: truncating 66 moves whose tail holds 0.1 % of the prior is harmless, truncating one that holds 20 % is not |
-| `max_depth`, plus p50 and p99 | descent is the one irreducibly serial walk (§4.2) and its latency is proportional to depth | a sharpening policy concentrates visits and deepens trees, so this grows over a run and is the term that would invalidate §14.1 |
+| `max_depth`, plus p50 and p99 | descent is the one irreducibly serial walk (§4.2) and its latency is proportional to depth | a sharpening policy concentrates visits and deepens trees, so this grows over a run and is the term that would invalidate [the tree-cost prediction](../ledger/perf.md#how-much-the-tree-is-likely-to-cost) |
 | `max_nodes_used` and the mean pool fill | `Nmax = n + 1` is exact, so the interesting quantity is the shortfall | a low fill means many descents ended at terminal nodes, which is wasted encoder batch (§6.3) |
 | `n_terminal_descents` | the waste §6.3 accepts deliberately | rising means the deliberate waste stopped being small, and compaction becomes worth its complexity |
 | `n_empty_mask_expansions` | invariant 5 | must be exactly zero. Anything else is a movegen or masking regression, not a statistic |
@@ -1403,7 +1275,7 @@ read once per generation, so nothing here costs a host synchronisation.
 
 | statistic | why |
 |---|---|
-| `max_N / n` at the root, and the root visit entropy | the direct measure of how peaked the policy target is, and the concrete form of the low-`n` problem in §14.2 |
+| `max_N / n` at the root, and the root visit entropy | the direct measure of how peaked the policy target is, and the concrete form of the low-`n` problem in [the low-`n` policy target](../ledger/perf.md#the-low-n-policy-target) |
 | number of root edges with `N > 0` | at small `n` the root cannot even cover its own edges; this is the number that says so |
 | fraction of moves where `argmax N` differs from `argmax prior` | search that never disagrees with the policy is search that is not earning its cost, and this is the cheapest signal that `n` is too small or `cpuct` is wrong |
 | root `Q` of the chosen move against the eventual game result | value calibration. Cheap here, and C3 needs it anyway |
@@ -1429,7 +1301,7 @@ terms that feed it, and Gate 1a is the first read.
 
 **2026-07-30, the kernels land and Gate 1a is measured.** `csrc/search.cuh`,
 `csrc/search.cu` and `brokefish/search/cuda_impl.py` implement §9's four kernels;
-§12.3 is the differential harness and §14.3 the measurement. Trees agree with the
+§12.3 is the differential harness and [the Gate 1a measurement](../ledger/perf.md#what-the-tree-actually-costs-measured-2026-07-30) the measurement. Trees agree with the
 reference field for field after every simulation, including one move at `n = 800`
 over 462,720 selections.
 
@@ -1440,7 +1312,7 @@ in torch and handed over as a tensor, which is what closes §12's open caveat an
 lets the differential test run at the real `eps`; and `descent` stages the leaf into
 a contiguous buffer for the encoder, which is also where `rep` is checkable.
 
-The tree costs less than §14.1 guessed and more than nothing. §14.3 has the numbers
+The tree costs less than [the tree-cost prediction](../ledger/perf.md#how-much-the-tree-is-likely-to-cost) guessed and more than nothing. [the Gate 1a measurement](../ledger/perf.md#what-the-tree-actually-costs-measured-2026-07-30) has the numbers
 and where the estimate was wrong.
 
 **2026-07-30, the oracle lands, and the papers get read properly.**
@@ -1482,12 +1354,12 @@ first-play urgency at 0 an unvisited edge is scored as a loss, so a mate whose
 prior is 0.017 under an untrained network is not reached until
 `pb_c * P * sqrt(N_v)` clears the visited edges' `Q`, which happens between 400
 and 800 simulations. That is AlphaZero's behaviour rather than a defect, and it is
-§14.2's low-`n` problem in its most concrete form.
+[the low-`n` policy target](../ledger/perf.md#the-low-n-policy-target)'s low-`n` problem in its most concrete form.
 
 **draft, 2026-07-30.** First version. `n = 800` and `B = 4096` from §4.4, chosen
 convergence-first after the encoder was measured flat in batch size. `Dmax` is the
 exact bound `n` rather than a cap, so v0 truncates no path. §15 is the counter block,
 which exists because every fixed size in §4 is a bet on a policy-dependent
 distribution. Supersedes the
-"Search is Gumbel MCTS" statement in `docs/index.md` and `CLAUDE.md`, which record
+"Search is Gumbel MCTS" statement in `index.md` and `CLAUDE.md`, which record
 the intent formed during sizing and not the v0 design.

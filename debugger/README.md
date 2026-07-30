@@ -1,7 +1,7 @@
 # The search debugger
 
 A viewer over recorded searches, plus the live half that records them. The
-contract is [`docs/debugger.md`](../docs/debugger.md); this file is how to run it.
+contract is [`debugger.md`](../docs/reference/debugger.md); this file is how to run it.
 
 ## Install
 
@@ -31,7 +31,7 @@ gets a 404 in the banner and the game is gone. Add `--reload` when editing
 
 | file | what |
 |---|---|
-| `server.py` | the API of `docs/debugger.md` §9.1, and the game sessions |
+| `server.py` | the API of `docs/reference/debugger.md` §9.1, and the game sessions |
 | `static/trace.js` | §5's replay and §3's derived PUCT scores |
 | `static/app.js` | the views of §7 |
 | `../brokefish/search/trace.py` | `TracingSearch`, the recorder |
@@ -47,7 +47,7 @@ The debugger drives the reference search in `brokefish/search/torch_impl.py` and
 not the kernels. The two are validated tree for tree, so a trace of the reference
 is a trace of what the kernel does wherever `tests/test_search_cuda.py` covers,
 and a CUDA-only bug outside that coverage is invisible here by construction
-(`docs/debugger.md` §10).
+(`docs/reference/debugger.md` §10).
 
 Searches are synchronous. A move at `n = 800` on the reference takes as long as it
 takes, and the tab waits for it.
@@ -55,6 +55,6 @@ takes, and the tab waits for it.
 ## No external engine
 
 There is no Stockfish button and there will not be one. The network's own value
-and policy are the only evaluations displayed, for the reason `docs/debugger.md`
+and policy are the only evaluations displayed, for the reason `docs/reference/debugger.md`
 §8 gives: an operator who tunes against an engine's opinion contaminates the curve
 by a route no test covers.

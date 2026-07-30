@@ -1,8 +1,9 @@
 # csrc: CUDA sources
 
-Two kernels will live here. Neither exists yet in production form; this file is
-the contract they have to meet, so that whoever writes them does not have to
-rediscover it.
+Two kernels live here — `encoder.cu` (B1, B2) and `search.cu` (C1) — plus the
+headers the engine is built from. This file is the contract they meet, kept as a
+contract rather than as a description so that a rewrite has something to be checked
+against.
 
 Target architecture is **sm89 (Ada)**: `mma.sync` and `cp.async` are available,
 TMA, `wgmma`, `setmaxnreg` and clusters are not. Build with
@@ -66,7 +67,7 @@ needs 1220 s; 71 registers, no spill.
 Perft is the only test here whose oracle is not this repository, which is why it
 gates the kernel: the differential tests compare against the PyTorch engine, so a
 bug the two share is invisible to them. Porting this kernel found exactly such a
-bug in the reference, an int64 overflow in `terminal`; see `docs/env.md`.
+bug in the reference, an int64 overflow in `terminal`; see `docs/reference/environment.md`.
 
 ⚠️ 71 registers caps the kernel at 3 blocks per SM, so occupancy is 50 %. The
 margin over what the loop needs is 111×, so that stays a note rather than a task,
@@ -84,7 +85,7 @@ Requirements the finished kernel has to meet:
   all-zero mask is checkmate when it is set and stalemate otherwise, and nothing
   else tells the two apart.
 - **Oracle**: `brokefish/env/torch_impl.py`, which implements the same contract in
-  PyTorch and is itself checked against python-chess (`docs/env.md`).
+  PyTorch and is itself checked against python-chess (`docs/reference/environment.md`).
   `scripts/dump_cuda_testset.py` writes the flat binaries, including per-stage
   snapshots so a kernel can be validated one rule at a time.
 - **Fully device-side.** Nothing about the search or the environment may touch
@@ -158,7 +159,7 @@ an incremental hash: both en passant states enter the key.
 
 ## `search`, MCTS v0 ✅
 
-`search.cuh` holds the four kernels of [`docs/mcts.md`](../docs/mcts.md) §9 and
+`search.cuh` holds the four kernels of [`search.md`](../docs/reference/search.md) §9 and
 `search.cu` binds them to torch. This is the first thing in `csrc/` that is *on*
 the self-play path rather than beside it: `descent` calls `step_full`, `movegen`
 and `terminal` from inside its own tree walk with no launch between them, which is
@@ -231,5 +232,5 @@ The fix, which Triton cannot express:
 prototype has already been made to run correctly on this card, so the mechanism
 carries no hardware risk, and only the writing effort remains.
 
-`docs/perf.md` has the full ledger, including the levers already measured to be
+`docs/ledger/perf.md` has the full ledger, including the levers already measured to be
 worthless. Do not re-test those.

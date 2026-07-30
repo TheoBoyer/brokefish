@@ -3,6 +3,12 @@
 How `csrc/encoder.cu` got to 55.0k evals/s, including the version that was
 *slower* than the Triton kernel it replaced, and why.
 
+⚠️ **This entry stops at 55.0k**, which is row 8 of the ladder in
+[`perf.md`](../ledger/perf.md). The landed kernel is faster: row 9's optimisation
+round and B2's prologue and epilogue take it to **62.3k boards-to-logits**. §15 covers
+B2; the row-9 round is in the ledger and not here. The number in the title is the
+state of the case study, not the state of the kernel.
+
 This is written for someone fluent in Triton and PyTorch who has not spent much
 time in CUDA C++. It assumes you know what a warp is, what coalescing means and
 how a roofline works. It does not assume you have met `mma.sync`, `ldmatrix`,
@@ -79,7 +85,7 @@ number that used to sit in our notes ("35-40 TFLOPS fp16") was the fp16-*accumul
 figure being quoted for a kernel that accumulated in fp32. It was off by 2×, in
 the direction that makes you attempt the impossible.
 
-**Is fp16 accumulation safe?** Separate analysis (`docs/perf.md`): in a pre-norm
+**Is fp16 accumulation safe?** Separate analysis (`perf.md`): in a pre-norm
 transformer every accumulator's A operand is a LayerNorm output, so the residual
 stream — the thing that actually grows during training — never feeds a
 contraction. The single exposed accumulator is Q·Kᵀ, and we fold 1/√d_head into
@@ -767,7 +773,7 @@ The fix is to stop inlining. `__device__ __noinline__` on the gather and on the 
 epilogue gives each an ABI frame of its own; the call costs a handful of cycles once
 per board, and the loop gets its allocation back. Spill stores fell from 56 bytes to
 12, and the backbone path measures identical to before B2 against the unchanged
-Triton control. `docs/perf.md` has the four-row table.
+Triton control. `perf.md` has the four-row table.
 
 Two smaller consequences worth knowing, because both changed the *spec* rather than
 the code. The gather accumulates one table at a time rather than loading five and

@@ -158,7 +158,7 @@ Perft timings on CPU, for scale: 197 k positions expanded in 1.4 s, 4.9 M in 30 
 ## Where it departs from FIDE
 
 Three choices every engine makes, none of them a defect, all of them affecting
-self-play results. [`fidelity.md`](fidelity.md) §3.2 has the full argument.
+self-play results. [the fidelity audit](../journal/2026-07-30-fidelity.md) §3.2 has the full argument.
 
 * **Draws are automatic where FIDE makes them claimable.** Threefold and the
   fifty-move rule are claims under Articles 9.2 and 9.3, with automatic thresholds

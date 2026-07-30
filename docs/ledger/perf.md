@@ -1,10 +1,13 @@
-# Model inference performance ledger
+# Performance ledger
+
+Every measured number in the project, in one place, so the rest of `docs/` cites
+rather than restates. Inference first, then the search inside the loop.
 
 All measurements come from the RTX 4060 Laptop, 8 GB, sm89, running the
-d=256 / L=8 / H=8 / FFN=1024 model (6.32M parameters, about 400 MFLOPs per
+d=256 / L=8 / H=8 / FFN=1024 model (6,383,360 parameters, about 400 MFLOPs per
 evaluation) in fp16 at B=16384 boards with T=32 tokens, between 2026-07-27 and
 2026-07-30. Every version was validated numerically against torch at a relative
-error below 5e-3. Row 11 is at B=4096, which §4.4 of `mcts.md` measures as flat.
+error below 5e-3. Row 11 is at B=4096, which §4.4 of `search.md` measures as flat.
 
 ⚠️ Protocol: clocks fall to 1.38-1.5 GHz under load and drift by ±3 %, so every
 comparison is an order-balanced interleaved A/B. A naive before-and-after produced a
@@ -29,7 +32,7 @@ dwarfed the true delta of 0.35 ms.
 | 9 | **+ ping-pong prefetch, 2 CTAs/SM, row-wise residual, current default** | **267.5** | **61.3k** | **×3.03** vs eager |
 | | GO target | ~350 | 45-50k | **cleared** |
 | 10 | B2: boards in, policy/promo/value out — **a different measurement**, see below | **263.0** | **62.3k** | ×3.25 vs the torch full model |
-| 11 | **Gate 1a: the whole MCTS of `docs/mcts.md` §6 on device** at `n=800`, `B=4096`. **Another different measurement**, see below | 57 220 ms/move | **57.0k useful** | tree costs 4.4 % |
+| 11 | **Gate 1a: the whole MCTS of `search.md` §6 on device** at `n=800`, `B=4096`. **Another different measurement**, see below | 57 220 ms/move | **57.0k useful** | tree costs 4.4 % |
 
 Rows 0-9 all measure the same thing, activations in and activations out, and are
 comparable to each other. **Row 10 is not on that ladder**: it takes 64 bytes of
@@ -60,8 +63,8 @@ transferable part.
 
 Row 11 is not on the ladder either, and for a larger reason than row 10: it is a
 whole self-play move rather than a forward pass, so it runs `n + 1` encoder calls
-plus the descent, the expansion and the backup of `docs/mcts.md` §6, and its unit is
-the number the project is gated on. `docs/mcts.md` §14.3 has the full table, the
+plus the descent, the expansion and the backup of `search.md` §6, and its unit is
+the number the project is gated on. The search in the loop, below, has the full table, the
 sweep over `n` and what the §15 counters said. Three things belong here.
 
 **The tree costs 4.4 %, flat in `n`.** 2.84 ms per simulation at `n = 32`, 2.88 at
@@ -72,7 +75,7 @@ charging the tree for the extra evaluation makes the overhead look like it falls
 with `n`, which it does not.
 
 **The encoder is slower inside the loop than in its own benchmark, and this is the
-transferable finding.** §4.4 of `mcts.md` measured 64 142 evals/s at `B = 4096`. The
+transferable finding.** §4.4 of `search.md` measured 64 142 evals/s at `B = 4096`. The
 same call in the same process, run 801 times back to back as part of this campaign,
 gives **59 852/s**, 6.7 % lower. The card sits at **1230-1290 MHz and 82 °C** through
 a 57-second block where a short encoder benchmark holds the 1.38-1.5 GHz this
@@ -343,7 +346,7 @@ is reading 0.3 % of arithmetic plus 7.5 % of torch overhead.
 
 ## The dead-token mask, 2026-07-29
 
-[Spec §7.3](spec.md#73-dead-tokens) makes the mask mandatory, and rows 0 through 5
+[Spec §7.3](../reference/spec.md#73-dead-tokens) makes the mask mandatory, and rows 0 through 5
 were all measured without it, so the GO target was being chased against a kernel
 that was not the one we ship.
 
@@ -702,3 +705,144 @@ and clusters.
 `commit_group` plus `wait_group` plus a plain `mbarrier.arrive`. A working
 warp-specialised prototype exists, built in Gluon, so the mechanism is proven on
 this card and the CUDA version carries no hardware risk.
+
+---
+
+## The search in the loop
+
+Moved from `search.md` §14 on 2026-07-31. The prediction came first and the
+measurement that settled it is below, which is why the two are kept together.
+
+From the measured 64.2k evals/s, ignoring the learner's share and assuming the tree
+costs nothing. A move costs `n` evaluations per game, so the rate of real moves is
+`64.2e3 / n` across the whole batch:
+
+| `n` | moves/s | 10k games (80 plies) | 128k games | 10M games |
+|---|---|---|---|---|
+| 32 | 2006 | 6.6 min | 1.4 h | 111 h |
+| 128 | 502 | 27 min | 5.7 h | 444 h |
+| 400 | 161 | 1.4 h | 17.7 h | 1386 h |
+| 800 | 80 | 2.8 h | 35.4 h | 2772 h |
+
+⚠️ Arithmetic from a measurement and not a measurement. It is a floor: the tree's
+cost is what Gate 1a exists to measure, and it comes out of these numbers rather than
+being added to them.
+
+The `n = 800` column is what makes the ordering in §4.4 workable rather than
+reckless. A convergence check does not need 10M games; the first evidence that the
+loss is falling and that self-play Elo is rising arrives in the low thousands of
+games, which is under three hours. A full run at `n = 800` is out of the question on
+this card, and that is the point: the search budget is the first thing the
+optimisation work will attack, with a converging baseline to regress against.
+
+The reduction path, in the order it should be tried: bring `n` down and watch Elo per
+game, since AlphaZero's 800 was chosen on hardware where evaluations were nearly
+free; then Gumbel, whose entire purpose is to make small `n` behave, and which §11
+prices at two functions; then playout cap randomisation, which pays the large budget
+on only a fraction of moves.
+
+### How much the tree is likely to cost
+
+Rough arithmetic, to set expectations for Gate 1a rather than to substitute for it.
+
+A descent step reads one node's edge statistics, 64 × (2 + 2 + 4) = 512 B, and picks
+an argmax. Taking 300 cycles for the load-and-reduce and a real depth of 40, one
+simulation's descent is about 12k cycles, and a move's 800 simulations about 9.6M
+cycles per game. At `B = 4096` over roughly 1150 concurrent warp slots that is about
+3.6 waves, so 34M cycles, or **24 ms per move** at 1.4 GHz.
+
+The same move costs 800 encoder launches at 63.9 ms each, which is **51.1 s**.
+
+So the arithmetic puts the tree near 0.05 % of a move, against the 2.2 % the
+environment measured. If that survives contact with a profiler, then the block tail of
+§9, the path array of §4.2 and the parallel backup of §6.5 are all decisions about
+code clarity and none of them is a throughput decision.
+
+⚠️ The 300 cycles is a guess, not a measurement, and the estimate ignores the
+repetition scan, the expansion and every launch overhead. Treat it as an order of
+magnitude. Gate 1a is what settles it, and the reason to write it down now is that it
+argues against optimising any of this before measuring.
+
+### The low-`n` policy target
+
+At small `n` the policy target degrades in a specific way worth watching for: with
+about 31 edges at the root and `n` visits to spread over them, `N / n` approaches
+uniform-with-noise. The reference implementation shows this long before the kernel
+exists, which is a reason to look at it there.
+
+### What the tree actually costs, measured 2026-07-30
+
+`bench/bench_search.py`, `logs/gate1a.log`. `B = 4096` games at 30 random plies,
+three interleaved rounds with the order reversed on alternate ones. The whole of §6
+runs on device: `root_init`, `n` simulations of descent, encoder, expansion and
+backup, and `select_and_advance`.
+
+| `n` | useful evals/s | raw evals/s | encoder alone | tree | tree, ms/simulation | s per move | mean/max depth |
+|---|---|---|---|---|---|---|---|
+| 32 | **58 942** | 59 021 | 63 547 | 4.4 % | 2.84 | 2.22 | 4.1 / 15 |
+| 128 | **58 763** | 58 852 | 61 890 | 4.3 % | 2.88 | 8.91 | 5.1 / 21 |
+| 800 | **56 996** | 57 265 | 59 852 | 4.4 % | 3.00 | 57.22 | 5.8 / 28 |
+
+**Gate 1 wanted 45-50k and gets 57.0k at the full `n = 800`.** The gated number is
+*useful* evaluations: a descent that ended on a stored terminal, or that created a
+terminal child, has nothing for the network to say, and §6.3 evaluates it anyway to
+keep the launch shape static. That waste is 0.5 % at `n = 800` and 0.1 % below it.
+
+The baseline is `n + 1` calls through `forward_full` and nothing else, because a
+move is `root_init` plus `n` simulations and each calls the encoder once. Charging
+the tree for one extra evaluation makes the overhead look like it falls with `n`
+(7.5 % → 4.5 %); it does not, it is flat.
+
+**The tree costs 3.00 ms per simulation at `B = 4096`, 0.73 µs per game.** Nearly
+flat in `n`: the 5 % rise from 32 to 800 is the mean depth going from 4.1 to 5.8,
+which is the only term that should grow and does.
+
+**Predicted 1.7 ms and 2.7 %, measured 3.00 ms and 4.4 %.** Two separate gaps.
+
+The absolute rate misses its 62.5k prediction because the encoder in this campaign
+is **59 852/s, not the 64 142/s of §4.4**. A 57-second block holds the card at
+1230-1290 MHz where the shorter encoder benchmark sits at 1.38-1.5 GHz, and 82 °C is
+where it settles. Sustained MCTS load throttles harder than the benchmark that sized
+it, which is a fact about the card and not about the search. The interleaved protocol
+is what keeps the *ratio* meaningful anyway.
+
+Scaled to the clock it actually ran at, the prediction was 1.84 ms against 3.00
+measured, so the tree is 1.6× more expensive than the arithmetic said. The
+prediction's dominant term was the two `movegen` calls, priced at the perft kernel's
+5.01M boards/s. That kernel uses 71 registers and fits three blocks per SM; inside
+`descent` the same code runs in a 96-register kernel at two blocks per SM, and inside
+`expand` at 72 with a different instruction mix. Lower occupancy on the dominant term
+is the leading candidate and it is **not measured**, because a 1.2 ms gap inside a
+4.4 % overhead is not worth a profiler run.
+
+⚠️ **The prediction was wrong by two orders of magnitude, in the optimistic direction.** It
+put the tree near 0.05 % of a move; it is 4.4 %. Its error is not the 300-cycle guess
+for a descent level, which if anything was generous, since the measured mean depth is
+5.8 and not the 40 it assumed. Its error is scope: it costed the descent alone and
+explicitly set aside the two `movegen` calls, the expansion and the launches, which
+are the bulk of the 3.00 ms. The conclusion it drew still holds, since 4.4 % is not
+worth attacking, but the number it drew it from should not be quoted.
+
+**What the cost table above becomes**, now that the tree is in it. The measured rate of
+real plies is `4096 / (s per move)`:
+
+| `n` | plies/s, arithmetic | plies/s, measured | 10M games (80 plies) |
+|---|---|---|---|
+| 32 | 2006 | 1845 | 120 h |
+| 128 | 502 | 460 | 483 h |
+| 800 | 80 | 71.6 | 3103 h |
+
+12 % above the arithmetic at every point, which is the tree plus the throttling.
+The ordering is unchanged: a full run at `n = 800` is out of the question on this
+card and the search budget is still the first thing to attack.
+
+**What the counters say about §4's fixed sizes**, over one instrumented move at each
+point. `E = 64` holds: 443 of 3 276 800 expansions truncated at `n = 800`, 0.0135 %
+against §4.3's estimate of 0.01 %, dropping 2.32 of prior mass in total across those
+443 nodes. The largest candidate count seen was **77**, above the 65 maximum in
+`data/cuda_testset`, which is the reminder §4.3 asks for that the histogram was
+measured on random playouts. And the node pool ends every move at exactly
+`801 of 801`: `Nmax = n + 1` is tight, not generous, and every simulation created a
+node.
+
+---

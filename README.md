@@ -72,10 +72,21 @@ py -m bench.bench_env                  environment throughput
 py scripts/check_cuda_build.py         the CUDA toolchain, end to end
 ```
 
-Anything that compiles a CUDA extension also needs `PATH="$PWD/.venv/bin:$PATH"`,
-because torch shells out to `ninja --version` to decide whether ninja exists.
+## The documentation
 
-`docs/spec.md` is the normative contract between engine and network, and it is
-frozen. `docs/state.md` is the ledger: what is built, what it measured, and the
-mistakes that cost time. `docs/roadmap.md` says what is next. `docs/perf.md`
-records every measured number, including the optimisations that returned nothing.
+`docs/` is split by what a document owes the reader, and the directory is the kind.
+
+```
+docs/reference/   what the code must do. spec.md is the frozen engine-network
+                  contract; search.md, training.md, evaluation.md, environment.md
+                  and debugger.md are normative for their component
+docs/ledger/      the numbers. state.md is one bullet per landed component,
+                  perf.md one row per measurement. Cited, never restated
+docs/journal/     dated and append-only: experiments, audits, dead ends, and the
+                  reasons behind decisions. Never edited to stay true
+docs/roadmap.md   what is next, and the decisions still open
+```
+
+Where a journal entry and a reference page disagree, the reference page is current
+and the entry records what was believed on its date. That is the arrangement, not a
+defect.

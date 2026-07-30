@@ -42,7 +42,7 @@ and is not. Deleting one because it looks obvious is how it gets made again.
   one 128-bit load straight into the mma's registers. That is the whole trick —
   14 barriers per layer. The first CUDA build staged weights through SMEM like
   the Triton one and was *slower* than Triton (202 barriers/layer, 255
-  registers); `docs/perf.md` has both rows and the static census, because the
+  registers); `perf.md` has both rows and the static census, because the
   failed prediction is the instructive part.
   ⚠️ **Two hard budgets, both binding, both measured.** SMEM must stay at or
   under **50,176 B** or the block stops fitting twice on an SM (worth 5.4 %),
@@ -64,7 +64,7 @@ and is not. Deleting one because it looks obvious is how it gets made again.
   ⚠️ fp16 accumulation moves the overflow ceiling to about 12× weight growth
   (the residual stream, already fp16, fails at ~17×). The single quantity to log
   during training is **max |post-scale attention logit|**, at 3.1 today; overflow
-  is loud (inf → NaN), not silent. `docs/perf.md` has the headroom table.
+  is loud (inf → NaN), not silent. `perf.md` has the headroom table.
   Implementations are selected by name (`brokefish.nn.encoder_impl`);
   `tests/test_model.py` (11 tests) and `bench/bench_model.py` run every
   available one, and `brokefish/nn/_build.py` compiles CUDA against torch's own
@@ -80,7 +80,7 @@ and is not. Deleting one because it looks obvious is how it gets made again.
   codes and the null move. Perft green on all six standard positions, startpos
   to depth 6 (119 060 324 nodes, 1220 s under `pytest --slow`); differential
   fuzzing against python-chess asserts the full `chess.Move` set, the hash
-  partition, the terminal code and the repetition count. See `docs/env.md`,
+  partition, the terminal code and the repetition count. See `environment.md`,
   which also lists the three deliberate departures from python-chess.
 - `csrc/movegen.cuh` — **the first order of the move generator, A1.1, done**: the
   per-(type, square) table, pawns with en passant, slider occlusion, castling
@@ -168,12 +168,12 @@ and is not. Deleting one because it looks obvious is how it gets made again.
   carrying uint64 patterns, so summing overflows: two pieces able to reach h8 give
   2 × 2⁶³ = 0. `terminal` used it and called a position with four legal replies
   checkmate. Fixed 2026-07-29, pinned by `test_terminal_survives_mask_overflow`, full
-  story in `docs/env.md`. Test emptiness with `(mask == 0).all(-1)`.
+  story in `environment.md`. Test emptiness with `(mask == 0).all(-1)`.
 - `csrc/tests/harness.cuh` — shared reading and reporting for the device tests. The
   engine tests print the offending position as a board plus a slot-by-slot diff, and
   `tstep.cu` **fails when a rule is uncovered** rather than passing vacuously; the
   dump is random playouts, where en passant is 39 cases out of 322 246.
-- `docs/mcts.md` — **the normative v0 search contract**, written 2026-07-30. v0 is
+- `search.md` — **the normative v0 search contract**, written 2026-07-30. v0 is
   the AlphaZero search adapted to fixed shapes: PUCT with the logarithmic
   exploration term, Dirichlet root noise, visit counts as the policy target,
   `n=800`, `B=4096`, `E=64` edges per node, a fresh tree per move. Faithfulness is
@@ -200,7 +200,7 @@ and is not. Deleting one because it looks obvious is how it gets made again.
   under which the tree is a function of the rules alone; and properties of chess.
   **15 of 16 mutations killed** by `tests/test_mutation_search.py`, the survivor
   being the designed control (`torch.argmax` happens to return the lowest index, so
-  swapping it for `_lowest_argmax` changes nothing measurable). `docs/mcts.md` §12.1
+  swapping it for `_lowest_argmax` changes nothing measurable). `search.md` §12.1
   has the table and which mutations only one test catches.
   ⚠️ **Test the parity at `L >= 3`.** At `L = 2` the correct `(L-d) % 2` and the
   inverted `d % 2` agree on both levels, so a two-level test cannot see the bug it
@@ -226,13 +226,13 @@ and is not. Deleting one because it looks obvious is how it gets made again.
   ⚠️ The forced-mate check needs `n=800` and `eps=0`. With first-play urgency at 0
   an unvisited edge is scored as a loss, so a mate at prior 0.017 is not reached
   until `pb_c * P * sqrt(N_v)` clears the visited edges' `Q`, between 400 and 800
-  simulations. AlphaZero's behaviour, and §14.2's low-`n` problem in concrete form.
+  simulations. AlphaZero's behaviour, and [the low-`n` policy target](perf.md#the-low-n-policy-target)'s low-`n` problem in concrete form.
   ⚠️ The Dirichlet **stream** is now shared: `cuda_impl` subclasses this and
   inherits §6.1, so one seed drives both and §12's comparison runs at the real `eps`.
 - `csrc/search.cuh` + `csrc/search.cu` + `brokefish/search/cuda_impl.py`: **the CUDA
   search, C1 closed 2026-07-30. Gate 1a: 56 996 useful evals/s at n=800, B=4096**,
   a 4.4 % tree overhead over the encoder alone, 57.2 s per move
-  (`bench/bench_search.py`, `logs/gate1a.log`, `docs/mcts.md` §14.3). `descent` fuses
+  (`bench/bench_search.py`, `logs/gate1a.log`, [the Gate 1a measurement](perf.md#what-the-tree-actually-costs-measured-2026-07-30)). `descent` fuses
   select, `step_full`, the repetition scan, `terminal` and the allocation into one
   launch at **96 registers with no spill**; `expand` is 72, `backup` 20.
   `cuda_impl.Search` subclasses the reference and replaces only the four
@@ -251,13 +251,13 @@ and is not. Deleting one because it looks obvious is how it gets made again.
   denominator is a warp reduction over ≤64 survivors and torch's is over the
   8192-wide masked row, so they differ by one fp16 ULP on about one edge in a
   hundred. Everything else, `edge_Q` and `node_value` included, is exact.
-  `docs/mcts.md` §12.3 has the margin table and which runs are guaranteed rather
+  `search.md` §12.3 has the margin table and which runs are guaranteed rather
   than empirical.
   ⚠️ `E = 64` is compile-time (§6.6's scan is two edges per lane), `B` and `Nmax`
   runtime. Changing `E` means editing `kE` in `csrc/search.cuh`.
   ⚠️ **The card throttles harder here than in any earlier benchmark**: 1230-1290 MHz
   at 82 °C through a 57-second move, so the same encoder call reads 59.9k inside the
-  loop against the 64.1k `docs/perf.md` quotes. Every absolute number in that file is
+  loop against the 64.1k `perf.md` quotes. Every absolute number in that file is
   an upper bound on what the kernel does inside a generation, by about 6.7 %.
 - `tests/test_search_cuda.py`: **the kernels against the reference, 19 checks**.
   both implementations from one seed, every array of §4.2 compared after **every**
@@ -283,7 +283,7 @@ and is not. Deleting one because it looks obvious is how it gets made again.
   lists, built four ways round from the reference (values per node flipped at read
   time, the repetition window walked up the parent links, the path as node references,
   node indices from a counter). Trees compared node for node and edge for edge on seven
-  positions; **they agree exactly at 64 and at 512 simulations**. `docs/mcts.md` §12.2.
+  positions; **they agree exactly at 64 and at 512 simulations**. `search.md` §12.2.
   ⚠️ **The evaluator has to be integer arithmetic, not the network.** The reference
   calls the net on a batch of B and the oracle on one position, and an fp32 reduction
   need not give the same last bit at two batch sizes. The shared evaluator is a
@@ -298,7 +298,7 @@ and is not. Deleting one because it looks obvious is how it gets made again.
   same reading of the paper, agreement proves nothing about the reading.
 - `brokefish/search/trace.py` + `debugger/` — **the search debugger, done 2026-07-30**.
   `TracingSearch` records one `B = 1` reference search as the per-simulation deltas of
-  `docs/debugger.md` §4, and the web app replays them: root table with `Q` and `U`
+  `debugger.md` §4, and the web app replays them: root table with `Q` and `U`
   split, a scrubber over the `n` simulations with the score that decided each descent
   step, a node inspector, a run summary, and play against a checkpoint.
   `tests/test_trace.py`, 18 checks. **1360 B per simulation, 18 ms per simulation** at
@@ -321,8 +321,8 @@ and is not. Deleting one because it looks obvious is how it gets made again.
   debugger is not evidence about the kernels.
   ⚠️ No external engine evaluation in it, ever: not Stockfish, not a tablebase, not an
   opening name. The operator is the route by which engine opinion would enter, and no
-  test covers that route (`docs/debugger.md` §8).
-- `docs/fidelity.md` — **where the reproduction may be wrong, written 2026-07-30**.
+  test covers that route (`debugger.md` §8).
+- `2026-07-30-fidelity.md` — **where the reproduction may be wrong, written 2026-07-30**.
   Everything else in `docs/` records what was measured; this records what was not.
   Two audits: the search against AlphaZero, the engine against FIDE. Nothing in it is
   a known defect, and every entry names what would settle it.
@@ -339,7 +339,7 @@ and is not. Deleting one because it looks obvious is how it gets made again.
 - `brokefish/env/notation.py` — **D0, the output side, done 2026-07-30**: `to_fen`,
   `to_uci`, `to_san`, `to_pgn` and a batched `GameRecorder`, the inverses of the
   `from_fen`/`parse_san`/`from_pgn` that already existed. Nothing could emit a game
-  before this, which blocked every external-opponent layer of `docs/evals.md`.
+  before this, which blocked every external-opponent layer of `evaluation.md`.
   `tests/test_notation.py`, 30 tests, python-chess as the oracle **string for
   string** over ~600 positions and ~13 000 moves of random legal play, plus a PGN
   handed back to `chess.pgn` and replayed.
@@ -354,11 +354,11 @@ and is not. Deleting one because it looks obvious is how it gets made again.
   python-chess's default; the full-move number is an argument, since spec §2.2 does
   not carry one. Binds to `torch_impl` on purpose: host-side I/O for evaluation,
   never on the self-play path, so a PGN writer needs no CUDA toolchain.
-- `docs/evals.md` — the evaluation contract, **draft**, and Track D in the roadmap.
+- `evaluation.md` — the evaluation contract, **draft**, and Track D in the roadmap.
   Four layers: regression (every checkpoint, **44.4 s measured**), the self-anchored
   checkpoint league that produces the curve, external calibration, and the
   preregistered gate.
-  `eval_prior_art.md` at the root verifies every borrowed claim against the papers.
+  `2026-07-30-eval-prior-art.md` at the root verifies every borrowed claim against the papers.
   Settled so far: **no checkpoint gating** (so C2 does not depend on Track D), fixed
   simulations per move rather than a time control, greedy move selection in
   evaluation, target a CI width rather than a game count, and two cost numbers with
@@ -369,7 +369,7 @@ and is not. Deleting one because it looks obvious is how it gets made again.
   ⚠️ Evaluation output may never flow backwards. The prohibition that will actually
   get violated is checkpoint selection: "keep the checkpoint with the best puzzle
   score" is distillation through a one-bit channel and looks like good practice.
-- `brokefish/eval/` — **layers 0 and 3 of `evals.md`, D1 done 2026-07-30**. The six
+- `brokefish/eval/` — **layers 0 and 3 of `evaluation.md`, D1 done 2026-07-30**. The six
   rule suites (200 items each, cached in `data/suites.pt`), the layer-0 scalars, the
   Lichess puzzle curve, and `layer0_report()`, one call per checkpoint and one JSON
   record out. `tests/test_eval.py` (33 tests) checks every answer key against
@@ -378,7 +378,7 @@ and is not. Deleting one because it looks obvious is how it gets made again.
   ⚠️ **The Lichess CSV's schema was the one claim with no oracle, and is now
   settled**: `data/lichess_db_puzzle.csv` is on disk, and both the column names and
   the "the first move is the opponent's" convention were checked against real rows
-  on 2026-07-30. `eval_prior_art.md` §8 covers the licence, the count and the
+  on 2026-07-30. `2026-07-30-eval-prior-art.md` §8 covers the licence, the count and the
   Glicko-2 deviation field.
   ⚠️ **A random-init net scores 0.147 on the puzzle curve against a 0.051 uniform
   null, and none of it is chess knowledge.** Decomposed: **0.448** where the solution
@@ -390,18 +390,18 @@ and is not. Deleting one because it looks obvious is how it gets made again.
   0.00115), and in 17 cases it found the mate and played something else, because root
   selection is greedy on visit count rather than on `Q`. Over six random inits the
   mate rate is **0.568 ± 0.100** (0.448-0.738), so the untrained anchor's puzzle score
-  measures the seed as much as the architecture — which matters because `evals.md`
+  measures the seed as much as the architecture — which matters because `evaluation.md`
   §5.1 pins that net as the frozen Elo-0 anchor. Measured 2026-07-30,
   `logs/d1_puzzles.log` and `logs/d1_why.log`.
-  ⚠️ **`max |post-scale attention logit|` is not here**, though `evals.md` §4 listed
+  ⚠️ **`max |post-scale attention logit|` is not here**, though `evaluation.md` §4 listed
   it as a fourth layer-0 scalar. It is an fp16 overflow watch on the kernels rather
   than a measurement of a net, it would be the only thing in `eval/` reaching inside
   `net.encoder.layers`, and it can only read the torch oracle's logits rather than
-  the accumulator that overflows. It belongs to C2 and `docs/train.md` §11 already
+  the accumulator that overflows. It belongs to C2 and `training.md` §11 already
   carries it. Dropped 2026-07-30.
   ⚠️ **Every suite's answer key is a spec §4.3 terminal code**, never a material
   count and never an evaluation, which is what keeps them inside the tabula rasa
-  boundary during training. `evals.md`'s original definitions of stalemate
+  boundary during training. `evaluation.md`'s original definitions of stalemate
   avoidance and underpromotion both needed something else — a material count and a
   search — and were restated one ply deep: a mate must exist, the wrong move must be
   a named draw. There is deliberately no "best move" suite.
@@ -426,7 +426,7 @@ and is not. Deleting one because it looks obvious is how it gets made again.
   ⚠️ Evaluation must run under `no_grad`. The first version did not, and the fp32
   master weights built an autograd graph across a 300-ply run that OOM'd an 8 GB
   card at 8 games.
-- `brokefish/train/` — **the C2 training loop, `docs/train.md`, done 2026-07-31**.
+- `brokefish/train/` — **the C2 training loop, `training.md`, done 2026-07-31**.
   `loss.py` (AZ eq. 1 and the label decode), `buffer.py` (the 500k-game window as a
   memory-mapped ring), `sync.py` (§8.1's two weight representations), `log.py`,
   `loop.py` (the alternation, the cadence, the optimiser, checkpoint/resume, the euro
@@ -434,9 +434,9 @@ and is not. Deleting one because it looks obvious is how it gets made again.
   ⚠️ **C2 is the first phase with no oracle.** Perft settled the engine, `model.py`
   the encoder, an independent AGZ search settled C1. Nothing external says a training
   loop is correct, and its failure mode is a curve that is merely worse than it should
-  have been. `train.md` §12 is what replaces the oracle and is the part to argue with.
+  have been. `training.md` §12 is what replaces the oracle and is the part to argue with.
   ⚠️ **The record stores the root's whole edge set, so the training path recomputes
-  nothing** (`mcts.md` §10, `train.md` §3.5, revised 2026-07-31). `policy_len` is the
+  nothing** (`search.md` §10, `training.md` §3.5, revised 2026-07-31). `policy_len` is the
   edge count, not the visit count, and an unvisited edge is stored with `π = 0`. It
   carries nothing for the target and everything for the *denominator*. The arrays were
   already `E` wide and zero-padded, so this costs **no bytes** — the first draft
@@ -474,7 +474,7 @@ and is not. Deleting one because it looks obvious is how it gets made again.
   gradient norm at 0.1 — a **saturated `tanh`**, which produces no gradient at all.
   Provisional: no rate reached `KL ≈ 0`, so this is a rate comparison and not yet a
   pass of check 1, and `n = 16` targets have a mean `policy_len` of 3.5 against the
-  much richer ones `n = 800` produces. `train.md` §7.3 has the table.
+  much richer ones `n = 800` produces. `training.md` §7.3 has the table.
 - Cost accounting is in (`loop.py`'s euro counter, §10, two numbers: the curve's
   x-axis and the project total). What is still **untouched** is everything downstream
   of C2 — the checkpoint league, the Elo curve, C4's sims sweep.

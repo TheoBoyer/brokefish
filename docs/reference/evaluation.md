@@ -6,7 +6,7 @@ and who has to make them. Everything outside §11 is a recommendation with its r
 attached, so that disagreeing with one part does not require re-deriving the rest.
 
 Scope: how strength is measured, and the harness that measures it. The training loop
-and the replay buffer are C2. The search is [`mcts.md`](mcts.md). The engine and
+and the replay buffer are C2. The search is [`search.md`](search.md). The engine and
 network contracts are [`spec.md`](spec.md); nothing here modifies them.
 
 The deliverable this serves is a **cost-versus-Elo curve**, so the object being
@@ -73,7 +73,7 @@ Two asserts to write, both cheap:
 of MCTS simulations per move. Four reasons:
 
 - **Reproducibility.** Clocks on the 4060 drop to 1.38-1.5 GHz under sustained load
-  and drift ±3 %. Every benchmark in `docs/perf.md` is order-balanced interleaved
+  and drift ±3 %. Every benchmark in `perf.md` is order-balanced interleaved
   because of it. A time-controlled match has no such defence, and a rating measured
   under one thermal state does not compare to one measured under another.
 - **Hardware independence.** A rating at `n = 800` means the same thing on the 4060
@@ -91,7 +91,7 @@ point.
 ⚠️ **AlphaZero is not precedent for this.** Its training-progress ratings came from a
 **1 second per move** tournament, i.e. a time control. The four reasons above stand on
 their own, but the recommendation is ours and not inherited — see
-`eval_prior_art.md` §2.4.
+`2026-07-30-eval-prior-art.md` §2.4.
 
 **Move selection during evaluation is greedy on the root visit count**: temperature 0,
 no Dirichlet noise, in every layer. This follows AZ, which does the same, and it is
@@ -133,7 +133,7 @@ never touched; and `CLAUDE.md` asks for it **during training**, where a NaN is
 found at the step that caused it rather than at the next checkpoint. It landed in
 this section because layer 0 was the only per-checkpoint hook that existed when the
 section was written — placement by availability, not by fit. Its home is
-`docs/train.md` §11, which already carries it, and `mcts.md` §15.3 lists it among
+`training.md` §11, which already carries it, and `search.md` §15.3 lists it among
 the search's numerical-health counters.
 
 **Cost: 44.4 s per checkpoint**, measured on 2026-07-30 for 64 games at `n = 100`
@@ -183,7 +183,7 @@ the fitted scale shows up directly as the anchor's rating moving off zero.
 
 Precedent: lc0's training chart "sets 'the first net' to Elo 0", with the explicit
 warning that it is therefore "not comparable, even between different training runs"
-(lc0 FAQ, quoted in `eval_prior_art.md` §4.1). KataGo instead anchors externally, at
+(lc0 FAQ, quoted in `2026-07-30-eval-prior-art.md` §4.1). KataGo instead anchors externally, at
 ELF ≈ 0. The difference matters only for §6: an internal anchor makes the calibration
 step mandatory, an external one folds it into the fit.
 
@@ -260,7 +260,7 @@ uncertainty, and that uncertainty propagates into any absolute claim.
 
 The preregistered claim: a threshold, on a named list, at a named time control, on
 named inference hardware, at a named search budget, **fixed before the run rather
-than after it** (`docs/roadmap.md`, "Measuring strength").
+than after it** (`roadmap.md`, "Measuring strength").
 
 Two design points:
 
@@ -307,7 +307,7 @@ of matches.
 
 ### 7.2 Tablebases and pondering — decided 2026-07-30
 
-Supersedes `docs/roadmap.md`'s "no tablebases and no pondering on either side or the
+Supersedes `roadmap.md`'s "no tablebases and no pondering on either side or the
 same on both", which offers only two options where three exist.
 
 - **We never use tablebases, in any layer.** Not a boundary question — a
@@ -407,7 +407,7 @@ silently returning nothing.
 ⚠️ **The schema is the one unverified thing in Track D's code.** The reader, the
 setup move, the deviation and rating filters and the rating binning are all tested,
 but against a CSV this repository writes itself in the format `puzzles.py` claims.
-That proves the reader and not the claim. `eval_prior_art.md` §8 verified the
+That proves the reader and not the claim. `2026-07-30-eval-prior-art.md` §8 verified the
 licence, the 6 014 381 count and the Glicko-2 deviation field against
 database.lichess.org; the column names and the two conventions below came from
 memory and stay unconfirmed until the export is on disk.
@@ -507,16 +507,16 @@ opponent-ladder decision to be made before it starts.
 
 | decision | who/when | note |
 |---|---|---|
-| the preregistered threshold, list, time control, hardware and search budget | start of C3, per roadmap | this is the claim; it cannot move afterwards |
-| the gate basket: which engines, throttled how | start of C3 | §7 argues for CCRL-listed at CCRL conditions |
+| the preregistered threshold, list, time control, hardware and search budget | start of D5 | this is the claim; it cannot move afterwards |
+| the gate basket: which engines, throttled how | start of D5 | §7 argues for CCRL-listed at CCRL conditions |
 | ~~**checkpoint gating in the training loop**~~ | **settled 2026-07-30: no gating** | AZ's choice. Gating makes the x-axis ambiguous — a rejected candidate costs euros and yields no curve point — and SAI names it as an aggravating factor for the §5.2 inflation. C2 therefore does **not** depend on the eval harness. KataGo's 200-game check is still run in layer 0 as a **non-blocking logged diagnostic**, so the write-up can say whether gating would have fired |
 | ~~**games per curve point**~~ | **settled 2026-07-30: target a CI width, not a game count** | `d` drifts over the run (§9), so a fixed `N` over-measures early points and under-measures late ones. Fix the ±Elo, let `N` follow; variance-proportional sampling (§5.2) is the same statistic |
 | ~~**what the euro counter counts**~~ | **settled 2026-07-30: two numbers** | the curve's x-axis is **training compute only**, which is what makes it comparable to AlphaGateau's 13.7 days × 8 A5000s. Total project cost — eval, failed runs, development — is published as a separate headline figure. Only the first is incomparable; only the second is dishonest for a cost paper |
 | ~~**submission to a third-party list**~~ | **closed 2026-07-30: not available** | CCRL is CPU-only (§7.1). The anchor is a *borrowed* rating, not an awarded one |
-| **which calibration engines** | start of C3, and the next one to decide | §6 |
+| **which calibration engines** | start of D4, and the next one to decide | §6 |
 | eval `n` for the reported curve | start of C4 | need not equal training's 800 |
-| rating fit: BayesElo, Ordo, or our own BT fit | start of C3 | all three are fine; the pairing schedule matters more than the fitter |
-| whether the external anchor is a node in the league fit or a separate affine map | start of C3 | folding it in deletes §6's two-scale hazard but pulls §10.2's exporters earlier |
+| rating fit: BayesElo, Ordo, or our own BT fit | start of D2 | all three are fine; the pairing schedule matters more than the fitter |
+| whether the external anchor is a node in the league fit or a separate affine map | start of D2 | folding it in deletes §6's two-scale hazard but pulls §10.2's exporters earlier |
 
 ---
 
@@ -524,8 +524,7 @@ opponent-ladder decision to be made before it starts.
 
 Verified against the papers on 2026-07-30. The quotes, links, the full scorecard of
 what was checked and what turned out to be wrong, and the four things still
-unverified are in **`eval_prior_art.md`** at the repository root — deliberately
-outside the MkDocs nav: working material, not part of the published site.
+unverified are in **[the eval prior-art pass](../journal/2026-07-30-eval-prior-art.md)**.
 
 The five results that this document rests on:
 
@@ -539,7 +538,7 @@ The five results that this document rests on:
 
 ⚠️ **One claim from the first draft is withdrawn, not softened**: that lc0 ran gating
 early and dropped it. It could not be sourced, and what evidence there is points the
-other way. `eval_prior_art.md` §4.2.
+other way. `2026-07-30-eval-prior-art.md` §4.2.
 
 ---
 
@@ -556,7 +555,7 @@ point figure given in conversation on 2026-07-30, which assumed no draws and was
 therefore pessimistic by up to 1.8×.
 
 **draft, 2026-07-30, verification pass.** §12 was written from memory and has been
-checked against the papers; `eval_prior_art.md` holds the quotes and the scorecard.
+checked against the papers; `2026-07-30-eval-prior-art.md` holds the quotes and the scorecard.
 Six things changed as a result: AZ is no longer cited as precedent for fixed
 simulations (it rated at 1 s/move, §3); §5.2 attributes the inflation claim to SAI
 §3.5 rather than KataGo and adopts KataGo's variance-proportional pairing over a
@@ -572,7 +571,7 @@ count**; **two cost numbers**, with training-only on the curve's x-axis; and
 Lc0, so §7 was rewritten around a *borrowed* rating instead of an awarded one, with
 §7.1 resolving the protocol question by running both and measuring the offset. §7.2
 settles tablebases (never ours, whatever the opponent is rated with) and supersedes
-`docs/roadmap.md`'s two-option sentence. Still open and now next: **which calibration
+`roadmap.md`'s two-option sentence. Still open and now next: **which calibration
 engines**.
 
 **draft, 2026-07-30, D1 built.** §4 and §8 stop being proposals: `brokefish/eval/`
@@ -594,6 +593,6 @@ overflow watch on the fused kernels rather than a measurement of a network, it i
 the only thing in `brokefish/eval/` that would have to open up `net.encoder.layers`,
 and it can only read the torch oracle's logits in fp32 rather than the fp16
 accumulator that actually overflows. `CLAUDE.md` asks for it during *training*, and
-`docs/train.md` §11 and `mcts.md` §15.3 both already carry it. It was in §4 because
+`training.md` §11 and `search.md` §15.3 both already carry it. It was in §4 because
 layer 0 was the only per-checkpoint hook that existed when §4 was written. Layer 0
 now logs three scalars, not four.

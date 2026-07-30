@@ -395,7 +395,7 @@ block-diagonal mask at T=32, but this one is dynamic and survives.
 residual stream whose scale grows with depth, in fp16. `norm_f` normalises it before
 any head reads it. This is not optional and it is not part of the stack: the fused
 kernels treat it as the first step of the head epilogue, which also gives them a
-row-padded buffer to read (`docs/cuda_walkthrough.md` §15).
+row-padded buffer to read (`2026-07-29-encoder-kernel.md` §15).
 
 Three heads, all **biasless**, applied to all 32 normed tokens:
 
@@ -562,13 +562,13 @@ values are not part of the engine-network contract.
 
 | question | where it stands |
 |---|---|
-| **Value target** | settled 2026-07-30: **the final game outcome**, no bootstrapping and no mixing, per AZ p.3. `root_value` is recorded and trained on by nothing, so KataGo's mix stays a cheap later ablation. [`train.md`](train.md) §4 |
-| **Training window** | settled 2026-07-30: **AZ's literal 500,000 games**, uniform over all positions in the window, evicted by game, oldest first. [`train.md`](train.md) §5.2 |
-| **Reuse factor R** | settled 2026-07-30: **65.2 positions sampled per game generated**, derived from AZ's 700,000 × 4,096 steps against 44M games. [`train.md`](train.md) §6 |
-| **Simulations per move** | settled: **`n = 800`, AlphaZero PUCT**, chosen for convergence rather than for throughput. The sweep downward is a C4 measurement. [`mcts.md`](mcts.md) §4.4 |
-| **Tree node layout** | settled by C1 and normative there: the node arrays, `E = 64` children per node, and the pool's bump allocator. [`mcts.md`](mcts.md) §4.2, §4.3. §6.3 here still owns the hash and the irreversible bit |
+| **Value target** | settled 2026-07-30: **the final game outcome**, no bootstrapping and no mixing, per AZ p.3. `root_value` is recorded and trained on by nothing, so KataGo's mix stays a cheap later ablation. [`training.md`](training.md) §4 |
+| **Training window** | settled 2026-07-30: **AZ's literal 500,000 games**, uniform over all positions in the window, evicted by game, oldest first. [`training.md`](training.md) §5.2 |
+| **Reuse factor R** | settled 2026-07-30: **65.2 positions sampled per game generated**, derived from AZ's 700,000 × 4,096 steps against 44M games. [`training.md`](training.md) §6 |
+| **Simulations per move** | settled: **`n = 800`, AlphaZero PUCT**, chosen for convergence rather than for throughput. The sweep downward is a C4 measurement. [`search.md`](search.md) §4.4 |
+| **Tree node layout** | settled by C1 and normative there: the node arrays, `E = 64` children per node, and the pool's bump allocator. [`search.md`](search.md) §4.2, §4.3. §6.3 here still owns the hash and the irreversible bit |
 | **Learner placement** | settled: **GPU, alternating with self-play**, on 5000 positions/s against 130 on the CPU. Revisit if the sims sweep moves the requirement |
-| **Playout cap randomisation** | **still open.** KataGo decouples the cost of value and policy targets this way, which would turn "sims" into `(n_small, n_large, p_large)` and make positions stop costing the same. Priced as a seam in [`mcts.md`](mcts.md) §11, not scheduled |
+| **Playout cap randomisation** | **still open.** KataGo decouples the cost of value and policy targets this way, which would turn "sims" into `(n_small, n_large, p_large)` and make positions stop costing the same. Priced as a seam in [`search.md`](search.md) §11, not scheduled |
 
 ---
 
@@ -616,7 +616,7 @@ and the engine-network contract is the same one frozen at v1.
 
 §11 had gone stale in a way that mattered, because it is the frozen document and it
 was still calling settled questions open. Six of its seven rows were decided between
-2026-07-29 and 2026-07-30 by `mcts.md` and `train.md` — value target, training
+2026-07-29 and 2026-07-30 by `search.md` and `training.md` — value target, training
 window, reuse factor, simulations per move, tree node layout, learner placement —
 and the simulations row in particular still read "32 sits in the Gumbel low-*n*
 regime", which v0 is not: the search is AlphaZero PUCT at `n = 800`. The section is

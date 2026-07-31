@@ -13,6 +13,7 @@ entry records what was true when it was written. Neither is a bug.
 
 | date | entry | what it settles |
 |---|---|---|
+| 2026-07-31 | [Building D2: the league](2026-07-31-d2-league.md) | why the league has no opening book, the lockstep trick that made it 1× the encoder instead of 2×, and the self-match identity that made it testable on a CPU |
 | 2026-07-31 | [The collapse of `c2-8h`](2026-07-31-value-collapse.md) | the first long training run fell into an absorbing state: a first-play-urgency constant that did not ride the `[0,1]` remap made low-prior moves unreachable at any budget |
 | 2026-07-31 | [Build log, A0 through D1](2026-07-31-build-log.md) | how the engine, the network, the search, the training loop and the diagnostics were built, and where each estimate was wrong |
 | 2026-07-30 | [Eval prior art](2026-07-30-eval-prior-art.md) | AlphaZero, KataGo, lc0 and SAI read against the papers rather than from memory; four claims in `evaluation.md` were wrong |

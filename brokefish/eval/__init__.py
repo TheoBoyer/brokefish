@@ -1,9 +1,11 @@
 """Evaluation: the layers of [`evals.md`](../../docs/evals.md).
 
-What is here is Track D's self-contained half — layer 0 (regression scalars) and
-layer 3 (diagnostics). Neither needs a second process, an opening book, or an
-external engine, which is why they are the frequent layers: they run on every
-checkpoint and they never block.
+What is here is Track D's self-contained half — layer 0 (regression scalars),
+layer 2 (the league and the cost-versus-Elo curve, §5.4) and layer 3
+(diagnostics). None of them needs a second process, an opening book, or an
+external engine: layer 2's opponents are our own past checkpoints and its openings
+are generated from the rules. Layers 0 and 3 are the frequent ones — they run on
+every checkpoint and they never block; layer 2 runs over a finished run.
 
 Two things this package is careful about.
 
@@ -29,10 +31,14 @@ from .metrics import game_statistics, policy_entropy, value_calibration
 from .layer0 import layer0_report
 from .positions import random_positions
 from .puzzles import PuzzleSet, load_puzzles, score_puzzles
+from .match import MatchResult, play_match, random_openings
+from .elo import Edge, EloFit, elo_half_width, fit_elo
 
 __all__ = [
     "enumerate_moves", "promotion_targets", "reply_codes", "random_positions",
     "Suite", "SUITE_NAMES", "harvest_suites", "score_suite",
     "value_calibration", "policy_entropy", "game_statistics", "layer0_report",
     "PuzzleSet", "load_puzzles", "score_puzzles",
+    "MatchResult", "play_match", "random_openings",
+    "Edge", "EloFit", "fit_elo", "elo_half_width",
 ]

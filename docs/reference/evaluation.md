@@ -237,6 +237,149 @@ Cost arithmetic, not a measurement: 1000 league games × 80 plies × `n = 800` =
 6.4×10⁷ evals ≈ 17 min at the 62.3k ceiling, with both players on device. Layer 2 is
 not a budget problem.
 
+### 5.4 The harness — D2, specified 2026-07-31
+
+`brokefish/eval/match.py`, `elo.py`, `league.py`, `curve.py`; `tests/test_league.py`.
+Four modules and one command:
+
+```
+uv run --no-project --python .venv/bin/python -m brokefish.eval.league \
+    --run t4h-n64 --games 36 --sims 64
+```
+
+#### 5.4.1 Openings: self-generated, not a book
+
+Each opening is **8 uniformly random legal plies** from the start position,
+rejected if terminal or if fewer than two legal replies remain, deduplicated by
+Zobrist hash, and driven by a CPU generator so a seed reproduces the book on any
+machine.
+
+⚠️ **A UHO/TCEC book was considered and declined for v1**, and the reason is not
+the tabula rasa boundary — §2 explicitly permits standard books in *evaluation*.
+It is that the book does not address our failure mode. UHO exists to break draws
+between engines that are strong enough to hold a balanced position; the draws here
+come from a near-uniform policy shuffling into threefold repetition, which no
+opening prevents. Random openings are also naturally *unbalanced*, which produces
+**more** decisive games, and §5.4.2 is what makes that unbalance fair. A published
+book becomes worth its dependency at §6, when the scale has to be comparable to
+CCRL's — not before.
+
+⚠️ **Evaluation is deterministic** (§3: `eps = 0`, `tau_plies = 0`), so the
+openings are the **only** source of diversity in the entire league. Two engines
+replaying one opening produce one game, every time. A pairing of `G` games
+therefore needs `G/2` genuinely distinct openings, which is why the deduplication
+above is a hash and not an assumption.
+
+#### 5.4.2 Colours are paired, and the unit is the pair
+
+Every opening is played twice with the colours swapped. Without it, a league on
+unbalanced openings measures who drew the favourable side. §9 already calls paired
+openings "mandatory anyway" for the variance; here they are also what makes an
+unbalanced book *fair*, which is what allows the book to be unbalanced at all.
+
+The property this buys is exact rather than statistical: **a network played
+against itself scores exactly 0.5 per pair, whatever the games do.** Both halves
+are literally the same game, so one half's point is the other half's zero. That
+identity is `tests/test_league.py`'s end-to-end oracle — it catches a sign flip, a
+swapped assignment and a double-counted half with one assertion and no sample size
+to argue about. `--games` must be even for the same reason.
+
+#### 5.4.3 One network per batch, kept in lockstep
+
+The two networks alternate by ply, so a batch mixing both colour assignments needs
+two evaluations per position — either both networks over the whole batch (2× the
+encoder) or a gather/scatter with dynamic shapes. Neither is necessary. The two
+colour assignments are played as **two separate batches**, and inside one batch
+every row is at the same ply, so at every moment every row wants the same network:
+one evaluator call, static shapes, 1× the encoder.
+
+⚠️ That lockstep is one edit away from being false, and if it breaks the games stay
+legal, the results stay plausible and the curve is quietly meaningless. So it is
+**asserted every move**, not documented — `match._swap_evaluator`. It holds because
+every opening has the same length and because a finished row is restarted *in
+phase*: a row reset to the ordinary start position would be a ply out of step with
+the rest of the batch.
+
+⚠️ **A finished game may not be searched again** (`search.md` §6.7, invariant 8),
+so a finished row plays a throwaway game whose moves are ignored. The batch
+therefore does real work for games that have ended. With games running 40 to 250
+plies that tail is this harness's known inefficiency; it is a cost, not a
+correctness problem, and refilling dead slots from a queue is the named seam if it
+ever matters.
+
+#### 5.4.4 The calendar is fixed
+
+SAI's schedule (§5.2): each pool index plays the ones at offsets +1, +2, +3, +6,
++8, +12, giving up to twelve edges per checkpoint. The **anchor sits at pool index
+0**, so the calendar connects it to checkpoints 1, 2, 3, 6, 8 and 12 for free; it
+additionally plays every 4th checkpoint and always the last one, because a zero
+measured only against the start of the run is reached from the far end by a chain,
+which is the failure §5.2 exists to avoid.
+
+| pool | pairings | mean degree | games at `--games 36` |
+|---|---|---|---|
+| 16 | 68 | 8.5 | 2 448 |
+| 24 | 118 | 9.8 | 4 248 |
+| 32 | 168 | 10.5 | 6 048 |
+
+Variance-proportional sampling — spend games where `p(1−p)` is largest, KataGo's
+rule — is the upgrade and `EloFit.predict` is the function it needs. It is not in
+v1 because it requires an online fit and the fixed calendar requires nothing.
+
+#### 5.4.5 The fit
+
+One global Bradley-Terry model over the whole graph, by minorization-maximization,
+never a chain (§5.2). Two departures from the textbook, both load-bearing:
+
+- **the anchor is pinned, not fitted** — held at `gamma = 1`, i.e. Elo 0, so the
+  scale means something across runs and "the anchor drifted" is a detectable event;
+- **a phantom opponent regularizes** — every player also plays `--prior` drawn
+  games against a phantom at Elo 0. A player who won every game has an infinite
+  maximum-likelihood rating, and one will: the first real checkpoint against the
+  random-init anchor is plausibly 100 %. At `prior = 1` against several hundred
+  real games it moves a rating by well under an Elo point, and it shrinks *toward*
+  zero, so it is conservative.
+
+**The scale is score-based** — expected score `1/(1 + 10^(−Δ/400))`, which is
+§9's convention, FIDE's, CCRL's and Ordo's default. ⚠️ It is **not** BayesElo's
+draw-model Elo, which factors draws out and is a larger number for the same games.
+The two must never be compared, and §6's affine map is between this scale and a
+published one, not between two conventions.
+
+**The interval.** The Fisher information of Bradley-Terry is a weighted graph
+Laplacian; inverting it gives the covariance, which is the point of a global fit —
+a checkpoint borrows precision from every path through the graph, not only from its
+own edges. But BT with half-points is misspecified: it models a game's score as
+having variance `p(1−p)` where a match at draw fraction `d` has `(1−d)/4`. The raw
+interval is therefore too **wide**, by about `1/√(1−d)` — a factor of 2.2 at
+`d = 0.8`, which is not a rounding error. The correction is the standard
+quasi-likelihood one: estimate the dispersion from the Pearson residuals and scale
+the covariance by it. `dispersion` is reported, and lands near `1 − d`; `se_raw`
+keeps the uncorrected number so the correction is visible rather than baked in.
+
+#### 5.4.6 Unfinished games are dropped, never adjudicated
+
+A game past `--max-plies` (512) has an unknown result. Calling it a draw is the one
+adjudication this harness could make without an engine, and it is exactly the bias
+the draw rate exists to detect. The count is reported per pairing instead, so a run
+where it is not ≈ 0 is visible rather than absorbed.
+
+#### 5.4.7 Sizing
+
+`se(Elo) ≈ 347·√(1−d)/√N` per edge (§9), and the global fit does better than that
+because of §5.4.5. At `--games 36` and `d = 0.8` one edge resolves ±51 Elo; pooled
+over ~11 edges a checkpoint lands near ±15.
+
+#### 5.4.8 The boundary, enforced rather than documented
+
+The league writes to `logs/` and nothing under `brokefish/train/` imports
+`brokefish.eval` or names a league artefact — asserted by
+`tests/test_league.py::TestAntiSelection`. §2's prohibition that will actually get
+violated is checkpoint selection, because "keep the checkpoint with the best league
+rating" looks like good practice; the structural guarantee is that it cannot be
+written without deleting a test. Which checkpoints get *rated* is a cost decision
+and is spaced evenly by index, never by score.
+
 ---
 
 ## 6. Layer 2b — calibration
@@ -543,6 +686,20 @@ other way. `2026-07-30-eval-prior-art.md` §4.2.
 ---
 
 ## Changelog
+
+**2026-07-31.** §5.4 added: D2's harness, specified and built the same day
+(`brokefish/eval/{match,elo,league,curve}.py`, `tests/test_league.py`). Three things
+in it depart from what §5 previously assumed, and each is argued in place rather
+than quietly adopted: **no opening book** (§5.4.1 — UHO addresses a draw mechanism
+that is not ours, and random openings are more decisive, which is the direction we
+need); **the fixed SAI calendar rather than variance-proportional pairing** (§5.4.4
+— the latter needs an online fit and buys nothing while the calendar costs nothing);
+and **an explicit statement that the scale is score-based, not BayesElo's draw-model
+Elo** (§5.4.5), which §9's own arithmetic already implied and which §6's affine map
+now has to name. §5.4.5 also corrects an interval that would otherwise have been too
+wide by `1/√(1−d)` — 2.2× at the draw rates observed — in the conservative
+direction, which is the kind that is never noticed. The story is in
+`journal/2026-07-31-d2-league.md`.
 
 **draft, 2026-07-30.** First version. Proposes four layers against the three Théo
 framed, the addition being layer 0, which exists because layers 1-3 are all

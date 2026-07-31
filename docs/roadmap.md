@@ -56,7 +56,18 @@ it is" and drives the whole decomposition.
 Four evaluation layers, four different questions, four different costs — `evaluation.md`
 §1 has the table. The steps below are ordered by dependency, not by layer number.
 
-### D2. The league and the rating fit — layer 2, 2-3 days
+### ~~D2. The league and the rating fit — layer 2~~ ✅ landed 2026-07-31
+
+`brokefish/eval/{match,elo,league,curve}.py`, specified in `evaluation.md` §5.4,
+built in [the D2 journal entry](journal/2026-07-31-d2-league.md), 54 checks in
+`tests/test_league.py`. Everything below was the plan; what shipped differs in three
+places, all recorded in §5.4: **no opening book** (8 random legal plies instead —
+UHO breaks draws between engines strong enough to hold a balanced position, which is
+not our failure mode), **the fixed SAI calendar rather than variance-proportional
+pairing** (which needs an online fit and buys nothing yet; `EloFit.predict` is the
+function it will need), and **a score-based Elo scale** rather than BayesElo's
+draw-model one. ⚠️ No league has run on the kernel yet — the card was busy with
+`t4h-n64` — so every timing below is still arithmetic.
 
 The curve itself. A checkpoint league where the opponent is our own past self, so the
 opponent strength escalates for free and no external process is involved.
@@ -242,10 +253,9 @@ D0 ✅ ──> D1 ✅ ──> D2 ──> D3 ──> D4 ──> D5
 **On the path**: C4, then C5. C4 needs D2, because a pilot with no rating fit
 produces GPU time and no curve point.
 
-**Off it, and startable now**: D2 and D3. D2 does not wait for real checkpoints — a
-random-init net plus deliberately-degraded copies gives a synthetic ladder whose
-ordering is known in advance, which is a better test of the fit than real checkpoints
-are. D3 is an async scheduler against UCI processes and shares nothing with the
+**Off it, and startable now**: D3. (D2 landed 2026-07-31; the synthetic ladder is in
+`tests/test_league.py`, where the fit recovers ratings it was never told.) D3 is an
+async scheduler against UCI processes and shares nothing with the
 training loop; our opponents are CPU-only, so the two do not contend for the card.
 
 **Decisions rather than code**: the calibration engines (D4) and the preregistration
@@ -263,8 +273,8 @@ as scheduling.
 | milestone | state |
 |---|---|
 | environment, network, search, training loop | ✅ 2026-07-29 to 2026-07-31, A0-B2, C1, C2 |
-| layer 0 and layer 3 diagnostics | ✅ 2026-07-30, D0 and D1, 44.4 s per checkpoint |
-| the league and the rating fit | D2, 2-3 days, startable now |
+| layer 0 and layer 3 diagnostics | ✅ 2026-07-30, D0 and D1, 31.7 s per checkpoint |
+| the league and the rating fit | ✅ 2026-07-31, D2, 54 checks, no league run on the kernel yet |
 | the external match harness | D3, 2-3 days |
 | calibration and the gate | D4 and D5, both blocked on a decision, not on code |
 | first curve points, Gate 2 | end of C4, plus the pilot's own GPU time |

@@ -75,7 +75,7 @@ elsewhere. Code lands here correct and tested; exploratory kernels belong in scr
 
 ## State — the summary. **`docs/ledger/state.md` is the real ledger; read it.**
 Every row has a bullet there with its measured number and the traps that cost time.
-Downstream of C2 (league, Elo curve, C4's sims sweep) is untouched; `docs/roadmap.md`
+Downstream of D2 (C4's sims sweep, layer 2b's calibration) is untouched; `docs/roadmap.md`
 is the plan and the open decisions, and `docs/journal/` is how each row was reached.
 
 | done | what | the number |
@@ -85,6 +85,7 @@ is the plan and the open decisions, and `docs/journal/` is how each row was reac
 | C1 | the MCTS, `csrc/search.cu` + `search/` | **Gate 1a: 56 996 evals/s**, tree is 4.4 % |
 | C2 | training, `brokefish/train/` + `docs/reference/training.md` | 31 checks; `lr = 0.002` beats AZ's 0.2, provisional |
 | D0, D1 | notation, rule suites, layer 0, puzzles | layer 0 = 31.7 s per checkpoint |
+| D2 | the league and the curve, `eval/{match,elo,league,curve}.py` | 56 checks; smoke league green on the kernel, throughput not yet timed |
 | — | the debugger, the AGZ oracle, `docs/journal/2026-07-30-fidelity.md` | trees agree exactly at n=512 |
 
 Four traps belonging to no single component, each with its story in `docs/ledger/state.md`:

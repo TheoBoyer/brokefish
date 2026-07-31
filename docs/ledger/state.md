@@ -442,6 +442,76 @@ and is not. Deleting one because it looks obvious is how it gets made again.
   ⚠️ Evaluation must run under `no_grad`. The first version did not, and the fp32
   master weights built an autograd graph across a 300-ply run that OOM'd an 8 GB
   card at 8 games.
+- `brokefish/eval/{match,elo,league,curve}.py` — **D2, the league and the curve,
+  `evaluation.md` §5.4, landed 2026-07-31**. `match.py` plays one pairing,
+  `elo.py` fits one global Bradley-Terry model over the whole graph, `league.py`
+  runs the fixed SAI calendar and joins the cost axis, `curve.py` presents.
+  `tests/test_league.py`, 56 checks, all of them CPU-only on stub evaluators, 58 s.
+  The frozen anchor is `checkpoints/anchor.pt`, **sha256
+  `a27a099aa62940f13cb859a2adf16900c3934282f13ac27ccb680792fab4da57`** — recorded
+  here because `checkpoints/` is gitignored and this digest is the only durable
+  record of what the zero of the scale was.
+  ⚠️ **No opening book, and the reason is not the tabula rasa boundary** — §2 permits
+  standard books in evaluation. UHO exists to break draws between engines strong
+  enough to hold a balanced position; our draws are a near-uniform policy shuffling
+  into threefold repetition, which no opening prevents. 8 random legal plies,
+  deduplicated by Zobrist hash. A book earns its dependency at §6, not before.
+  ⚠️ **Evaluation is deterministic** (`eps = 0`, `tau_plies = 0`), so the openings are
+  the *only* source of diversity in the league. Same pairing + same opening = the same
+  game, every time. `G` games need `G/2` genuinely distinct openings, which is why the
+  deduplication is a hash rather than an assumption.
+  ⚠️ **A net against itself scores exactly 0.5 per colour-swapped pair** — both halves
+  are literally the same game, so one half's point is the other's zero. That identity
+  is the end-to-end oracle and it catches a sign flip, a swapped colour assignment and
+  a double-counted half with no sample size to argue about.
+  ⚠️ **One network per batch, and the lockstep is asserted every move.** The two nets
+  alternate by ply, so a batch mixing both colour assignments would need two encoder
+  calls per position. Playing the two assignments as two batches makes every row of a
+  batch want the same net — 1× the encoder, static shapes — but only while every row
+  is at the same ply. A finished row is therefore restarted **in phase**; a row reset
+  to the ordinary start position would be a ply out of step, half the batch would be
+  evaluated by the wrong network, and the games would stay legal and the results
+  plausible. `match._swap_evaluator` raises instead.
+  ⚠️ **The scale is score-based Elo, not BayesElo's draw-model Elo.** Expected score
+  `1/(1+10^(−Δ/400))`, which is §9's convention and Ordo's default; BayesElo factors
+  draws out and reports a larger number for the same games. Never compare the two.
+  ⚠️ **The plain Bradley-Terry interval is too wide by ~`1/√(1−d)`** — a factor of 2.2
+  at `d = 0.8`, so not a rounding error. BT models a game's score as having variance
+  `p(1−p)` where a match at draw fraction `d` has `(1−d)/4`. Corrected by the standard
+  quasi-likelihood dispersion, which lands near `1−d`; `se_raw` keeps the uncorrected
+  number and `dispersion` is reported so the correction is visible.
+  ⚠️ **A phantom opponent is what keeps an undefeated player finite**, and one will
+  occur: the first real checkpoint against the random-init anchor is plausibly 100 %.
+  One drawn game against a phantom at Elo 0, per player. It shrinks toward zero, so
+  it is conservative.
+  ⚠️ **The anchor is a file, not a seed.** `checkpoints/anchor.pt`, written once and
+  never overwritten. A seed is not forever — it depends on the torch version and on
+  nobody editing `BrokefishNet.__init__`. Delete that file and the whole curve moves.
+  ⚠️ **A synthetic ladder that draws first and decides the rest by Δ is a different
+  model**, whose expected score is `0.5 + (1−d)(p−0.5)`; a fitter that recovers Δ
+  correctly then looks like it compresses the scale by `1−d`. Carve the draw band out
+  of the score instead. Cost half an hour on 2026-07-31 and is written into
+  `tests/test_league.py::_simulate`.
+  ⚠️ Unfinished games are **dropped and counted**, never adjudicated as draws — that
+  is exactly the bias the draw rate exists to detect.
+  ⚠️ **An all-draw league reported `±0 Elo`**, found by the first real smoke league
+  on 2026-07-31 and not by any unit test — every synthetic ladder has decisive games
+  in it, because one without them has nothing to recover. All draws means zero
+  Pearson residual, so the dispersion estimate is exactly 0 and the corrected
+  interval collapses to 0: a false claim of certainty produced by the correction that
+  exists to remove a false claim of imprecision. Guarded by `min_decisive = 30`,
+  below which the uncorrected interval is reported and `dispersion_applied` says so.
+  ⚠️ **`load_engine` packs the fused encoder from a CPU fp32 master** — thirty
+  checkpoints then cost 13 MB each on an 8 GB card that is also the display, instead
+  of 38. Checked against the torch oracle 2026-07-31: policy to 6.2e-3, value to
+  1.7e-3, and the policy comes back fp16 as the kernel's `_expand` demands.
+  ⚠️ **Throughput is unmeasured.** The smoke league ran on the kernel, but beside
+  `t4h-n64` using the card at 99 %, so its 6 s per pairing measures contention.
+  Batch is `--games / 2` per
+  half (18 rows at the default), which is 576 encoder tokens — a prediction that small
+  batches are acceptable *because a board is 32 tokens*, and a prediction is what it
+  stays until a league runs. The tail waste from finished rows playing throwaway games
+  is real and unquantified; refilling dead slots from a queue is the named seam.
 - `brokefish/train/` — **the C2 training loop, `training.md`, done 2026-07-31**.
   `loss.py` (AZ eq. 1 and the label decode), `buffer.py` (the 500k-game window as a
   memory-mapped ring), `sync.py` (§8.1's two weight representations), `log.py`,

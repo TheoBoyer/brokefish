@@ -10,8 +10,12 @@ record of what a checkpoint was, not an input to deciding whether to keep it.
 NaNs, which are a fact about arithmetic rather than an opinion about chess.
 
 Two things `evals.md` §4 lists are deliberately **not here**. The ~50 games against
-the frozen anchor need two nets in one game, which is the league machinery of D2;
-layer 0 gains that row when D2 lands. And `max |post-scale attention logit|` is an
+the frozen anchor need two nets in one game; that machinery landed with D2 on
+2026-07-31 (`match.play_match`, `evaluation.md` §5.4) and is *still* not called from
+here, because a 50-game match is minutes and layer 0 is 31.7 s — folding it in would
+make the cheap per-checkpoint alarm as expensive as the thing it is meant to run
+ahead of. Run `brokefish.eval.league` over a finished run instead. And
+`max |post-scale attention logit|` is an
 fp16 overflow watch on the kernels rather than a measurement of a net — it belongs
 to the training loop, `docs/train.md` §11, and was dropped from here on 2026-07-30.
 """

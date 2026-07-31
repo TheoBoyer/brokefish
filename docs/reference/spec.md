@@ -208,6 +208,20 @@ out  code [N] u8,  result [N] i8
 | 4 | threefold repetition (§6.3) |
 | 5 | insufficient material: no pawns, rooks or queens, and then either every bishop on a single colour complex with no knights, or exactly one knight and no bishops |
 
+**This table is the one definition, and `env.TERMINAL_NAMES` is the one copy of it in
+code** — `{0: unfinished, 1: checkmate, 2: stalemate, 3: fifty_move, 4: threefold,
+5: insufficient}`. Every counter, log key and result table names codes from it rather
+than restating them: `search.md` §15's block emits `terminal_checkmate` and
+`terminal_threefold`, not `terminal_codes/1` and `terminal_codes/4`, and `eval/`'s
+result tables use the same words. Three modules had grown private copies of this
+mapping by 2026-07-31, which is how a code eventually gets two names and a plot lies.
+
+⚠️ **Code 0 means two different things by context**, because it is the *absence* of a
+terminal rather than a terminal. In a training log it means the ply cap fired, and
+[`training.md`](training.md) §5.4 scores that as a draw; in an evaluation log it means
+the game was abandoned and [`evaluation.md`](evaluation.md) §5.4.6 drops it rather
+than scoring it.
+
 `result` is taken from the side to move's point of view, giving `-1` for checkmate,
 since the side to move is the side that is mated, and `0` for every draw. A value of
 `+1` never occurs, because a position is never terminal in favour of the player

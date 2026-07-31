@@ -523,6 +523,25 @@ MAX_HISTORY = 100  # spec §6.2: the window never exceeds 100 plies
 
 NONE, CHECKMATE, STALEMATE, FIFTY_MOVE, REPETITION, INSUFFICIENT = range(6)
 
+# spec §4.3's table, as names. **This is the one copy.** Three modules had grown
+# their own dict of these — `eval/metrics.py`, `eval/match.py` and every reader of
+# `SearchStats.terminal_codes` — and a fourth was about to, which is how a code
+# eventually gets a different name in two places and a plot lies. Anything that
+# reports a terminal code by name imports it from here.
+#
+# ⚠️ Code 0 is "the game did not end", which in a *training* log means the ply cap
+# fired (`train.md` §5.4 scores that as a draw) and in an *evaluation* log means the
+# game was abandoned and dropped (`evaluation.md` §5.4.6). Same code, two meanings,
+# because it is the absence of a terminal rather than a terminal.
+TERMINAL_NAMES = {
+    NONE: "unfinished",
+    CHECKMATE: "checkmate",
+    STALEMATE: "stalemate",
+    FIFTY_MOVE: "fifty_move",
+    REPETITION: "threefold",
+    INSUFFICIENT: "insufficient",
+}
+
 
 def empty_history(n: int, device: Optional[torch.device] = None
                   ) -> Tuple[torch.Tensor, torch.Tensor]:

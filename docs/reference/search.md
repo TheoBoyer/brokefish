@@ -1317,7 +1317,7 @@ read once per generation, so nothing here costs a host synchronisation.
 |---|---|
 | **max abs post-scale attention logit** | the single quantity `CLAUDE.md` names for the fp16 accumulation ceiling, at 3.1 today against a limit near 12× weight growth. Overflow is loud rather than silent, and this is the early warning |
 | fraction of `\|value\|` above 0.99 | a saturated `tanh` stops producing gradient and makes `edge_Q` unable to order moves |
-| terminal code histogram at game end | early networks end nearly every game by repetition or the fifty-move rule, and watching codes 3 and 4 fall is the earliest sign that anything is being learned |
+| terminal code histogram at game end | early networks end nearly every game by repetition or the fifty-move rule, and watching `terminal_threefold` and `terminal_fifty_move` fall is the earliest sign that anything is being learned. **Emitted by name, not by index** — `terminal_checkmate`, `terminal_threefold`, … from [spec §4.3](spec.md#43-terminal)'s table via `env.TERMINAL_NAMES`, because `terminal_codes/4` in a dashboard tells the reader nothing (changed 2026-07-31) |
 | game length distribution | the same signal, and it is what converts positions per second into games per second for the cost accounting |
 
 ### 15.4 Cost

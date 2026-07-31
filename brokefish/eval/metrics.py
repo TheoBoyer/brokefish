@@ -295,9 +295,10 @@ def game_statistics(run: SelfPlayRun) -> dict:
     if n == 0:
         return {"n_games": 0, "n_abandoned": run.n_abandoned,
                 "n_in_flight": run.n_in_flight}
-    names = {1: "checkmate", 2: "stalemate", 3: "fifty_move",
-             4: "threefold", 5: "insufficient"}
-    by_code = {v: int((run.game_code == k).sum()) for k, v in names.items()}
+    # spec §4.3, named from `env.TERMINAL_NAMES` rather than restated here. Code 0
+    # is skipped: a collected game always ended, so "unfinished" would always be 0.
+    by_code = {name: int((run.game_code == code).sum())
+               for code, name in env.TERMINAL_NAMES.items() if code != env.NONE}
     return {"n_games": n, "n_abandoned": run.n_abandoned,
             "n_in_flight": run.n_in_flight,
             "draw_rate": float((r == 0).float().mean()),

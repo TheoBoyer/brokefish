@@ -58,9 +58,9 @@ from brokefish.env import torch_impl as env
 
 from .runner import eval_config, search_class
 
-# spec §4.3. Named here so a result table reads as words rather than as integers.
-TERMINAL_NAMES = {0: "unfinished", 1: "checkmate", 2: "stalemate", 3: "fifty_move",
-                  4: "threefold", 5: "insufficient"}
+# spec §4.3, so a result table reads as words rather than as integers. Re-exported
+# from `env` rather than restated: one copy of the mapping, in one place.
+TERMINAL_NAMES = env.TERMINAL_NAMES
 
 
 # --------------------------------------------------------------------------- #

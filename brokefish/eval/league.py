@@ -239,6 +239,14 @@ def load_engine(path: str, impl: Optional[str] = "cuda",
 # The euro axis
 # --------------------------------------------------------------------------- #
 
+def _first(rec: dict, *keys: str):
+    """The first key present in `rec`, or None. For log-schema changes."""
+    for k in keys:
+        if k in rec:
+            return rec[k]
+    return None
+
+
 def training_series(jsonl_path: str) -> List[Tuple[int, dict]]:
     """`(step, {euros, training_seconds})` from a training log, in step order.
 
@@ -265,8 +273,15 @@ def training_series(jsonl_path: str) -> List[Tuple[int, dict]]:
             except json.JSONDecodeError:
                 continue
             step = rec.get("step")
-            euros = rec.get("phase/euros/training")
-            seconds = rec.get("phase/euros/training_seconds")
+            # ⚠️ **Two spellings, on purpose.** `train/loop.py` dropped its `phase/`
+            # wrapper on 2026-07-31 because wandb groups on the first path component
+            # only, so `gradient/kl` is now what a new run writes where `t4h-n64` and
+            # everything before it wrote `phase/gradient/kl`. Reading only the new one
+            # would make the cost axis silently null for every log already on disk —
+            # and a null x-axis looks like "the run had no euros", not like a bug.
+            euros = _first(rec, "euros/training", "phase/euros/training")
+            seconds = _first(rec, "euros/training_seconds",
+                             "phase/euros/training_seconds")
             if step is None or (euros is None and seconds is None):
                 continue
             out.append((int(step), {"euros": None if euros is None else float(euros),

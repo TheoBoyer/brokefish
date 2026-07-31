@@ -17,6 +17,7 @@ and making a PGN writer require a CUDA toolchain would be absurd.
 """
 
 from .torch_impl import (
+    TERMINAL_NAMES,
     castling_rights,
     empty_history,
     hash_position,
@@ -48,7 +49,7 @@ from .notation import (
 )
 
 __all__ = [
-    "movegen", "step", "play", "terminal",
+    "movegen", "step", "play", "terminal", "TERMINAL_NAMES",
     "hash_position", "castling_rights", "legal_ep_file", "insufficient_material",
     "empty_history", "push_history", "repetition_count",
     "initial_boards", "empty_boards", "from_fen", "from_board", "from_boards", "from_pgn",

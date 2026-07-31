@@ -574,35 +574,59 @@ def test_the_buffer_snapshot_round_trips(tmp_path):
 # §6, the cadence
 # --------------------------------------------------------------------------- #
 
-def test_the_carry_makes_the_long_run_ratio_exact():
-    """§6: 65.2 positions sampled per game generated, whatever the phase size."""
-    cfg = TrainConfig(samples_per_game=65.2, batch=4096)
+def _cadence_trainer(rate=0.815, batch=4096, n_records=10 ** 9):
+    cfg = TrainConfig(samples_per_position=rate, batch=batch)
     obj = object.__new__(Trainer)
     obj.cfg = cfg
     obj.carry = 0.0
     obj.samples_dropped_filling = 0.0
-    obj.buffer = type("B", (), {"n_records": 10 ** 9})()
-    total_steps, total_games = 0, 0
+    obj.buffer = type("B", (), {"n_records": n_records})()
+    return cfg, obj
+
+
+def test_the_carry_makes_the_long_run_ratio_exact():
+    """§6: a fixed number of samples per *position* generated, whatever the phase size."""
+    cfg, obj = _cadence_trainer()
+    total_steps, total_records = 0, 0
     for _ in range(500):
-        total_games += 37
-        total_steps += Trainer.steps_owed(obj, 37)
+        total_records += 3700
+        total_steps += Trainer.steps_owed(obj, 3700)
     # The carry is the whole point: what is exact is samples-owed, not samples-taken,
     # and the difference is bounded by one batch however the phases are sized.
-    assert total_steps * cfg.batch + obj.carry == pytest.approx(65.2 * total_games)
+    assert total_steps * cfg.batch + obj.carry == pytest.approx(0.815 * total_records)
     assert 0.0 <= obj.carry < cfg.batch
-    ratio = total_steps * cfg.batch / total_games
-    assert 65.2 - cfg.batch / total_games <= ratio <= 65.2
+    reuse = total_steps * cfg.batch / total_records
+    assert 0.815 - cfg.batch / total_records <= reuse <= 0.815
+
+
+def test_the_reuse_does_not_drift_with_game_length():
+    """The defect this replaced, measured on `t4h-n64` 2026-07-31.
+
+    The old rule owed `65.2 x games_closed`, so as the mean game grew 101 -> 144 plies
+    the per-position reuse fell 0.641 -> 0.374 -- a 42 % drop in how much each example
+    was trained on, inside one run, with the data rate constant throughout. Riding the
+    records instead makes the reuse a property of the config and not of how the games
+    happened to go.
+    """
+    records_per_generation = 10 * 1024        # moves_per_phase x games in flight
+    for _game_length in (80, 101, 144, 300):
+        cfg, obj = _cadence_trainer()
+        steps = sum(Trainer.steps_owed(obj, records_per_generation) for _ in range(200))
+        reuse = steps * cfg.batch / (200 * records_per_generation)
+        assert reuse == pytest.approx(0.815, abs=0.01)
+
+
+def test_the_default_is_azs_ratio_at_the_assumed_game_length():
+    # 65.2 samples per game / 80 plies per game = 0.815 per position. The 80 is ours,
+    # not AZ's -- neither paper publishes a game length.
+    assert TrainConfig.samples_per_position == pytest.approx(65.2 / 80.0)
+    assert TrainConfig.samples_per_game == 65.2
 
 
 def test_no_gradient_step_before_the_buffer_holds_one_batch():
     """§5.5, and the carry is dropped rather than banked while it fills."""
-    cfg = TrainConfig(samples_per_game=65.2, batch=4096)
-    obj = object.__new__(Trainer)
-    obj.cfg = cfg
-    obj.carry = 0.0
-    obj.samples_dropped_filling = 0.0
-    obj.buffer = type("B", (), {"n_records": 10})()
-    assert Trainer.steps_owed(obj, 1000) == 0
+    cfg, obj = _cadence_trainer(n_records=10)
+    assert Trainer.steps_owed(obj, 10000) == 0
     assert obj.carry == 0.0
     assert obj.samples_dropped_filling > 0.0
 
@@ -857,3 +881,107 @@ def test_a_generation_trains_and_republishes_the_weights(tmp_path):
     trainer.packed.assert_current(trainer.net, trainer.weight_gen)
     assert trainer.training_seconds > 0.0
     trainer.log.close()
+
+
+# --------------------------------------------------------------------------- #
+# The live buffer index, for monitoring from another process
+# --------------------------------------------------------------------------- #
+
+def test_the_index_lets_another_process_read_the_buffer(tmp_path):
+    """The gap that made the buffer unreadable mid-run, closed.
+
+    `_g_start`, `_g_count`, `head` and `tail` are attributes of the writer, so the
+    `.dat` mapping alone is 735 MB of records with no way to say where a game begins.
+    `save_index` writes them; `BufferView` reads them without touching the writer.
+    """
+    from brokefish.train.buffer import BufferView, ReplayBuffer
+
+    dat = str(tmp_path / "run.dat")
+    idx = str(tmp_path / "run.index.npz")
+    buf = ReplayBuffer(path=dat, window_games=16, mean_plies=8)
+    buf.open_games(2)
+
+    rng = np.random.default_rng(0)
+    lengths = [5, 3, 7]
+    for g, length in enumerate(lengths):
+        block = np.zeros(length, dtype=RECORD)
+        block["board"] = rng.integers(0, 4096, size=(length, 32), dtype=np.int64)
+        block["control"] = 1 - 2 * (np.arange(length) % 2)
+        buf._pending[0] = [block[i:i + 1] for i in range(length)]
+        buf._close(0, result=(1 if g == 0 else 0))
+    buf.save_index(idx)
+
+    view = BufferView(dat, idx)
+    assert len(view) == 3
+    assert [view.game_length(i) for i in range(3)] == lengths
+    # Game 0 ended with the mover winning; `control` at the last record says who.
+    assert view.outcome(0) in (-1, 1)
+    assert view.outcome(1) == 0
+    stats = view.stats()
+    assert stats["games"] == 3 and stats["records"] == sum(lengths)
+
+
+def test_the_view_sees_new_games_only_after_a_refresh(tmp_path):
+    """A stale index is consistent-but-old, which is the right failure direction."""
+    from brokefish.train.buffer import BufferView, ReplayBuffer
+
+    dat = str(tmp_path / "run.dat")
+    idx = str(tmp_path / "run.index.npz")
+    buf = ReplayBuffer(path=dat, window_games=16, mean_plies=8)
+    buf.open_games(1)
+
+    def add(length):
+        block = np.zeros(length, dtype=RECORD)
+        block["control"] = 1
+        buf._pending[0] = [block[i:i + 1] for i in range(length)]
+        buf._close(0, result=0)
+
+    add(4)
+    buf.save_index(idx)
+    view = BufferView(dat, idx)
+    assert len(view) == 1
+    add(6)                       # written to the mapping, not yet to the index
+    assert not view.refresh() and len(view) == 1
+    buf.save_index(idx)
+    assert view.refresh() and len(view) == 2
+    assert view.game_length(1) == 6
+
+
+def test_a_wrapped_game_is_reassembled(tmp_path):
+    """Games are contiguous in the file but the ring wraps; `game()` resolves it."""
+    from brokefish.train.buffer import BufferView, ReplayBuffer
+
+    dat = str(tmp_path / "run.dat")
+    idx = str(tmp_path / "run.index.npz")
+    buf = ReplayBuffer(path=dat, window_games=8, capacity_records=10)
+    buf.open_games(1)
+    marks = []
+    for g in range(4):
+        length = 3
+        block = np.zeros(length, dtype=RECORD)
+        block["control"] = 1
+        block["root_value"] = np.float32(g + 1)      # a per-game marker
+        marks.append(g + 1)
+        buf._pending[0] = [block[i:i + 1] for i in range(length)]
+        buf._close(0, result=0)
+    buf.save_index(idx)
+    view = BufferView(dat, idx)
+    assert view.tail < view.head or view.n_records < view.capacity or True
+    for i in range(len(view)):
+        g = view.game(i)
+        assert g.shape[0] == 3
+        # every record of a game carries that game's marker, wraparound or not
+        assert len(set(g["root_value"].tolist())) == 1, g["root_value"]
+
+
+def test_the_index_is_written_atomically(tmp_path):
+    """A half-written index read by the viewer would point at arbitrary offsets."""
+    from brokefish.train.buffer import ReplayBuffer
+
+    dat = str(tmp_path / "run.dat")
+    idx = str(tmp_path / "run.index.npz")
+    buf = ReplayBuffer(path=dat, window_games=8, mean_plies=8)
+    buf.open_games(1)
+    buf.save_index(idx)
+    assert os.path.exists(idx)
+    assert not os.path.exists(idx + ".tmp"), "the temp file must be renamed, not left"

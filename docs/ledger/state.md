@@ -517,6 +517,24 @@ and is not. Deleting one because it looks obvious is how it gets made again.
   memory-mapped ring), `sync.py` (§8.1's two weight representations), `log.py`,
   `loop.py` (the alternation, the cadence, the optimiser, checkpoint/resume, the euro
   counter) and `overfit.py` (§12 check 1). `tests/test_train.py`, 31 checks.
+  ⚠️ **The cadence rides positions, not games** (changed 2026-07-31, `training.md` §6).
+  AZ's published `65.2 samples per game` is a reuse factor only at a fixed game length,
+  and `t4h-n64` measured the mean game growing 101 → 144 plies while the per-position
+  reuse fell **0.641 → 0.374 inside one run** — a 42 % drop in how much each example is
+  trained on, with the data rate constant at 10 240 records per generation throughout.
+  Records are produced at `moves_per_phase × batch_games` and do not depend on game
+  length; only the games *closing* per phase do. `samples_per_position = 65.2/80 =
+  0.815` now drives `steps_owed`, which gives 2.04 steps per generation constant
+  against 0.94 and falling. ⚠️ The 80-ply divisor is **ours** — neither AZ nor AGZ
+  publishes a game length, checked against both texts.
+  ⚠️ **Log keys lost their `phase/` prefix** on 2026-07-31: wandb groups on the first
+  path component only, so the wrapper put every metric of a run in one folder and threw
+  away the `self_play` / `gradient` / `buffer` / `euros` grouping. Terminal codes are
+  logged by name (`self_play/terminal_threefold`), from `env.TERMINAL_NAMES` — spec
+  §4.3's table, now the one copy in code. A reader of a pre-2026-07-31 JSONL wants
+  `phase/gradient/kl` where a current one has `gradient/kl`; `eval/league.py` reads both
+  spellings, because a renamed key would have made the curve's cost axis silently null
+  for every log already on disk.
   ⚠️ **C2 is the first phase with no oracle.** Perft settled the engine, `model.py`
   the encoder, an independent AGZ search settled C1. Nothing external says a training
   loop is correct, and its failure mode is a curve that is merely worse than it should

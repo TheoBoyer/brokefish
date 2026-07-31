@@ -357,9 +357,39 @@ training games**.
 
 $$\frac{700{,}000 \times 4{,}096}{44 \times 10^{6}} = 65.2 \text{ positions sampled per game generated}$$
 
-That is the constant to reproduce, and it is the whole answer to "reuse factor":
-**`samples_per_game = 65.2`**. At a mean game length near 80 plies it corresponds to a
-per-position reuse just under 1 — each position generated is trained on about once.
+⚠️ **Revised 2026-07-31: the cadence rides positions, not games.** The paragraph below
+was the original reading and it is wrong in a way that is invisible until game length
+moves.
+
+`65.2 per game` is only a reuse factor **at a fixed game length**. The conversion this
+document used — "at a mean game length near 80 plies it corresponds to a per-position
+reuse just under 1" — is a division: `reuse = 65.2 / mean_plies`. So a per-*game* rule
+lets the quantity that actually acts on training float with something the training
+does not control.
+
+Measured on run `t4h-n64`: the mean game grew **101 → 144 plies** over 1 292 steps, and
+the per-position reuse fell **0.641 → 0.374** — a 42 % drop in how much each generated
+example is trained on, *inside one run*, while the data rate was constant at 10 240
+records per generation throughout. Records are produced at `moves_per_phase ×
+batch_games` and do not depend on game length; only the number of games *closing* per
+phase does, so the step budget collapsed while the data did not.
+
+⚠️ **The 80-ply figure is ours, not AlphaZero's.** Checked against both paper texts on
+2026-07-31: AZ publishes 44 million training games and 700 000 × 4096 samples, and
+states that games past a maximum length were terminated as draws, but **no game
+length anywhere**. So AZ's true per-position reuse is unknown and 0.815 is our estimate
+of it.
+
+**The constant to reproduce is therefore `samples_per_position = 65.2 / 80 = 0.815`**,
+and `steps_owed` takes the records a phase appended rather than the games it closed. A
+run whose reuse halves partway through cannot be compared with itself, let alone with
+AZ. `samples_per_game = 65.2` stays in the config as the published ratio it is derived
+from, and `--samples-per-position 65.2/mean_plies` reproduces the old behaviour for an
+A/B.
+
+At `moves_per_phase = 10` and 1024 games in flight this is 10 240 records and **2.04
+steps per generation, constant** — against 0.94 and falling under the old rule.
+
 It closes the "reuse factor R" row of `spec.md` §11.
 
 ⚠️ **It is 65 per game, not 1 per game.** The one-position-per-game rule is real and
@@ -373,11 +403,14 @@ workaround inside an AlphaZero loop, and would discard 98 % of generated data.
 gradient phase, run
 
 ```
-steps = floor((carry + 65.2 * G) / 4096)
-carry = (carry + 65.2 * G) - 4096 * steps
+steps = floor((carry + 0.815 * R) / 4096)
+carry = (carry + 0.815 * R) - 4096 * steps
 ```
 
-optimiser steps. The carry makes the long-run ratio exact regardless of phase size.
+where `R` is the number of records the phase appended. The carry makes the long-run
+ratio exact regardless of phase size, and is still needed even though `R` is fixed
+today: `moves_per_phase × batch_games` is config, the last phase of a run can be
+short, and `0.815 × 10240 / 4096 = 2.04` is not an integer.
 
 ⚠️ Expressed per **game**, not per position, because that is the ratio AZ's numbers
 give directly; the per-position form additionally depends on a mean game length AZ
@@ -632,6 +665,18 @@ justified by a failure mode that does not exist: wandb writes every record to
 retries, so a dropped network stalls the upload and never the run). `--wandb-mode
 offline` is for a machine with no credentials; `python -m wandb sync wandb/offline-run-*`
 pushes it afterwards. The JSONL sink is unconditional either way.
+
+**Metric names are `self_play/…`, `gradient/…`, `buffer/…`, `euros/…`** — one level of
+nesting and no more (corrected 2026-07-31). ⚠️ wandb groups a run's charts on the
+**first** path component only, so the previous `phase/` wrapper put every metric in the
+run into a single folder and threw away the grouping the second component would have
+given for free. The wrapper carried no information: every record logged there was a
+phase. This changed the JSONL keys too, so a reader of a pre-2026-07-31 log wants
+`phase/gradient/kl` where a current one has `gradient/kl`.
+
+Terminal codes are logged **by name** — `self_play/terminal_checkmate`,
+`self_play/terminal_threefold` — from [spec §4.3](spec.md#43-terminal)'s table via
+`env.TERMINAL_NAMES`, not as `terminal_codes/4`.
 
 **Per gradient step**: total loss, and the policy, value and L2 terms separately — a
 single scalar hides which head has stopped learning. Learning rate. Global gradient

@@ -79,6 +79,12 @@ PROMO_SHIFT = MOVE_BITS
 # With 0.5 the same network at n = 800 visits 20 of 20.
 FPU_DRAW = 0.5
 
+# spec §4.3's codes in index order, so `SearchStats` can report the histogram by
+# name. Built from `env`'s `TERMINAL_NAMES` rather than restated, so there is exactly
+# one place a code is given a name.
+_TERMINAL_NAMES_ORDERED = [_default_env.TERMINAL_NAMES[i]
+                           for i in range(len(_default_env.TERMINAL_NAMES))]
+
 
 @dataclass
 class SearchConfig:
@@ -859,7 +865,11 @@ class SearchStats:
             "search_disagrees_frac": self.search_disagrees / moves,
             # §15.3, numerical and rules health
             "saturated_value_frac": self.saturated_value / max(self.value_samples, 1),
-            "terminal_codes": self.terminal_codes.tolist(),
+            # By name, not by index. `terminal_codes/4` in a dashboard means nothing
+            # to the person reading it, and the mapping is spec §4.3 — `env`'s
+            # `TERMINAL_NAMES` is the one copy of it.
+            **{f"terminal_{name}": int(n)
+               for name, n in zip(_TERMINAL_NAMES_ORDERED, self.terminal_codes.tolist())},
             "mean_game_length": sum(lengths) / len(lengths) if lengths else 0.0,
             "games_finished": len(lengths),
             "terminal_descent_frac": self.n_terminal_descents / sims,

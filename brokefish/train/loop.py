@@ -85,7 +85,26 @@ class TrainConfig:
     buffer_in_memory: bool = False
 
     # -- the cadence, §6
-    samples_per_game: float = 65.2
+    #
+    # ⚠️ **Denominated in positions, not games** (changed 2026-07-31). AZ publishes
+    # 700,000 x 4096 samples against 44 million games = 65.2 samples per *game*, and
+    # that is what `samples_per_game` records. But the quantity that acts on training
+    # is samples per *position* — how many times each generated example is trained on
+    # — and the two are the same thing only at AZ's game length. `training.md` §6
+    # assumed 80 plies for that conversion.
+    #
+    # Measured on run `t4h-n64`: our games grew from 101 to 144 plies, so at a fixed
+    # 65.2 per game the per-position reuse fell **0.641 -> 0.374 inside one run**, a
+    # 42 % drop in how much each example is trained on, with the data rate constant at
+    # 10,240 records per generation throughout. A run whose reuse halves partway
+    # through is uninterpretable, so the cadence now rides the records rather than the
+    # games and holds reuse fixed whatever the game length does.
+    #
+    # ⚠️ The 80-ply figure is **ours, not AZ's** — neither paper publishes a game
+    # length (checked against both texts, 2026-07-31). So 0.815 is our estimate of
+    # AZ's per-position reuse, not their number.
+    samples_per_position: float = 65.2 / 80.0     # = 0.815
+    samples_per_game: float = 65.2                # AZ's published ratio, for the log line
 
     # -- the optimiser, §7
     batch: int = 4096
@@ -96,7 +115,18 @@ class TrainConfig:
     # against, so it does not move. `adamw` is ablation 1 (2026-07-30).
     optimizer: str = "sgd"
     betas: Tuple[float, float] = (0.9, 0.95)   # 0.999 is too slow to matter at 10^2 steps
-    adam_wd: float = 0.1                       # decoupled, so unrelated to `l2` -- see below
+    # ⚠️ **0.01, not the 0.1 transformer default** (changed 2026-07-31). 0.1 comes from
+    # supervised settings with orders of magnitude more data than 4.7M samples, and it
+    # was judged too aggressive on 2026-07-31 and lowered to 0.01 for run `c2-8h`.
+    # That choice then **silently reverted**: it lived only in a command line, so
+    # `t60-n256` and `t4h-n64` both picked the 0.1 default back up without anyone
+    # noticing. `c2-8h` lost its cosine schedule the same way. A decision that exists
+    # only in a shell history is a decision that will be un-made, so it lives here.
+    #
+    # ⚠️ There is **no measurement** preferring 0.01 to 0.1: the one run that used it
+    # was invalidated by the FPU bug (`journal/2026-07-31-value-collapse.md`). This is
+    # a restored intention, not a result, and it is a legitimate ablation.
+    adam_wd: float = 0.01                      # decoupled, so unrelated to `l2` -- see below
     grad_clip: float = 0.0                     # 0 disables; AGZ specifies no clipping
     lr_schedule: Tuple[Tuple[float, float], ...] = LR_SCHEDULE
     total_steps: int = 159_000
@@ -209,8 +239,17 @@ def build_optimizer(net: torch.nn.Module, cfg: TrainConfig) -> torch.optim.Optim
     second-moment normalisation. Carrying ``2e-4`` across would apply a decay some
     three orders of magnitude weaker than the regulariser it is meant to be, so the
     ablation would silently be "AdamW with no regularisation" -- which is a real
-    result about a different question. ``adam_wd = 0.1`` is the transformer default
-    and is what the ablation should actually test.
+    result about a different question. ``adam_wd`` is the knob that actually
+    regularises the AdamW arm.
+
+    ⚠️ **Under AdamW, ``cfg.l2`` reaches nothing.** `az_loss` returns
+    ``policy_loss + value_loss`` and that is the only thing ``backward()`` sees, so
+    the coupled term exists solely as `weight_decay_for(cfg.l2)` on the **SGD**
+    optimiser. `l2_penalty` is evaluated *after* ``opt.step()`` purely to log
+    ``gradient/l2``, which is therefore a **weight-norm diagnostic, not a loss term
+    being optimised** — a dashboard reader will otherwise take it for one. The two
+    arms are: SGD regularised by ``2 * l2`` coupled, AdamW by ``adam_wd`` decoupled,
+    and never both.
 
     The split is the standard one: decay tensors with two or more dimensions, which
     is every matmul weight and the token embedding, and never LayerNorm gains or
@@ -330,12 +369,17 @@ class Trainer:
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         closed = 0
+        added = 0
         with torch.no_grad():
             for _ in range(moves):
                 self.search.reset_finished()
                 record = self.search.self_play_move()
                 done, result = self._apply_ply_cap(record)
                 closed += self.buffer.append(record, done=done, result=result)
+                # One row per game in flight, per move-step. This is what the §6
+                # cadence rides: the *data production rate*, which is constant, rather
+                # than the games-closed rate, which falls as games lengthen.
+                added += int(record.board.shape[0])
                 self.positions_generated += int(record.board.shape[0])
         torch.cuda.synchronize()
         dt = time.perf_counter() - t0
@@ -349,6 +393,7 @@ class Trainer:
         stats["seconds"] = dt
         stats["moves"] = moves
         stats["games_closed"] = closed
+        stats["records_added"] = added
         return stats
 
     def _apply_ply_cap(self, record):
@@ -373,10 +418,21 @@ class Trainer:
 
     # -- §6, how much training per game -------------------------------------- #
 
-    def steps_owed(self, games: int) -> int:
-        """AZ's 65.2 positions per game, carried so the long-run ratio is exact."""
+    def steps_owed(self, records: int) -> int:
+        """§6's reuse factor, carried so the long-run ratio is exact.
+
+        ``records`` is the number of positions the self-play phase just appended, not
+        the number of games it closed. See ``samples_per_position``: at a fixed
+        per-*game* rate the reuse tracks ``65.2 / mean_plies`` and therefore drifts
+        with the game length, which is what run `t4h-n64` measured falling 0.641 to
+        0.374. Riding the records holds it constant.
+
+        The carry is still needed even though the record count per phase is fixed
+        today: ``moves_per_phase x games_in_flight`` is config, a phase can be short
+        at the end of a run, and ``0.815 x 10240 / 4096 = 2.04`` is not an integer.
+        """
         cfg = self.cfg
-        self.carry += cfg.samples_per_game * games
+        self.carry += cfg.samples_per_position * records
         if self.buffer.n_records < cfg.batch:
             # §5.5: before the buffer holds one full batch of *sampleable* records the
             # loop is pure self-play. The carry is dropped rather than banked, or the
@@ -656,17 +712,32 @@ class Trainer:
                 self.log.note(f"  wall-clock limit reached after {g} generations")
                 break
             play = self.self_play_phase()
-            steps = self.steps_owed(play["games_closed"])
+            steps = self.steps_owed(play["records_added"])
             grad = self.gradient_phase(steps)
             self.generation += 1
             g += 1
 
             buf = self.buffer.stats()
             self.buffer.check()
+            # §5's live index: ~320 KB written atomically every generation, so a
+            # second process can read the buffer while the run is going. Without it
+            # the ring's offsets exist only in this process's memory and the 735 MB
+            # mapping is unreadable — which is what a Ctrl-C would have left behind
+            # on 2026-07-31, since `save()` only fires every `buffer_snapshot_every`
+            # steps. Cheap enough to be unconditional.
+            if self.buffer.path:
+                self.buffer.save_index(os.path.splitext(self.buffer.path)[0] + ".index.npz")
             euros = self.euros()
-            self.log.log({"phase": {"generation": self.generation, "self_play": play,
-                                    "gradient": grad, "buffer": asdict(buf),
-                                    "euros": euros}}, step=self.step)
+            # ⚠️ **No `phase` wrapper.** wandb groups metrics on the *first* path
+            # component only, so nesting everything under `phase` put every metric in
+            # the run into one useless folder and threw away the grouping that
+            # `self_play` / `gradient` / `buffer` / `euros` would have given for free.
+            # Removed 2026-07-31; this changes the JSONL keys too (`phase/gradient/kl`
+            # is now `gradient/kl`), so a reader of a pre-2026-07-31 log needs the old
+            # names.
+            self.log.log({"generation": self.generation, "self_play": play,
+                          "gradient": grad, "buffer": asdict(buf),
+                          "euros": euros}, step=self.step)
             # A phase with no gradient step has no loss to report, which is the
             # normal state until §5.5's startup threshold is met. Printing a dash
             # rather than a formatted absence, because a column of `nan` in a
@@ -715,6 +786,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sims", type=int, default=TrainConfig.n_sims)
     p.add_argument("--games", type=int, default=TrainConfig.batch_games)
     p.add_argument("--moves-per-phase", type=int, default=TrainConfig.moves_per_phase)
+    p.add_argument("--samples-per-position", type=float,
+                   default=TrainConfig.samples_per_position,
+                   help="§6's reuse factor: how many times each generated position is "
+                        "trained on. 0.815 is AZ's 65.2-per-game at an assumed 80-ply "
+                        "game. Pass 65.2/mean_plies to reproduce the old per-game rule")
     p.add_argument("--window-games", type=int, default=TrainConfig.window_games)
     p.add_argument("--mean-plies", type=int, default=TrainConfig.mean_plies)
     p.add_argument("--max-plies", type=int, default=TrainConfig.max_plies)
@@ -788,6 +864,7 @@ def build_parser() -> argparse.ArgumentParser:
 def config_from_args(args) -> TrainConfig:
     cfg = TrainConfig(
         n_sims=args.sims, batch_games=args.games, moves_per_phase=args.moves_per_phase,
+        samples_per_position=args.samples_per_position,
         window_games=args.window_games, mean_plies=args.mean_plies,
         max_plies=args.max_plies, batch=args.batch, micro_batch=args.micro_batch,
         total_steps=args.total_steps, euros_per_hour=args.euros_per_hour,
@@ -821,9 +898,20 @@ def main() -> None:
     logger.note(f"  tail -f {logger.text_path}   (records: {logger.jsonl_path})")
 
     trainer = Trainer(cfg, run=args.run, logger=logger, resume=args.resume)
+    # The cadence, stated so a drifting reuse is visible at startup rather than
+    # reconstructed from the logs afterwards (§6). `per_gen` is exact because the
+    # record rate is `moves_per_phase x batch_games` and does not depend on how long
+    # the games turn out to be -- which is the whole point of the change.
+    per_gen = cfg.moves_per_phase * cfg.batch_games
     logger.note(f"  {cfg.n_sims} sims, {cfg.batch_games} games in flight, "
                 f"batch {cfg.batch} in {math.ceil(cfg.batch / cfg.micro_batch)} "
-                f"micro-batches, {cfg.samples_per_game} samples per game")
+                f"micro-batches")
+    logger.note(f"  cadence {cfg.samples_per_position:.3f} samples/position -> "
+                f"{per_gen} records and {per_gen * cfg.samples_per_position / cfg.batch:.2f} "
+                f"steps per generation, constant in game length "
+                f"(AZ's published ratio is {cfg.samples_per_game} per *game*, which is "
+                f"the same thing only at {cfg.samples_per_game / cfg.samples_per_position:.0f} "
+                f"plies)")
     # Print the rate the run will actually see. A cosine sized against the default
     # 159,000 steps in a run that takes 116 is a constant rate wearing a decay's name,
     # and this line is where that becomes obvious instead of being found afterwards.

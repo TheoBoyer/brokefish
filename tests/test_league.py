@@ -627,11 +627,29 @@ class TestRunLeague:
 
 class TestCostAxis:
 
+    def test_it_reads_both_log_schemas(self, tmp_path):
+        """`train/loop.py` dropped its `phase/` wrapper on 2026-07-31.
+
+        Reading only the new spelling would make the cost axis silently null for
+        every log already on disk, and a null x-axis reads as "this run had no
+        euros" rather than as a bug.
+        """
+        old = tmp_path / "old.jsonl"
+        old.write_text(json.dumps({"step": 10, "phase/euros/training": 4.0,
+                                   "phase/euros/training_seconds": 40.0}) + "\n")
+        new = tmp_path / "new.jsonl"
+        new.write_text(json.dumps({"step": 10, "euros/training": 4.0,
+                                   "euros/training_seconds": 40.0}) + "\n")
+        for path in (old, new):
+            series = league_mod.training_series(str(path))
+            assert league_mod.series_at(series, 10) == {"euros": 4.0,
+                                                        "training_seconds": 40.0}
+
     def test_it_joins_by_the_last_step_at_or_before(self, tmp_path):
         path = tmp_path / "run.jsonl"
         path.write_text("\n".join(json.dumps(
-            {"step": s, "phase/euros/training": s * 0.5,
-             "phase/euros/training_seconds": s * 10.0})
+            {"step": s, "euros/training": s * 0.5,
+             "euros/training_seconds": s * 10.0})
             for s in (10, 20, 30)) + "\n")
         series = league_mod.training_series(str(path))
         assert league_mod.series_at(series, 25)["euros"] == 10.0
@@ -646,7 +664,7 @@ class TestCostAxis:
 
     def test_a_truncated_line_is_skipped(self, tmp_path):
         path = tmp_path / "run.jsonl"
-        path.write_text('{"step": 1, "phase/euros/training": 1.0}\n{"step": 2, "pha\n')
+        path.write_text('{"step": 1, "euros/training": 1.0}\n{"step": 2, "eur\n')
         assert len(league_mod.training_series(str(path))) == 1
 
 
@@ -748,3 +766,51 @@ class TestAntiSelection:
         args = parser.parse_args(["--run", "x"])
         assert args.out is None       # defaults to logs/league-<run>.json
         assert args.checkpoints == "checkpoints"
+
+
+class TestTerminalNames:
+    """spec §4.3 has one table; the code must have one copy of it.
+
+    Three modules had grown private `{1: "checkmate", ...}` dicts by 2026-07-31 and a
+    fourth was about to. That is how a code eventually gets two names in two places
+    and a plot lies about what it is showing.
+    """
+
+    def test_the_names_match_the_spec_table(self):
+        assert env.TERMINAL_NAMES == {
+            0: "unfinished", 1: "checkmate", 2: "stalemate",
+            3: "fifty_move", 4: "threefold", 5: "insufficient"}
+
+    def test_the_indices_are_the_env_constants(self):
+        for const, name in ((env.NONE, "unfinished"), (env.CHECKMATE, "checkmate"),
+                            (env.STALEMATE, "stalemate"), (env.FIFTY_MOVE, "fifty_move"),
+                            (env.REPETITION, "threefold"),
+                            (env.INSUFFICIENT, "insufficient")):
+            assert env.TERMINAL_NAMES[const] == name
+
+    def test_match_and_search_share_the_one_copy(self):
+        from brokefish.eval import match as match_mod
+        from brokefish.search import torch_impl as search_mod
+        assert match_mod.TERMINAL_NAMES is env.TERMINAL_NAMES
+        assert search_mod._TERMINAL_NAMES_ORDERED == [
+            env.TERMINAL_NAMES[i] for i in range(6)]
+
+    def test_nobody_restates_the_mapping(self):
+        # A literal `"checkmate"` next to a literal `"threefold"` in the same file is
+        # a private copy of spec §4.3 unless that file is env/torch_impl.py.
+        import glob
+        offenders = []
+        for path in glob.glob("brokefish/**/*.py", recursive=True):
+            if path.endswith(os.path.join("env", "torch_impl.py")):
+                continue
+            src = open(path).read()
+            if '"checkmate"' in src and '"threefold"' in src:
+                offenders.append(path)
+        assert not offenders, f"{offenders} restate spec §4.3; import env.TERMINAL_NAMES"
+
+    def test_the_search_reports_codes_by_name(self):
+        from brokefish.search.torch_impl import SearchStats
+        snap = SearchStats(d_max=4, device="cpu").snapshot()
+        for name in env.TERMINAL_NAMES.values():
+            assert f"terminal_{name}" in snap, name
+        assert "terminal_codes" not in snap, "the by-index list is gone"

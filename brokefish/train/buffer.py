@@ -335,6 +335,48 @@ class ReplayBuffer:
                                    self.total_records, self.capacity,
                                    self.window_games], dtype=np.int64))
 
+    # -- the live index, for a reader outside this process -------------------- #
+
+    def save_index(self, path: str) -> None:
+        """The ring's *metadata only*, written atomically. For live monitoring.
+
+        ⚠️ **This exists because the ring lives in Python memory and the records do
+        not.** ``data/replay/<run>.dat`` is a memory map that a second process can
+        open at any time, but ``_g_start``, ``_g_count``, ``head`` and ``tail`` are
+        attributes of this object, so without them a reader has 735 MB of records and
+        no way to say where a game begins or which region is live. That was found on
+        2026-07-31, when the only snapshot mechanism was :meth:`save` at
+        ``buffer_snapshot_every = 10_000`` steps — a run 1 292 steps long had never
+        written one, and a Ctrl-C would have left the buffer unreadable.
+
+        Metadata only, so it is ~320 KB against :meth:`save`'s 36 MB: no records (the
+        mapping already has them) and **no pending blocks** (a game in flight has no
+        `z` yet and is not something a reader should show). Cheap enough to write
+        every generation.
+
+        ⚠️ **Written to a temporary file and renamed**, because ``os.replace`` is
+        atomic on POSIX and a half-written index read by the viewer would point at
+        arbitrary offsets. A reader therefore always sees a consistent index, though
+        possibly an old one — which is the right failure direction.
+
+        ⚠️ It is written **after** the records it describes, and games are committed
+        whole (:meth:`_commit`), so every game the index names is already fully in the
+        file. The converse is not true and does not matter: records written since the
+        last index are simply invisible until the next one.
+        """
+        if isinstance(self.data, np.memmap):
+            self.data.flush()
+        self._index_revision = getattr(self, "_index_revision", 0) + 1
+        tmp = f"{path}.tmp"
+        with open(tmp, "wb") as fh:
+            np.savez(fh, g_start=self._g_start, g_count=self._g_count,
+                     scalars=np.array([self._g_head, self.n_games, self.head,
+                                       self.tail, self.n_records, self.capacity,
+                                       self.window_games, self.total_games,
+                                       self.total_records, self._index_revision],
+                                      dtype=np.int64))
+        os.replace(tmp, path)
+
     def load(self, meta_path: str) -> None:
         z = np.load(meta_path, allow_pickle=False)
         s = z["scalars"]
@@ -380,3 +422,107 @@ class ReplayBuffer:
         for n in lengths.tolist():
             self._pending.append([blob[off:off + n].copy()] if n else [])
             off += n
+
+
+# --------------------------------------------------------------------------- #
+# Reading a buffer from outside the process that writes it
+# --------------------------------------------------------------------------- #
+
+class BufferView:
+    """A read-only window onto a replay buffer, live or finished.
+
+    This is the half of the buffer that a viewer needs and the trainer does not: open
+    the ``.dat`` mapping and the index :meth:`ReplayBuffer.save_index` wrote, and hand
+    out games. It opens the mapping in ``mode="r"``, so a reader can never perturb a
+    running trainer.
+
+    ⚠️ **Games are contiguous in the file, but the ring wraps**, so a game near the
+    write head is split across the end of the mapping. :meth:`game` resolves that; do
+    not index ``.data`` directly.
+
+    ⚠️ **The index is a snapshot and the file is not.** A game this view returns was
+    complete when the index was written, because :meth:`ReplayBuffer._commit` writes a
+    game whole and the index is written afterwards. But the *oldest* games named by a
+    stale index may since have been evicted and overwritten by newer ones. Call
+    :meth:`refresh` before a read if freshness matters; ``revision`` says whether
+    anything moved. For an evicted game the records are simply different records —
+    still valid, still legal positions, just not the game you asked for. Nothing here
+    can detect that, which is why a live viewer should refresh rather than cache.
+
+    The debugger imports this; `brokefish` never imports the debugger
+    (`docs/ledger/state.md` calls the reverse direction a defect).
+    """
+
+    def __init__(self, dat_path: str, index_path: Optional[str] = None) -> None:
+        self.dat_path = dat_path
+        self.index_path = index_path or (os.path.splitext(dat_path)[0] + ".index.npz")
+        self.data = np.memmap(dat_path, dtype=RECORD, mode="r")
+        self.refresh()
+
+    @classmethod
+    def for_run(cls, run: str, buffer_dir: str = "data/replay") -> "BufferView":
+        """The view for a training run by name, using the loop's own paths."""
+        return cls(os.path.join(buffer_dir, f"{run}.dat"))
+
+    def refresh(self) -> bool:
+        """Re-read the index. Returns whether it moved since the last read."""
+        z = np.load(self.index_path, allow_pickle=False)
+        s = z["scalars"]
+        (self._g_head, self.n_games, self.head, self.tail, self.n_records,
+         self.capacity, self.window_games, self.total_games, self.total_records,
+         revision) = (int(x) for x in s)
+        self._g_start, self._g_count = z["g_start"], z["g_count"]
+        moved = revision != getattr(self, "revision", None)
+        self.revision = revision
+        if self.capacity != self.data.shape[0]:
+            raise RuntimeError(
+                f"the index describes a {self.capacity}-record ring and "
+                f"{self.dat_path} holds {self.data.shape[0]}. They are from different "
+                f"runs, or the run was resized.")
+        return moved
+
+    def __len__(self) -> int:
+        return self.n_games
+
+    def game_length(self, i: int) -> int:
+        """Plies in game `i`, where 0 is the oldest game still in the window."""
+        return int(self._g_count[(self._g_head + i) % len(self._g_start)])
+
+    def game(self, i: int) -> np.ndarray:
+        """Game `i` as a contiguous ``RECORD`` array, wraparound resolved.
+
+        Index 0 is the **oldest** game still in the window and ``len(view) - 1`` the
+        newest, so a viewer that wants "what is being played now" reads from the end.
+        """
+        if not 0 <= i < self.n_games:
+            raise IndexError(f"game {i} of {self.n_games}")
+        slot = (self._g_head + i) % len(self._g_start)
+        start, count = int(self._g_start[slot]), int(self._g_count[slot])
+        end = start + count
+        if end <= self.capacity:
+            return np.array(self.data[start:end])
+        return np.concatenate([np.array(self.data[start:]),
+                               np.array(self.data[:end - self.capacity])])
+
+    def outcome(self, i: int) -> int:
+        """The game's result from **White**'s point of view, in {-1, 0, +1}.
+
+        ``value`` is stored per record from the point of view of the player to move
+        there (§4's parity rule), so the last record's `z` belongs to the side that
+        delivered the final move, and `control` says who that was.
+        """
+        g = self.game(i)
+        if g.shape[0] == 0:
+            return 0
+        z = float(g["value"][-1])
+        return int(z if int(g["control"][-1]) > 0 else -z)
+
+    def stats(self) -> dict:
+        """What a monitor header wants, without walking every game."""
+        counts = [self.game_length(i) for i in range(self.n_games)]
+        return {"games": self.n_games, "records": self.n_records,
+                "capacity": self.capacity, "window_games": self.window_games,
+                "total_games": self.total_games, "revision": self.revision,
+                "mean_plies": (sum(counts) / len(counts)) if counts else 0.0,
+                "max_plies": max(counts) if counts else 0,
+                "fill": self.n_records / max(self.capacity, 1)}

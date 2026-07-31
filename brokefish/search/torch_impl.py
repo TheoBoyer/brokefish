@@ -60,6 +60,25 @@ IRREVERSIBLE = 1 << 4
 MOVE_BITS = 11
 PROMO_SHIFT = MOVE_BITS
 
+# §6.6 first-play urgency: the value an unvisited edge is scored at.
+#
+# ⚠️ **0.5, not 0.** AGZ scores an untried move at `Q = 0`, and AGZ's values are in
+# `[-1, 1]`, so that 0 is a *draw* -- a neutral prior on a move nobody has tried. The
+# tree here works in `[0, 1]` (§3.5, deliberately, so `pb_c_init = 1.25` keeps the
+# meaning it has in the published pseudocode), and under `q01 = (v + 1) / 2` a draw is
+# **0.5**. Every constant living in Q-space has to ride the remap; §3.5 says exactly
+# that and v0 applied it to the value and not to this.
+#
+# What the literal 0 cost, measured 2026-07-31 on run `c2-8h`: an untried move is
+# scored as a certain loss, so against a value head near the draw value it needs
+# `pb_c * prior > 0.5` to ever be tried -- `prior > 0.0145` at n = 800. Anything below
+# that is unreachable *at any simulation budget*, so its prior can never be corrected
+# upward and can only fall further. That is an absorbing state, and it turned a
+# stagnating run into a monotonically collapsing one: 3 of 20 root moves visited at
+# n = 64 and at n = 800 alike, decisive games 5.13 % -> 1.76 % over seven hours.
+# With 0.5 the same network at n = 800 visits 20 of 20.
+FPU_DRAW = 0.5
+
 
 @dataclass
 class SearchConfig:
@@ -369,9 +388,11 @@ class Search:
         n_v = torch.where(valid, nvis, torch.zeros_like(nvis)).sum(-1, keepdim=True)
         pb_c = torch.log((n_v + c.pb_c_base + 1.0) / c.pb_c_base) + c.pb_c_init
         pb_c = pb_c * n_v.sqrt() / (nvis + 1.0)
-        # §6.6: an unvisited edge scores 0, which is AlphaZero's first-play urgency
-        # and a loss from the mover's point of view in the [0,1] convention.
-        score = pb_c * prior + torch.where(nvis > 0, q, torch.zeros_like(q))
+        # §6.6: an unvisited edge takes AGZ's first-play urgency, a *draw* from the
+        # mover's point of view -- which is `FPU_DRAW`, not 0, because the tree works
+        # in [0,1] (§3.5). See that constant for what carrying the literal 0 across
+        # the remap did.
+        score = pb_c * prior + torch.where(nvis > 0, q, torch.full_like(q, FPU_DRAW))
         score = torch.where(valid, score, torch.full_like(score, float("-inf")))
         return _lowest_argmax(score)
 

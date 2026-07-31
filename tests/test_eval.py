@@ -281,17 +281,27 @@ def _rigged_evaluator(suite: suites.Suite, labels: torch.Tensor):
 
 
 class TestScoring:
+    """⚠️ Every `score_suite` here passes `search_impl="torch"` deliberately.
+
+    These test the *scorer*, and they do it with `_RiggedNet` — a callable standing
+    in for a network so the right answer is known in advance. A rigged net has no
+    `layers`, so no fused encoder can be built from it, and since 2026-07-31 the
+    evaluation default is `search_impl="cuda"`, which pairs itself with the fused
+    encoder (`runner.make_search`). The oracle tree is the correct path for a fake
+    network; naming it keeps that a decision rather than a default these tests
+    happen to inherit.
+    """
 
     def test_the_scorer_reports_what_was_played(self, small_suites):
         suite = small_suites["avoid_stalemate"].subset(torch.arange(8, device=DEVICE))
         right = suites.score_suite(
             suite, _RiggedNet(_rigged_evaluator(suite, suite.good[:, 0])),
-            n=16, device=DEVICE, batch=8)
+            n=16, device=DEVICE, batch=8, search_impl="torch")
         assert right["accuracy"] == 1.0 and right["blunder_rate"] == 0.0
 
         wrong = suites.score_suite(
             suite, _RiggedNet(_rigged_evaluator(suite, suite.bad[:, 0])),
-            n=16, device=DEVICE, batch=8)
+            n=16, device=DEVICE, batch=8, search_impl="torch")
         assert wrong["accuracy"] == 0.0 and wrong["blunder_rate"] == 1.0
 
     def test_wilson_brackets_the_proportion(self):
@@ -305,7 +315,8 @@ class TestScoring:
     def test_the_policy_scorer_agrees_with_the_search_on_a_sharp_policy(self, small_suites):
         suite = small_suites["mate_in_1"].subset(torch.arange(8, device=DEVICE))
         rigged = _RiggedNet(_rigged_evaluator(suite, suite.good[:, 0]))
-        a = suites.score_suite(suite, rigged, n=16, device=DEVICE, batch=8)
+        a = suites.score_suite(suite, rigged, n=16, device=DEVICE, batch=8,
+                               search_impl="torch")
         b = suites.score_suite_policy(suite, rigged, device=DEVICE)
         assert a["accuracy"] == b["accuracy"] == 1.0
 
@@ -558,3 +569,40 @@ def _other_legal_move(boards, control, answer):
                 out[i] = lab
                 break
     return out
+
+
+class TestSearchImplPairing:
+    """`search_impl` and `impl` are two axes and only one pairing is illegal.
+
+    ⚠️ The kernel's `_expand` reads fp16 logits and refuses to cast an fp32 policy,
+    because casting would change the numbers the fp32 reference computes and break
+    `tests/test_search_cuda.py`'s tree-for-tree comparison. `impl=None` is the plain
+    torch module, which emits fp32 — so a CUDA search with no fused encoder raises.
+
+    This regression exists because flipping the evaluation default from `"torch"` to
+    `"cuda"` (2026-07-31) broke exactly that pairing and the suite stayed green: the
+    only tests that drive a real search through `self_play_run` are `@slow`, so a
+    default `pytest` run skipped them and the failure surfaced in a layer-0 run
+    instead. These are deliberately *not* slow.
+    """
+
+    def test_a_cuda_search_with_no_encoder_named_gets_the_fused_one(self, net):
+        from brokefish.eval.runner import make_search
+
+        s = make_search(n=8, B=2, net=net, impl=None, search_impl="cuda",
+                        device=DEVICE)
+        boards, control = env.initial_boards(2, device=DEVICE)
+        s.reset(boards, control)
+        with torch.no_grad():
+            s.self_play_move()          # raises TypeError on fp32 logits
+
+    def test_the_torch_search_still_accepts_the_plain_module(self, net):
+        """The oracle path must keep working with no fused encoder at all."""
+        from brokefish.eval.runner import make_search
+
+        s = make_search(n=8, B=2, net=net, impl=None, search_impl="torch",
+                        device=DEVICE)
+        boards, control = env.initial_boards(2, device=DEVICE)
+        s.reset(boards, control)
+        with torch.no_grad():
+            s.self_play_move()

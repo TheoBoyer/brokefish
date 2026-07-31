@@ -339,7 +339,7 @@ def _membership(played: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
 
 @torch.no_grad()
 def score_suite(suite: Suite, net, n: int = 128, impl: Optional[str] = None,
-                search_impl: str = "torch", batch: int = 256, seed: int = 0,
+                search_impl: str = "cuda", batch: int = 256, seed: int = 0,
                 device: str = "cuda") -> dict:
     """Run the search on a suite and report the fraction it gets right.
 

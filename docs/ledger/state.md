@@ -416,13 +416,29 @@ and is not. Deleting one because it looks obvious is how it gets made again.
   3:Q` and a non-promotion move also carries field 0, so testing `promo == 0` for
   "knight promotion" silently deletes the whole underpromotion motif. Ask the board,
   through `promotion_targets`.
-  ⚠️ **44.4 s, against §4's predicted ~6 s** (fused encoder, CUDA search). The
-  estimate assumed 80-ply games where a random-init net plays 125, and costed the
-  mean game where the loop pays for the longest in the batch. Both fixes failed and
-  are written down: collecting the first `N` games *to finish* is 1.5× cheaper and
-  biases mean game length short by 24 plies — disqualifying, since game length is
-  one of the three metrics — and `batch < games` came out marginally worse. Layer 0
-  still never blocks. The suites are 2.8 s of the 44.4; self-play is 41.4.
+  **31.7 s per checkpoint** (2026-07-31, `logs/layer0_cuda.jsonl`, 64 games at
+  n = 100, six suites at n = 128), against §4's predicted ~6 s. ⚠️ The cost is a
+  function of the checkpoint, not a constant: self-play dominates and it pays for
+  the longest game in the batch, so a random init at 149 mean plies costs **46.9 s**
+  where an 83-step net at 99 plies costs 31.7. Quote the range, not the number. The estimate assumed
+  80-ply games where a random-init net plays 99–125, and costed the mean game where
+  the loop pays for the longest in the batch. Both fixes failed and are written
+  down: collecting the first `N` games *to finish* is 1.5× cheaper and biases mean
+  game length short by 24 plies — disqualifying, since game length is one of the
+  three metrics — and `batch < games` came out marginally worse. Layer 0 never
+  blocks.
+  ⚠️ **The old 44.4 s was measured on the reference tree, not the kernel, and the
+  line here said otherwise.** `runner.make_search` defaulted to `search_impl="torch"`
+  and `layer0.py` had no flag to change it, so no layer-0 run had ever driven the
+  CUDA search. Same checkpoint, same seed, 2026-07-31: **519.6 s on the torch tree
+  against 31.7 s on the kernel, 16.4×**, with suite accuracies agreeing to within
+  one or two items of 200 (`mate_in_1` 0.860 both ways) — which is what makes it one
+  measurement rather than two. Every record now carries `config.search_impl`.
+  ⚠️ The two axes are coupled: `impl` is the encoder, `search_impl` is the tree, and
+  the kernel's `_expand` refuses fp32 logits, so a CUDA search needs a fused encoder.
+  `make_search` now pairs them. `TestSearchImplPairing` covers both directions and is
+  deliberately not `@slow` — the flip that exposed this left the default suite green
+  because every test driving a real search was slow-marked and skipped.
   ⚠️ Evaluation must run under `no_grad`. The first version did not, and the fp32
   master weights built an autograd graph across a 300-ply run that OOM'd an 8 GB
   card at 8 games.

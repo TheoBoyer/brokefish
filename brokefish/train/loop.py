@@ -92,12 +92,28 @@ class TrainConfig:
     micro_batch: int = 1024
     momentum: float = 0.9
     l2: float = 1e-4
+    # `sgd` is AGZ's and stays the default: the baseline is the thing being ablated
+    # against, so it does not move. `adamw` is ablation 1 (2026-07-30).
+    optimizer: str = "sgd"
+    betas: Tuple[float, float] = (0.9, 0.95)   # 0.999 is too slow to matter at 10^2 steps
+    adam_wd: float = 0.1                       # decoupled, so unrelated to `l2` -- see below
+    grad_clip: float = 0.0                     # 0 disables; AGZ specifies no clipping
     lr_schedule: Tuple[Tuple[float, float], ...] = LR_SCHEDULE
     total_steps: int = 159_000
+    # Linear warmup, in optimiser steps. 0 is off and is the default, because AGZ
+    # specifies none and the SGD baseline must not move underneath the ablation.
+    warmup_steps: int = 0
+    # "step" is AGZ's three drops and stays the default; "cosine" decays smoothly to
+    # `lr_min` at `total_steps` -- which that flag then has to actually describe.
+    decay: str = "step"
+    lr_min: float = 0.0
 
     # -- the loop, §8
     moves_per_phase: int = 4
     checkpoint_every: int = 1000
+    # Keep every checkpoint as a weights-only snapshot alongside the rolling one, so
+    # a finished run yields a *curve* and not a single endpoint. 26 MB each.
+    keep_checkpoints: bool = False
     buffer_snapshot_every: int = 10_000
     autocast: bool = True              # §8.2, bf16 forward and backward
 
@@ -127,12 +143,94 @@ class TrainConfig:
         return hashlib.blake2b(blob, digest_size=8).hexdigest()
 
     def lr_at(self, step: int) -> float:
-        frac = step / max(self.total_steps, 1)
-        lr = self.lr_schedule[0][1]
-        for at, value in self.lr_schedule:
-            if frac >= at:
-                lr = value
+        """Warmup, then either AGZ's step schedule or a cosine decay to ``lr_min``.
+
+        ``decay = "step"`` is AGZ's and is the default: three discrete drops at the
+        fractions in :data:`LR_SCHEDULE`. ``decay = "cosine"`` is the modern recipe --
+        ``lr_schedule[0][1]`` becomes the *peak* and the rate follows half a cosine
+        down to :attr:`lr_min` at ``total_steps``, so the run ends at a rate that has
+        already gone smoothly to zero rather than being cut off mid-plateau.
+
+        ⚠️ **Cosine makes ``total_steps`` load-bearing, and it was decorative before.**
+        Under the step schedule a wrong ``total_steps`` moves the drop points; under
+        cosine it sets the entire shape. The default 159,000 with a run that reaches
+        step 116 gives ``cos(pi * 116/159000) ~ 1``, i.e. a constant rate and no decay
+        at all -- the flag will look broken when it is merely mis-sized. **Set
+        ``--total-steps`` to the number of steps the run will actually take.**
+
+        Past ``total_steps`` the progress term is clamped, so a run that overshoots
+        holds ``lr_min`` instead of following the cosine back up.
+
+        ⚠️ **Warmup is a fix for Adam specifically, and for a measured failure.**
+        Adam's update is gradient-*normalised*: every parameter moves about ``lr`` per
+        step no matter how small its gradient is. The value head's pre-tanh activation
+        is a sum over ``d = 256`` such moves, so at ``lr = 1e-3`` step 1 alone drove it
+        into saturation -- ``value_saturated_frac = 1.0``, ``grad_value_head = 0.000``,
+        dead for 62 of 116 steps (run ``t15-adamw``, 2026-07-31). SGD cannot do this,
+        because its step is ``lr * g`` and ``g`` is small; that is exactly the
+        smallness Adam normalises away, so this ramp restores it by hand.
+
+        The ramp is ``(step + 1) / warmup_steps``, not ``step / warmup_steps``: the
+        latter makes step 0 a no-op, which quietly costs a step and, worse, logs a
+        gradient the optimiser never applied.
+        """
+        if self.decay == "cosine":
+            peak = self.lr_schedule[0][1]
+            # Progress is measured *after* the ramp, so warmup does not eat decay:
+            # the cosine starts at the peak the moment warmup hands over.
+            span = max(self.total_steps - self.warmup_steps, 1)
+            t = min(max(step - self.warmup_steps, 0) / span, 1.0)
+            lr = self.lr_min + (peak - self.lr_min) * 0.5 * (1.0 + math.cos(math.pi * t))
+        elif self.decay == "step":
+            frac = step / max(self.total_steps, 1)
+            lr = self.lr_schedule[0][1]
+            for at, value in self.lr_schedule:
+                if frac >= at:
+                    lr = value
+        else:
+            raise ValueError(f"unknown decay {self.decay!r}, want 'step' or 'cosine'")
+
+        if self.warmup_steps > 0 and step < self.warmup_steps:
+            lr *= (step + 1) / self.warmup_steps
         return lr
+
+
+def build_optimizer(net: torch.nn.Module, cfg: TrainConfig) -> torch.optim.Optimizer:
+    """AGZ's optimiser, or ablation 1's.
+
+    ⚠️ **The two weight decays are not the same quantity and do not transfer.**
+
+    AGZ's loss carries an explicit ``c||theta||^2`` term, so its gradient is
+    ``2 c theta`` and torch's *coupled* ``weight_decay`` reproduces it at ``2c``
+    (hence :func:`weight_decay_for`) -- and, being part of the gradient, it is
+    scaled by the learning rate and by Adam's per-parameter normalisation.
+
+    AdamW *decouples* it: the update is ``theta -= lr * wd * theta``, outside the
+    second-moment normalisation. Carrying ``2e-4`` across would apply a decay some
+    three orders of magnitude weaker than the regulariser it is meant to be, so the
+    ablation would silently be "AdamW with no regularisation" -- which is a real
+    result about a different question. ``adam_wd = 0.1`` is the transformer default
+    and is what the ablation should actually test.
+
+    The split is the standard one: decay tensors with two or more dimensions, which
+    is every matmul weight and the token embedding, and never LayerNorm gains or
+    biases -- shrinking a per-channel gain toward zero is not regularisation, it
+    scales the layer's output down and the next layer just scales back up.
+    """
+    if cfg.optimizer == "sgd":
+        return torch.optim.SGD(
+            net.parameters(), lr=cfg.lr_at(0), momentum=cfg.momentum,
+            weight_decay=weight_decay_for(cfg.l2))
+    if cfg.optimizer != "adamw":
+        raise ValueError(f"unknown optimizer {cfg.optimizer!r}, want 'sgd' or 'adamw'")
+
+    named = [(n, p) for n, p in net.named_parameters() if p.requires_grad]
+    decay = [p for _, p in named if p.ndim >= 2]
+    flat = [p for _, p in named if p.ndim < 2]
+    return torch.optim.AdamW(
+        [{"params": decay, "weight_decay": cfg.adam_wd},
+         {"params": flat, "weight_decay": 0.0}],
+        lr=cfg.lr_at(0), betas=cfg.betas, eps=1e-8)
 
 
 class Trainer:
@@ -164,11 +262,7 @@ class Trainer:
 
         torch.manual_seed(cfg.seed)
         self.net = BrokefishNet().to(self.device)          # fp32 master weights, §8.2
-        self.opt = torch.optim.SGD(
-            self.net.parameters(), lr=cfg.lr_at(0), momentum=cfg.momentum,
-            # ⚠️ 2c, not c. AGZ writes the penalty as `c||theta||^2` with no half,
-            # so its gradient is `2 c theta`, and torch's weight_decay adds `w theta`.
-            weight_decay=weight_decay_for(cfg.l2))
+        self.opt = build_optimizer(self.net, cfg)
 
         self.env = ENVIRONMENTS[cfg.impl]
         self.weight_gen = 0
@@ -342,6 +436,10 @@ class Trainer:
                                    for p in self.net.parameters() if p.grad is not None))
         weight_norm = torch.sqrt(sum((p.detach().float() ** 2).sum()
                                      for p in self.net.parameters()))
+        # Clip after `grad_norm` is read, so the logged number stays the pre-clip one
+        # and remains comparable between an arm that clips and an arm that does not.
+        if cfg.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(self.net.parameters(), cfg.grad_clip)
         self.opt.step()
         self.step += 1
 
@@ -590,6 +688,18 @@ class Trainer:
                 with_buffer = self.step >= next_snap
                 self.save_checkpoint(os.path.join(checkpoint_dir, f"{self.run}.pt"),
                                      with_buffer=with_buffer)
+                # ⚠️ **A rolling checkpoint has no history, and history is the
+                # deliverable.** `{run}.pt` is overwritten every time, so run `c2-8h`
+                # produced 2,827 steps and exactly one network — and the hypothesis
+                # it was meant to test (did skill peak early and decline?) cannot be
+                # asked of a single endpoint. These snapshots are the *weights only*:
+                # 26 MB against the full state's 78, because a frozen opponent in a
+                # match or a point on the cost-Elo curve needs a network and nothing
+                # else. Resume still comes from `{run}.pt`.
+                if cfg.keep_checkpoints:
+                    torch.save(self.net.state_dict(),
+                               os.path.join(checkpoint_dir,
+                                            f"{self.run}-{self.step:06d}.pt"))
                 next_ckpt = self.step + cfg.checkpoint_every
                 if with_buffer:
                     next_snap = self.step + cfg.buffer_snapshot_every
@@ -613,11 +723,38 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--total-steps", type=int, default=TrainConfig.total_steps)
     p.add_argument("--lr", type=float, default=None,
                    help="override the whole §7.3 schedule with one constant rate")
+    p.add_argument("--optimizer", default=TrainConfig.optimizer, choices=("sgd", "adamw"),
+                   help="sgd is AGZ's; adamw is ablation 1")
+    p.add_argument("--adam-wd", type=float, default=TrainConfig.adam_wd,
+                   help="AdamW's decoupled decay -- NOT --l2, see build_optimizer")
+    p.add_argument("--betas", type=float, nargs=2, default=list(TrainConfig.betas))
+    p.add_argument("--grad-clip", type=float, default=TrainConfig.grad_clip,
+                   help="global grad-norm clip; 0 disables (AGZ specifies none)")
+    p.add_argument("--warmup", type=int, default=TrainConfig.warmup_steps,
+                   help="linear lr warmup over this many optimiser steps; 0 disables. "
+                        "Adam needs it, SGD does not -- see lr_at")
+    # The self-generated diversity knobs. Allowed by the tabula rasa boundary
+    # (CLAUDE.md) precisely because none of them is an opinion about chess.
+    p.add_argument("--tau-plies", type=int, default=TrainConfig.tau_plies,
+                   help="plies of tau=1 sampling before argmax takes over. ⚠️ AGZ says "
+                        "'the first 30 moves', a ply in Go and a pair in chess")
+    p.add_argument("--eps", type=float, default=TrainConfig.eps,
+                   help="Dirichlet mixing weight at the root")
+    p.add_argument("--alpha", type=float, default=TrainConfig.alpha,
+                   help="Dirichlet concentration")
+    p.add_argument("--decay", default=TrainConfig.decay, choices=("step", "cosine"),
+                   help="step is AGZ's three drops; cosine decays smoothly to --lr-min "
+                        "at --total-steps, which must then be the real step count")
+    p.add_argument("--lr-min", type=float, default=TrainConfig.lr_min,
+                   help="the floor a cosine decay lands on (0 = all the way down)")
     p.add_argument("--euros-per-hour", type=float, default=0.0)
     p.add_argument("--generations", type=int, default=None)
     p.add_argument("--max-steps", type=int, default=None)
     p.add_argument("--minutes", type=float, default=None,
                    help="stop at the first generation boundary past this wall clock")
+    p.add_argument("--keep-checkpoints", action="store_true",
+                   help="also write {run}-{step}.pt (weights only, 26 MB) at every "
+                        "checkpoint, so skill can be plotted against step")
     p.add_argument("--checkpoint-every", type=int, default=TrainConfig.checkpoint_every,
                    help="optimiser steps between checkpoints; a short run wants this "
                         "small or it never writes one")
@@ -657,7 +794,12 @@ def config_from_args(args) -> TrainConfig:
         buffer_dir=args.buffer_dir, seed=args.seed, impl=args.impl,
         encoder=args.encoder, deterministic=not args.nondeterministic,
         checkpoint_every=args.checkpoint_every,
-        buffer_snapshot_every=args.buffer_snapshot_every, audit_every=args.audit_every)
+        keep_checkpoints=args.keep_checkpoints,
+        buffer_snapshot_every=args.buffer_snapshot_every, audit_every=args.audit_every,
+        optimizer=args.optimizer, adam_wd=args.adam_wd, grad_clip=args.grad_clip,
+        betas=tuple(args.betas), warmup_steps=args.warmup,
+        decay=args.decay, lr_min=args.lr_min,
+        tau_plies=args.tau_plies, eps=args.eps, alpha=args.alpha)
     if args.smoke:
         cfg.n_sims, cfg.batch_games, cfg.moves_per_phase = 32, 256, 8
         cfg.window_games, cfg.mean_plies, cfg.max_plies = 2000, 128, 160
@@ -682,6 +824,15 @@ def main() -> None:
     logger.note(f"  {cfg.n_sims} sims, {cfg.batch_games} games in flight, "
                 f"batch {cfg.batch} in {math.ceil(cfg.batch / cfg.micro_batch)} "
                 f"micro-batches, {cfg.samples_per_game} samples per game")
+    # Print the rate the run will actually see. A cosine sized against the default
+    # 159,000 steps in a run that takes 116 is a constant rate wearing a decay's name,
+    # and this line is where that becomes obvious instead of being found afterwards.
+    marks = [0, cfg.warmup_steps, cfg.total_steps // 4, cfg.total_steps // 2,
+             (3 * cfg.total_steps) // 4, max(cfg.total_steps - 1, 0)]
+    shape = "  ".join(f"{s}:{cfg.lr_at(s):.2e}" for s in sorted(set(marks)))
+    logger.note(f"  {cfg.optimizer}, {cfg.decay} decay over {cfg.total_steps} steps, "
+                f"warmup {cfg.warmup_steps}")
+    logger.note(f"  lr at step  {shape}")
     try:
         trainer.run_loop(generations=args.generations, max_steps=args.max_steps,
                          max_seconds=None if args.minutes is None else args.minutes * 60,

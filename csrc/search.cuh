@@ -45,6 +45,16 @@ namespace search {
 constexpr int kE = 64;
 constexpr int kWarps = 8;  // warps per block, matching the engine kernels
 
+// §6.6 first-play urgency, and it must equal `FPU_DRAW` in
+// brokefish/search/torch_impl.py exactly -- tests/test_search_cuda.py compares the two
+// trees edge for edge, so a mismatch here fails there rather than in a training run.
+//
+// 0.5, not 0: AGZ scores an untried move at a *draw*, and a draw is 0 in AGZ's
+// [-1,1] but 0.5 in the [0,1] the tree uses (§3.5). The literal 0 scores an untried
+// move as a certain loss, which locks out every move with prior < 0.0145 at n = 800
+// -- permanently, at any budget. See the torch constant for the measurements.
+constexpr float kFpuDraw = 0.5f;
+
 // `node_flags`, mirroring brokefish/search/torch_impl.py.
 constexpr uint8_t kTerminalMask = 0b111;
 constexpr uint8_t kExpanded = 1 << 3;
@@ -199,7 +209,7 @@ __device__ inline int puct_argmax(const int16_t* nvis, const __half* prior, cons
         if (e >= nedges) continue;
         const float n = (float)nvis[e];
         const float u = __fdiv_rn(pb_root, __fadd_rn(n, 1.0f));
-        const float q = n > 0.0f ? qs[e] : 0.0f;
+        const float q = n > 0.0f ? qs[e] : kFpuDraw;
         const float score = __fadd_rn(__fmul_rn(u, __half2float(prior[e])), q);
         // j ascends with the edge index, so a plain `>` already breaks the
         // within-lane tie towards the lower index.

@@ -23,11 +23,11 @@ from .log import Logger
 from .loss import (TrainBatch, audit_labels, az_loss, edge_logits, l2_penalty,
                    weight_decay_for)
 from .sync import PackedWeights, weight_fingerprint
-from .loop import LR_SCHEDULE, TrainConfig, Trainer
+from .loop import LR_SCHEDULE, TrainConfig, Trainer, build_optimizer
 
 __all__ = [
     "RECORD", "RECORD_BYTES", "ReplayBuffer",
     "TrainBatch", "az_loss", "audit_labels", "edge_logits", "l2_penalty", "weight_decay_for",
-    "TrainConfig", "Trainer", "LR_SCHEDULE",
+    "TrainConfig", "Trainer", "LR_SCHEDULE", "build_optimizer",
     "PackedWeights", "weight_fingerprint", "Logger",
 ]

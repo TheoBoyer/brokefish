@@ -620,6 +620,89 @@ def test_the_learning_rate_schedule_is_the_paper_s_four_values():
     assert cfg.lr_at(10 ** 9) == 0.0002
 
 
+def test_warmup_is_off_by_default_so_the_agz_baseline_does_not_move():
+    """The whole point of a default: an ablation must not silently change its control."""
+    assert TrainConfig.warmup_steps == 0
+    cfg = TrainConfig(total_steps=700_000, lr_schedule=LR_SCHEDULE)
+    assert [cfg.lr_at(s) for s in (0, 1, 50, 99_999)] == [0.2] * 4
+
+
+def test_linear_warmup_ramps_and_then_hands_back_to_the_schedule():
+    cfg = TrainConfig(total_steps=700_000, lr_schedule=((0.0, 0.001),), warmup_steps=100)
+
+    # ⚠️ Step 0 must not be zero: a zero rate is a step whose gradient is computed,
+    # logged, and thrown away. `(step + 1) / warmup` is what avoids that.
+    assert cfg.lr_at(0) == pytest.approx(0.001 / 100)
+    assert cfg.lr_at(0) > 0.0
+
+    # Linear in between, and the ramp is over by construction at the last warmup step.
+    assert cfg.lr_at(49) == pytest.approx(0.001 * 50 / 100)
+    assert cfg.lr_at(99) == pytest.approx(0.001)
+    assert cfg.lr_at(100) == pytest.approx(0.001)
+    assert cfg.lr_at(10_000) == pytest.approx(0.001)
+
+    steps = [cfg.lr_at(s) for s in range(100)]
+    assert steps == sorted(steps), "the ramp must be monotone"
+
+
+def test_cosine_decays_from_the_peak_to_lr_min_and_stays_there():
+    cfg = TrainConfig(total_steps=1000, lr_schedule=((0.0, 0.001),), decay="cosine")
+    assert cfg.lr_at(0) == pytest.approx(0.001)
+    assert cfg.lr_at(500) == pytest.approx(0.0005)          # half a cosine is half way
+    assert cfg.lr_at(999) == pytest.approx(0.0, abs=1e-8)
+    # ⚠️ Past the horizon the progress term is clamped. Without that, `cos` turns and
+    # the rate climbs back to the peak -- a run that overshoots would re-heat.
+    assert cfg.lr_at(1000) == pytest.approx(0.0, abs=1e-12)
+    assert cfg.lr_at(10_000) == pytest.approx(0.0, abs=1e-12)
+
+    got = [cfg.lr_at(s) for s in range(1000)]
+    assert got == sorted(got, reverse=True), "cosine must be monotone decreasing"
+
+
+def test_cosine_respects_lr_min():
+    cfg = TrainConfig(total_steps=1000, lr_schedule=((0.0, 0.001),), decay="cosine",
+                      lr_min=1e-5)
+    assert cfg.lr_at(0) == pytest.approx(0.001)
+    assert cfg.lr_at(1000) == pytest.approx(1e-5)
+    assert cfg.lr_at(500) == pytest.approx(1e-5 + (0.001 - 1e-5) * 0.5)
+
+
+def test_warmup_hands_over_to_cosine_at_the_peak():
+    """The two compose: the ramp ends at the peak, and decay starts from there --
+    not from wherever a cosine measured over the whole run happens to be."""
+    cfg = TrainConfig(total_steps=1000, lr_schedule=((0.0, 0.001),), decay="cosine",
+                      warmup_steps=100)
+    assert cfg.lr_at(0) == pytest.approx(0.001 / 100)
+    assert cfg.lr_at(99) == pytest.approx(0.001)             # ramp ends at the peak
+    assert cfg.lr_at(100) == pytest.approx(0.001)            # cosine starts *at* it
+    assert cfg.lr_at(101) < 0.001                            # and decays from there
+    assert cfg.lr_at(999) == pytest.approx(0.0, abs=1e-8)
+    got = [cfg.lr_at(s) for s in range(1000)]
+    assert max(got) == pytest.approx(0.001), "the ramp must never overshoot the peak"
+
+
+def test_a_cosine_sized_against_the_wrong_total_steps_is_a_constant():
+    """⚠️ The failure this will actually produce: `--decay cosine` with the default
+    `total_steps` in a run that takes ~10^2 steps is a flat rate, not a decay. It is
+    not a bug and no assertion can catch it -- hence the startup line that prints the
+    shape. This test exists to pin *why* that line is there."""
+    cfg = TrainConfig(total_steps=159_000, lr_schedule=((0.0, 0.001),), decay="cosine")
+    assert cfg.lr_at(116) == pytest.approx(0.001, rel=1e-4)  # 0.01 % below peak
+
+
+def test_an_unknown_decay_is_refused_rather_than_silently_stepping():
+    with pytest.raises(ValueError, match="unknown decay"):
+        TrainConfig(decay="linear").lr_at(0)
+
+
+def test_warmup_scales_the_schedule_rather_than_replacing_it():
+    """A drop landing inside the ramp must still be the schedule's value, scaled."""
+    cfg = TrainConfig(total_steps=1000, lr_schedule=((0.0, 0.2), (0.5, 0.02)),
+                      warmup_steps=1000)
+    assert cfg.lr_at(499) == pytest.approx(0.2 * 500 / 1000)
+    assert cfg.lr_at(500) == pytest.approx(0.02 * 501 / 1000)
+
+
 # --------------------------------------------------------------------------- #
 # §8.1, weight synchronisation — check 9
 # --------------------------------------------------------------------------- #

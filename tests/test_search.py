@@ -106,16 +106,27 @@ def test_edge_q_stays_in_range():
 # --------------------------------------------------------------------------- #
 
 def az_ucb_score(prior: float, child_n: int, child_q: float, parent_n: int,
-                 base: float = 19652.0, init: float = 1.25) -> float:
+                 base: float = 19652.0, init: float = 1.25,
+                 fpu: float = 0.5) -> float:
     """AlphaZero's `ucb_score`, transcribed from the released pseudocode.
 
     Deliberately written out in scalar Python from the paper rather than factored
     out of `_select`, so that a mistake in one is not a mistake in both. `init` is
     added to the logarithm, not multiplied by it.
+
+    ⚠️ **`fpu` is the one place this departs from a literal transcription**, and it
+    departs deliberately (`search.md` §6.6, corrected 2026-07-31). The pseudocode
+    returns `0` for an unvisited child because its values are in `[-1, 1]`, where 0
+    is a draw. This tree stores `Q` in `[0, 1]` (§3.5, so that `pb_c_init = 1.25`
+    keeps its published meaning), and every constant in Q-space has to ride that
+    remap: a draw is `0.5`. The literal `0` scores an untried move as a certain
+    *loss*, which made low-prior moves unreachable at any budget and collapsed run
+    `c2-8h`. The default here is the corrected value; pass `fpu=0.0` to reproduce
+    what v0 did.
     """
     pb_c = math.log((parent_n + base + 1) / base) + init
     pb_c *= math.sqrt(parent_n) / (child_n + 1)
-    return pb_c * prior + (child_q if child_n > 0 else 0.0)
+    return pb_c * prior + (child_q if child_n > 0 else fpu)
 
 
 def test_selection_matches_alphazeros_ucb_score():
@@ -148,6 +159,35 @@ def test_selection_matches_alphazeros_ucb_score():
             if want != int(got[row]):
                 bad.append((trial, row, want, int(got[row])))
     assert not bad, f"{len(bad)} of {trials * B} disagree, first {bad[:3]}"
+
+
+def test_the_v0_fpu_would_now_disagree():
+    """The test above is only worth what its ability to fail is worth.
+
+    `test_selection_matches_alphazeros_ucb_score` now encodes `fpu = 0.5`. If the
+    two constants happened never to change a selection over random tree states, that
+    test would pass against either one and would not be pinning the fix at all. This
+    asserts they genuinely disagree on the same states.
+    """
+    B, trials = 6, 200
+    s = make(n=8, B=B)
+    g = torch.Generator(device=DEVICE).manual_seed(3)
+    differ = 0
+    for _ in range(trials):
+        n_edges = torch.randint(1, s.config.E + 1, (B,), generator=g, device=DEVICE)
+        s.node_nedges[:, 0] = n_edges.to(torch.uint8)
+        s.edge_prior[:, 0] = torch.rand((B, s.config.E), generator=g, device=DEVICE).half()
+        s.edge_N[:, 0] = torch.randint(0, 40, (B, s.config.E), generator=g,
+                                       device=DEVICE).to(torch.int16)
+        s.edge_Q[:, 0] = torch.rand((B, s.config.E), generator=g, device=DEVICE)
+        for row in range(B):
+            k = int(n_edges[row])
+            parent = int(s.edge_N[row, 0, :k].sum())
+            args = [(float(s.edge_prior[row, 0, i]), int(s.edge_N[row, 0, i]),
+                     float(s.edge_Q[row, 0, i]), parent) for i in range(k)]
+            pick = lambda f: max(range(k), key=lambda i: (az_ucb_score(*args[i], fpu=f), -i))
+            differ += pick(0.5) != pick(0.0)
+    assert differ > 0, "the two FPU constants never changed a selection; the test above proves nothing"
 
 
 def test_ties_go_to_the_lowest_edge_index():
@@ -399,13 +439,24 @@ def test_rep_window_stops_at_an_irreversible_move():
 def test_threefold_inside_the_tree_ends_the_line():
     """A ring loaded with the root position turns a four-ply loop into a draw.
 
-    Nothing forces the search down that loop, so this asserts on the counter
-    rather than on a particular node: with the root at its second occurrence,
-    any return to it inside the tree is the third and code 4 has to appear.
+    With the root at its second occurrence, any return to it inside the tree is the
+    third and code 4 has to appear.
+
+    Nothing forces the search down that loop, so this asserts on the counter rather
+    than on a particular node.
+
+    ⚠️ **`n = 1200`, and the budget is load-bearing.** This ran at `n = 400` until
+    2026-07-31, which sufficed only because §6.6's first-play urgency was `0`: every
+    untried move scored as a loss, so the search dived down a single line and fell
+    into the loop almost immediately. Under the corrected `FPU = 0.5` it expands
+    breadth-first, and reaching a four-ply repeat means covering roughly `17 * 3 * 17`
+    sequences from this position. Measured: 0 repetition nodes at `n = 400`, 5 at
+    `n = 1000`. A spiked prior does *not* rescue this — forcing the lowest-index legal
+    move gives one deterministic line, and a line is not a loop.
     """
     fen = "7k/8/8/8/8/8/8/R6K w - - 20 1"
     b, c = from_fen(fen)
-    s = make(n=400, B=1, boards=b, control=c)
+    s = make(n=1200, B=1, boards=b, control=c)
     s.game_ring[0, 0] = s.game_hash[0]
     s.game_ring_len[0] = 1
     with torch.no_grad():
@@ -976,3 +1027,44 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# --------------------------------------------------------------------------- #
+# §6.6, first-play urgency — the constant that has to ride the [0,1] remap
+# --------------------------------------------------------------------------- #
+
+
+def test_fpu_is_a_draw_not_a_loss():
+    """§3.5: a draw is 0 in `[-1,1]` and 0.5 in the `[0,1]` the tree stores."""
+    from brokefish.search.torch_impl import FPU_DRAW
+    assert FPU_DRAW == 0.5
+
+
+def test_an_unvisited_edge_is_reachable_at_a_realistic_prior():
+    """⚠️ The regression that cost run `c2-8h` seven hours.
+
+    With `FPU = 0` an untried move is scored as a certain *loss*, so it can only be
+    reached if its prior alone beats a visited edge's `Q ~ 0.5`. That threshold is
+    `prior > 0.0145` at `n = 800` — above almost every move of a policy that has
+    started to sharpen — and it does not move with the simulation budget, so the
+    exclusion is permanent. This asserts the score algebra directly rather than
+    through a search, so it says which constant is wrong when it fails.
+    """
+    from brokefish.search.torch_impl import FPU_DRAW
+
+    c = SearchConfig(n=800)
+    n_v, n_top, p_top, p_cold = 800.0, 790.0, 0.65, 0.005
+    q_draw = 0.5                                   # a value head sitting at the draw
+
+    def pb(n_edge):
+        base = math.log((n_v + c.pb_c_base + 1.0) / c.pb_c_base) + c.pb_c_init
+        return base * math.sqrt(n_v) / (n_edge + 1.0)
+
+    hot = pb(n_top) * p_top + q_draw               # the edge holding all the visits
+    cold_fixed = pb(0.0) * p_cold + FPU_DRAW       # an untried move, after the fix
+    cold_v0 = pb(0.0) * p_cold + 0.0               # ... and as v0 shipped it
+
+    assert cold_fixed > hot, (
+        f"an untried move at prior {p_cold} is still unreachable at n=800: "
+        f"{cold_fixed:.4f} vs {hot:.4f}")
+    assert cold_v0 < hot, "the v0 constant would have been fine, so this test is moot"

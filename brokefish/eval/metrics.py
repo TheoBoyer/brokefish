@@ -64,7 +64,7 @@ class SelfPlayRun:
 @torch.no_grad()
 def self_play_run(net, games: int = 64, n_sims: int = 100, max_plies: int = 300,
                   batch: Optional[int] = None, impl: Optional[str] = None,
-                  search_impl: str = "torch", seed: int = 0, device: str = "cuda",
+                  search_impl: str = "cuda", seed: int = 0, device: str = "cuda",
                   max_iters: Optional[int] = None) -> SelfPlayRun:
     """Collect `games` finished games and keep what layer 0 needs.
 

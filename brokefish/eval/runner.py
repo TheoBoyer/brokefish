@@ -43,9 +43,30 @@ def eval_config(n: int, B: int, **kw):
 
 
 def make_search(n: int, B: int, net, impl: Optional[str] = None,
-                search_impl: str = "torch", seed: int = 0, device: str = "cuda",
+                search_impl: str = "cuda", seed: int = 0, device: str = "cuda",
                 greedy: bool = True, **kw):
-    """The whole "run a search over these positions" preamble, in one call."""
+    """The whole "run a search over these positions" preamble, in one call.
+
+    ⚠️ **``impl`` is the encoder, ``search_impl`` is the tree.** Two axes, easy to
+    confuse, and the confusion had teeth: this defaulted to ``"torch"`` until
+    2026-07-31, so every evaluation in the repository silently drove the *reference*
+    search. The reference exists to be the oracle the kernel is checked against
+    (`tests/test_search_cuda.py` holds them together tree for tree), not to be what a
+    measurement runs on — and it is roughly an order of magnitude slower, which put
+    `state.md`'s 44.4 s layer-0 cost against a prediction that assumed the kernel.
+    Pass ``"torch"`` deliberately when the oracle *is* the point.
+
+    ⚠️ **The two axes are coupled in one direction**: the kernel's ``_expand`` reads
+    fp16 logits and *refuses* to cast an fp32 policy, because casting would change
+    the numbers the reference computes in fp32 and silently break the tree-for-tree
+    comparison. ``impl=None`` is the plain torch module, which emits fp32. So a CUDA
+    search with ``impl=None`` raises — which is what the old ``"torch"`` default was
+    quietly protecting, and what flipping it exposed. The pairing is resolved here
+    rather than left to every caller: a CUDA search with no encoder named gets the
+    fused CUDA encoder. Name ``impl`` explicitly to override.
+    """
+    if search_impl == "cuda" and impl is None:
+        impl = "cuda"
     from brokefish.search.torch_impl import SearchConfig, make_evaluator
 
     cfg = (eval_config(n, B, **kw) if greedy else SearchConfig(n=n, B=B, **kw))

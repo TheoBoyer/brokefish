@@ -182,8 +182,23 @@ rescaled with them.** In PUCT the value term and the exploration term are added,
 halving the range of `Q` doubles the effective exploration. v0 therefore stores `Q`
 in `[0, 1]` and converts once at backup, which keeps `pb_c_init = 1.25` meaning
 what it means in the published pseudocode. An implementation that keeps `Q` in
-`[-1, 1]` and reuses 1.25 is running a search with twice the intended exploration
+`[-1, 1]` and reuses 1.25 is running a search with **half** the intended exploration
 and will not reproduce anything.
+
+⚠️ **Direction corrected 2026-07-31** — this said "twice". Substituting
+`q01 = (v + 1) / 2` into the score and dropping the per-node constant:
+
+```
+score[-1,1] = pb_c * P + (2 * q01 - 1) = 2 * ( (pb_c / 2) * P + q01 ) - 1
+```
+
+so `[-1, 1]` at `pb_c_init = c` is `[0, 1]` at `c / 2`. The equivalent constants are
+therefore 1.25 in `[0, 1]` and **2.5** in `[-1, 1]`.
+
+⚠️ **Every constant in Q-space rides this remap, and the one that did not was the
+first-play urgency** (§6.6). A draw is `0` in `[-1, 1]` and `0.5` in `[0, 1]`; v0
+carried the literal `0`, which is a certain loss. That paragraph is the rule this
+section states, broken one constant over.
 
 **Why the flip and not a second readout.** `W_value` is `[256, 1]` applied to one
 token, so a position's evaluation yields one number, the mover's. Reading the *other*
@@ -661,13 +676,29 @@ Exactly the AlphaZero pseudocode, on a node `v` with parent visit count
 pb_c = log((N_v + pb_c_base + 1) / pb_c_base) + pb_c_init
 pb_c = pb_c * sqrt(N_v) / (edge_N[b][v][e] + 1)
 score(e) = pb_c * edge_prior[b][v][e] + Q(e)
-Q(e)    = edge_N[b][v][e] == 0 ? 0 : edge_Q[b][v][e]
+Q(e)    = edge_N[b][v][e] == 0 ? 0.5 : edge_Q[b][v][e]
 ```
 
 `pb_c_init` is **added** to the logarithm rather than multiplied by it. Ties are
-broken by the lowest edge index. An unvisited edge scores `Q = 0`, which is
-AlphaZero's first-play urgency and is a loss from the mover's point of view in the
-`[0, 1]` convention; §11 has the alternatives.
+broken by the lowest edge index. An unvisited edge scores `Q = 0.5`, which is AGZ's
+first-play urgency — a **draw** from the mover's point of view — expressed in the
+`[0, 1]` convention of §3.5; §11 has the alternatives.
+
+⚠️ **Corrected 2026-07-31; v0 shipped `0` here and it is an absorbing state.** AGZ
+scores an untried move at `Q = 0` in `[-1, 1]`, where 0 is a draw. §3.5 remaps the
+tree to `[0, 1]` and warns that the two are equivalent *only if the constants are
+rescaled with them* — and then rescaled the value and not this. A literal `0` in
+`[0, 1]` is a **certain loss**, so against a value head near the draw value an untried
+move needs `pb_c * prior > 0.5`, i.e. `prior > 0.0145` at `n = 800`. Anything below
+that is unreachable **at every simulation budget**, so its prior can never be
+corrected upward and can only fall further.
+
+Measured on run `c2-8h` (177,669 games, 2,827 steps): 3 of 20 root moves visited at
+`n = 64` *and* at `n = 800`, `KL(pi||P) = 0.0855` at both; decisive games fell
+5.13 % → 1.76 % over seven hours while the policy collapsed onto one
+position-independent move. The same network with `Q = 0.5` visits 20 of 20 at
+`n = 800`. The story is in
+[the 2026-07-31 collapse post-mortem](../journal/2026-07-31-value-collapse.md).
 
 ### 6.7 `select_and_advance`
 

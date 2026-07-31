@@ -35,7 +35,7 @@ import torch
 from brokefish.env import cuda_impl as env
 from brokefish.search import SearchConfig, search_impl
 from brokefish.search.cuda_impl import TREE_FIELDS
-from brokefish.search.torch_impl import TERMINAL, Search as RefSearch
+from brokefish.search.torch_impl import FPU_DRAW, TERMINAL, Search as RefSearch
 from tests.boards import random_positions
 from tests.oracle import batched_eval
 
@@ -143,7 +143,9 @@ class Probe:
         n_v = torch.where(valid, nvis, torch.zeros_like(nvis)).sum(-1, keepdim=True)
         pb = torch.log((n_v + c.pb_c_base + 1.0) / c.pb_c_base) + c.pb_c_init
         pb = pb * n_v.sqrt() / (nvis + 1.0)
-        score = pb * prior + torch.where(nvis > 0, q, torch.zeros_like(q))
+        # §6.6's FPU, mirroring `_select`. It must be the same constant or the margin
+        # and perturbation below describe a score function nothing computes.
+        score = pb * prior + torch.where(nvis > 0, q, torch.full_like(q, FPU_DRAW))
         return torch.where(valid, score, torch.full_like(score, float("-inf")))
 
     def __call__(self, v):
@@ -357,18 +359,47 @@ def test_flat_priors_agree_bit_for_bit():
     _report(probe, f"flat (max depth {depth})")
 
 
+def spiked_eval(boards, control, rep):
+    """A prior spiked on one move per position, so the search dives instead of spreads.
+
+    ⚠️ **This used to be `flat_eval`, and the reason it cannot be is the §6.6 fix.**
+    The old version relied on first-play urgency being `0`: an untried edge scored a
+    certain loss, so any visited edge with `Q > 0` beat it and the search walked down
+    a single line. That constant was the bug (`search.md` §6.6), and under the correct
+    `FPU = 0.5` a flat prior makes the search expand every sibling before going deeper
+    — max depth 3 instead of 33, which is the *right* behaviour and leaves §7's
+    two-iteration scan and §6.5's backup loop untested.
+
+    A prior concentrated on edge 0 restores the dive on its merits: the top edge
+    scores `pb_c * ~1 + Q` against a sibling's `pb_c * ~0 + 0.5`, and with `Q` near
+    the draw value the `pb_c` term keeps it ahead at every visit count.
+    """
+    _, _, value = batched_eval(boards, control, rep)
+    n = boards.shape[0]
+    # ⚠️ The spike has to land on a *legal* edge, so it is placed by movegen rather
+    # than at a fixed index: slot 0 is the a1 rook, which has no legal move from the
+    # start position, and spiking it leaves the prior flat and the tree shallow.
+    mask = env.movegen(boards, control)[0]                       # [n, 32] bitboards
+    bits = ((mask.unsqueeze(-1) >> torch.arange(64, device=boards.device)) & 1).bool()
+    flat = bits.reshape(n, -1).float()
+    first = torch.argmax(flat, dim=-1)                           # lowest legal (slot, sq)
+    logits = torch.zeros(n, 32 * 64, device=boards.device, dtype=torch.float16)
+    logits[torch.arange(n, device=boards.device), first] = 16.0
+    promo = torch.zeros(n, 32, 4, device=boards.device, dtype=torch.float16)
+    return logits.reshape(n, 32, 64), promo, value.float()
+
+
 def test_agrees_on_a_path_longer_than_a_warp():
     """A path past 32 levels, where §7's scan and §6.5's backup loop twice per lane.
 
-    Flat priors from the start position, which is the deepest thing in this file.
-    With every prior equal and first-play urgency at 0 an unvisited edge scores 0
-    while a visited one with `Q > 0` beats it, so the search dives down one line
-    instead of spreading, and the pawns that reach the eighth rank on the way are
-    why this cannot also be the bit-exact test.
+    From the start position, which is the deepest thing in this file. The pawns that
+    reach the eighth rank on the way are why this cannot also be the bit-exact test.
     """
     boards, control = env.initial_boards(8, device="cuda")
-    ref, cu, probe = _pair(boards, control, n=192, eps=0.0, stats=True)
-    ref.evaluate = cu.evaluate = flat_eval
+    # n = 320, not 192: under the corrected §6.6 the dive costs one simulation per
+    # ply, and 192 reaches depth 29 -- just under the 32 this test exists to cross.
+    ref, cu, probe = _pair(boards, control, n=320, eps=0.0, stats=True)
+    ref.evaluate = cu.evaluate = spiked_eval
     _run(ref, cu, label="deep path ")
     depth = cu.device_counters()["max_depth"]
     assert depth > 32, f"the deepest path was {depth}, so no lane looped twice"

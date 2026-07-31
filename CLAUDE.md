@@ -84,7 +84,7 @@ is the plan and the open decisions, and `docs/journal/` is how each row was reac
 | B1, B2 | the encoder, `csrc/encoder.cu` + `nn/` | 62.3k evals/s boards-to-logits, ×3.25 over torch |
 | C1 | the MCTS, `csrc/search.cu` + `search/` | **Gate 1a: 56 996 evals/s**, tree is 4.4 % |
 | C2 | training, `brokefish/train/` + `docs/reference/training.md` | 31 checks; `lr = 0.002` beats AZ's 0.2, provisional |
-| D0, D1 | notation, rule suites, layer 0, puzzles | layer 0 = 44.4 s per checkpoint |
+| D0, D1 | notation, rule suites, layer 0, puzzles | layer 0 = 31.7 s per checkpoint |
 | — | the debugger, the AGZ oracle, `docs/journal/2026-07-30-fidelity.md` | trees agree exactly at n=512 |
 
 Four traps belonging to no single component, each with its story in `docs/ledger/state.md`:

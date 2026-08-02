@@ -14,9 +14,9 @@ lines of ``F.cross_entropy``.
 **The softmax denominator is the root's edge set, and the record carries it** (§3.5,
 revised 2026-07-31). The training path recomputes nothing about the position: the
 search already knew exactly which moves it normalised over, and since ``mcts.md`` §10's
-policy arrays are ``E = 64`` wide whether or not the entries are used, storing every
+policy arrays are ``E = K_POLICY`` wide whether or not the entries are used, storing every
 edge instead of only the visited ones costs **zero extra bytes**. What was a
-``[N, 8192]`` masked softmax over a recomputed legality mask is now an ``[N, 64]``
+``[N, 8192]`` masked softmax over a recomputed legality mask is now an ``[N, K_POLICY]``
 gather, and ``env`` no longer appears in this module's hot path at all.
 
 ⚠️ **The unvisited edges are the point.** They carry ``pi = 0`` and contribute nothing
@@ -32,17 +32,17 @@ whole time, and nothing else in ``train.md`` §12 notices. Two transcriptions pl
 differential test against a live search is the same discipline ``test_search.py``
 used on ``ucb_score``, and it is check 3 — the most important check in C2.
 
-**The ``E = 64`` truncation stops being a problem rather than being solved.** An
-earlier draft recomputed the legality mask and re-derived the top-64 support, which
+**The ``E`` truncation stops being a problem rather than being solved.** An
+earlier draft recomputed the legality mask and re-derived the top-``E`` support, which
 cannot be done correctly — the search truncated with the *generating* weights and the
 training path only has the *current* ones, and the two disagreed within eight
 generations of a smoke run, on ``r6r/1ppq1kpp/5n2/2n1pbP1/7P/1P1P1N2/PpP1PK2/2R2Q1R
-b - - 1 1``, where the search kept ``b2b1=N`` and a recomputed top-64 dropped it.
+b - - 1 1``, where the search kept ``b2b1=N`` and a recomputed top-``E`` dropped it.
 Reading the support out of the record makes the question disappear: the stored edges
 *are* the support, exactly, by construction, whichever weights chose them.
 
-⚠️ The residual difference from AZ is that on a position with more than 64 legal moves
-the denominator is the search's 64 rather than every legal move, which is what AZ
+⚠️ The residual difference from AZ is that on a position with more legal moves than the
+cap the denominator is the search's support rather than every legal move, which is what AZ
 Methods renormalises over. Softmax is consistent under restriction, so training the
 distribution the search actually consumes is coherent; it is recorded in
 [`fidelity.md`](fidelity.md) §4.2(i) as ours and not the paper's.
@@ -79,8 +79,8 @@ class TrainBatch:
     board: torch.Tensor        # [N, 32] int16
     control: torch.Tensor      # [N]     int16
     rep: torch.Tensor          # [N]     uint8
-    policy_move: torch.Tensor  # [N, 64] int16, spec §3 labels
-    policy_prob: torch.Tensor  # [N, 64] float16, pi = N(a)/n
+    policy_move: torch.Tensor  # [N, K_POLICY] int16, spec §3 labels
+    policy_prob: torch.Tensor  # [N, K_POLICY] float16, pi = N(a)/n
     policy_len: torch.Tensor   # [N]     uint8
     value: torch.Tensor        # [N]     float32, z in {-1, 0, +1}
     weight_gen: torch.Tensor   # [N]     int32, for the staleness counter of §11
@@ -143,8 +143,8 @@ def edge_logits(policy_logits: torch.Tensor, promo_logits: torch.Tensor,
     plus ``log_softmax(promo)[k]``, so one softmax over the edges normalises both
     ``P(target | piece)`` and ``P(type | piece)`` at once.
 
-    A gather over ``K <= 64`` edges rather than a mask over all 8192 labels, because
-    the record carries the support (§3.5). At ``N = 1024`` that is a ``[1024, 64]``
+    A gather over ``K <= K_POLICY`` edges rather than a mask over all 8192 labels, because
+    the record carries the support (§3.5). At ``N = 1024`` that is a ``[1024, 96]``
     tensor where the masked form built two ``[1024, 8192]`` ones.
     """
     n = boards.shape[0]
@@ -174,7 +174,7 @@ def az_loss(net, batch: TrainBatch, strict: bool = True) -> LossParts:
     policy_logits, promo_logits, value_pred = net(batch.board, batch.control, batch.rep)
 
     # The loss is computed outside autocast on purpose (§8.2): it is a reduction
-    # over <= 64 logits and one position, so bf16 saves nothing measurable and
+    # over <= K_POLICY logits and one position, so bf16 saves nothing measurable and
     # costs precision on the exact quantity being optimised.
     with torch.autocast(device_type=batch.board.device.type, enabled=False):
         k = batch.policy_move.shape[1]

@@ -169,10 +169,10 @@ sum over a *set*, and indexing logits by label is order-free.
 
 Revised 2026-07-31, twice, and the second revision deleted the problem the first one
 was solving. The question is what the softmax denominator runs over when a position
-has more than `E = 64` legal moves and the search kept only 64 of them.
+has more than `E` legal moves and the search kept only `E` of them.
 
 **The first draft said: recompute it.** Rebuild the legality mask with `movegen` and
-re-derive the top-64. **That cannot be done correctly** — the search truncated with the
+re-derive the top-`E`. **That cannot be done correctly** — the search truncated with the
 *generating* weights and the training path holds the *current* ones — and it fails in
 practice, not merely in principle: within eight generations of the first smoke run, on
 
@@ -180,11 +180,11 @@ practice, not merely in principle: within eight generations of the first smoke r
 r6r/1ppq1kpp/5n2/2n1pbP1/7P/1P1P1N2/PpP1PK2/2R2Q1R b - - 1 1
 ```
 
-the search kept `b2b1=N` and a recomputed top-64 dropped it, which turns a stored
+the search kept `b2b1=N` and a recomputed top-`E` dropped it, which turns a stored
 target into an infinite loss.
 
 **The right question is why the training path is recomputing anything at all.** The
-search knew its support exactly. §10's policy arrays are already `E = 64` wide and
+search knew its support exactly. §10's policy arrays are already `E` wide and
 zero-padded, so storing **every edge** rather than only the visited ones — `π = 0`
 where the search never went — costs **zero extra bytes**. `policy_len` becomes the
 root's edge count instead of its visit count and the record is complete.
@@ -197,7 +197,7 @@ direction:
 - the loss touches **no engine**: no `movegen`, no legality mask, no `bitset_to_bool`.
   `az_loss` does not take an `env` argument;
 - it is cheaper by two orders of magnitude in the tensor that dominates it — an
-  `[N, 64]` gather where the masked form built two `[N, 8192]` fp32 tensors;
+  `[N, 96]` gather where the masked form built two `[N, 8192]` fp32 tensors;
 - the canonical enumeration order of `search.md` §6.4 never enters the training path.
   No sort, no `topk`, and no host synchronisation to discover whether a sort was
   needed.
@@ -270,14 +270,20 @@ The record is `search.md` §10, unchanged, produced by
 board       [32] u16    the position searched
 control     i16
 rep         u8          min(rep - 1, 2)
-policy      [64] (u16 move, f16 prob)   the root's WHOLE edge set, pi = 0 where unvisited
+policy      [96] (u16 move, f16 prob)   the root's WHOLE edge set, pi = 0 where unvisited
 policy_len  u8          the root's edge count, NOT its visit count (§3.5)
 value       f32         §4, written when the game ends
 weight_gen  u16         the generation that produced the search
 root_value  f32         reserved, written, trained on by nothing (§4)
 ```
 
-≈ 334 B per position.
+**462 B per position** — `K_POLICY = 96` since 2026-08-02, when `E` moved 64 -> 96
+(`search.md` §4.3). It was 334 B at `K_POLICY = 64`.
+
+⚠️ **A `.dat` written at the old width cannot be read at the new one**, and it would
+not fail loudly on its own: reinterpreting the bytes yields records whose all-zero
+board word decodes as a live white pawn on a1 rather than as an error. `buffer.py`
+therefore checks `RECORD.itemsize` against the file and refuses the mismatch.
 
 ✅ **`root_value` landed 2026-07-31**, and it was C2's one edit into a module it does
 not own: `MoveRecord` in `search/torch_impl.py`, computed in `select_and_advance`, and
@@ -299,7 +305,7 @@ literal AZ figure rather than shrink it: `spec.md` §8 argues that a bounded win
 the *only* thing controlling both the policy staleness and the value bias, so a
 reduction would trade one measured quantity for another.
 
-500,000 games × ~80 plies × 334 B ≈ **13.2 GB**.
+500,000 games × ~80 plies × 462 B ≈ **18.5 GB**.
 
 ⚠️ **The buffer is a memory-mapped file on disk, not a RAM allocation, and that is
 what makes the AZ window affordable.** 15.7 GB of RAM cannot hold it; the access
@@ -308,7 +314,7 @@ pattern does not need RAM to. At ~1.2 optimiser steps/s, sampling 4096 records i
 NVMe would serve regardless. It never occupies VRAM either — micro-batches are staged
 to device from the mapping.
 
-⚠️ **Disk is the resource to check before a long run, not RAM.** 13.2 GB has to be
+⚠️ **Disk is the resource to check before a long run, not RAM.** 18.5 GB has to be
 free, and the loop should refuse to start rather than discover it at generation 40.
 `~80 plies` is an assumption, not a measurement — AZ does not publish its mean game
 length and ours is unmeasured — so **size the file from the measured mean once the
@@ -848,7 +854,7 @@ asked why it was recomputing anything the rollout already knew. It was: `search.
 policy arrays are `E` wide and zero-padded, so storing the root's whole edge set rather
 than only its visited edges costs **no bytes**. The record now carries its own support,
 `az_loss` takes no `env`, the dominant tensor went from two `[N, 8192]` fp32 arrays to
-one `[N, 64]` gather, and the truncation question stops existing. The engine-side
+one `[N, 96]` gather, and the truncation question stops existing. The engine-side
 cross-check the recompute used to provide moves to `audit_labels` on a schedule.
 
 **Implemented 2026-07-31**, `brokefish/train/` and `tests/test_train.py` (33 checks).
@@ -856,7 +862,7 @@ Four things the document said turned out to be wrong or incomplete once they wer
 code, and all four are corrected above rather than annotated:
 
 - **§3.5, the truncation.** The contract asked the training path to reproduce the
-  search's `E = 64` support. It cannot — the search truncated with the generating
+  search's `E` support. It cannot — the search truncated with the generating
   weights — and the disagreement is not theoretical: it fired in the eighth generation
   of the first smoke run. The denominator is now the full legal set, which is AZ's own
   rule, is the coherent choice under softmax restriction, and turns §12 check 3 into an

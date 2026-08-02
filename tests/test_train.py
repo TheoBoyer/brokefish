@@ -43,6 +43,7 @@ from brokefish.train.log import Logger
 from brokefish.train.loop import LR_SCHEDULE, Trainer, TrainConfig
 from brokefish.train.loss import (TrainBatch, audit_labels, az_loss, decode_labels,
                                   edge_logits, is_promotion_edge, weight_decay_for)
+from brokefish.train.buffer import K_POLICY
 from brokefish.train.sync import PackedWeights, weight_fingerprint
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -50,7 +51,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(),
                                 reason="the engine and the search are CUDA-shaped")
 
 # tests/test_search_cuda.py's maximum-mobility position: 218 legal moves for White
-# and no pawns, so the search truncates at E = 64 and the training path does not.
+# and no pawns, so the search truncates at `E` and the training path does not.
 MAX_MOBILITY = "R6R/3Q4/1Q4Q1/4Q3/2Q4Q/Q4Q2/pp1Q4/kBNN1KB1 w - - 0 1"
 
 
@@ -91,7 +92,7 @@ def make_batch(n: int, seed: int = 0, plies: int = 24):
 
     gen = torch.Generator(device=DEVICE).manual_seed(seed)
     net = BrokefishNet().to(DEVICE)
-    search = Search(SearchConfig(n=24, B=n, E=64, eps=0.0), evaluate=make_evaluator(net),
+    search = Search(SearchConfig(n=24, B=n, eps=0.0), evaluate=make_evaluator(net),
                     env=env, device=DEVICE, seed=seed)
     search.reset(boards, control)
     record = search.self_play_move()
@@ -102,7 +103,7 @@ def make_batch(n: int, seed: int = 0, plies: int = 24):
         policy_move=record.policy_move, policy_prob=record.policy_prob,
         policy_len=record.policy_len, value=z,
         weight_gen=torch.zeros(n, dtype=torch.int32, device=DEVICE))
-    assert k <= 64
+    assert k <= K_POLICY
     return batch, record, search
 
 
@@ -331,14 +332,14 @@ def test_the_label_decode_agrees_with_a_live_search():
     """
     net = BrokefishNet().to(DEVICE)
     boards, control, _ = _positions(24, seed=7)
-    search = Search(SearchConfig(n=8, B=24, E=64, eps=0.0), evaluate=make_evaluator(net),
+    search = Search(SearchConfig(n=8, B=24, eps=0.0), evaluate=make_evaluator(net),
                     env=env, device=DEVICE, seed=7)
     search.reset(boards, control)
     search.root_init()
 
     policy, promo, _ = net(search.game_board, search.game_control, search.root_rep)
     ne = search.node_nedges[:, 0].long()
-    valid = torch.arange(64, device=DEVICE)[None, :] < ne[:, None]
+    valid = torch.arange(K_POLICY, device=DEVICE)[None, :] < ne[:, None]
     logit = edge_logits(policy, promo, search.game_board, search.game_control,
                         search.edge_move[:, 0])
     got = torch.log_softmax(
@@ -358,7 +359,7 @@ def test_the_record_carries_the_searchs_own_support():
     net = BrokefishNet().to(DEVICE)
     boards, control, _ = _positions(16, seed=12)
     # `n` well below the edge count, so visited and valid genuinely differ.
-    search = Search(SearchConfig(n=8, B=16, E=64, eps=0.0), evaluate=make_evaluator(net),
+    search = Search(SearchConfig(n=8, B=16, eps=0.0), evaluate=make_evaluator(net),
                     env=env, device=DEVICE, seed=12)
     search.reset(boards, control)
     with torch.no_grad():
@@ -379,27 +380,27 @@ def test_the_record_carries_the_searchs_own_support():
         assert float(record.policy_prob[row, k:].abs().max()) == 0.0
 
 
-def test_a_truncated_position_stores_exactly_the_64_edges_it_searched():
+def test_a_truncated_position_stores_exactly_the_edges_it_searched():
     """The truncation question, dissolved rather than answered.
 
-    On a position with 218 legal moves the search keeps 64. The record now carries
-    those 64, so the training denominator *is* the search's support — no recomputed
-    top-64, no dependence on which weights truncated. `audit_labels` still confirms
+    On a position with 218 legal moves the search keeps `K_POLICY`. The record now
+    carries those, so the training denominator *is* the search's support — no recomputed
+    top-K, no dependence on which weights truncated. `audit_labels` still confirms
     every one of them is legal.
     """
     boards, control = env.from_fen(MAX_MOBILITY)
     boards, control = boards.to(DEVICE), control.to(DEVICE)
     n_legal = int(env.bitset_to_bool(env.movegen(boards, control)[0]).sum())
-    assert n_legal > 64, f"only {n_legal} legal moves, nothing to truncate"
+    assert n_legal > K_POLICY, f"only {n_legal} legal moves, nothing to truncate"
 
     net = BrokefishNet().to(DEVICE)
-    search = Search(SearchConfig(n=96, B=1, E=64, eps=0.0), evaluate=make_evaluator(net),
+    search = Search(SearchConfig(n=96, B=1, eps=0.0), evaluate=make_evaluator(net),
                     env=env, device=DEVICE, seed=8)
     search.reset(boards, control)
     with torch.no_grad():
         record = search.self_play_move()
-    assert int(search.node_nedges[0, 0]) == 64, "the search did not truncate"
-    assert int(record.policy_len[0]) == 64
+    assert int(search.node_nedges[0, 0]) == K_POLICY, "the search did not truncate"
+    assert int(record.policy_len[0]) == K_POLICY
     assert record.policy_move[0].tolist() == search.edge_move[0, 0].tolist()
 
     batch = TrainBatch(
@@ -456,9 +457,13 @@ def _positions(n: int, seed: int, plies: int = 24):
 # §4 and §5, the buffer — checks 5 and 6
 # --------------------------------------------------------------------------- #
 
-def test_the_record_is_334_bytes_and_round_trips():
-    assert RECORD_BYTES == 334
-    assert RECORD.itemsize == 334
+def test_the_record_is_462_bytes_and_round_trips():
+    # 462 = 64 board + 2 control + 1 rep + 1 policy_len + 96*(2+2) policy
+    #       + 4 value + 4 root_value + 2 weight_gen. Written out rather than
+    #       derived, so a silent layout change fails here instead of in a .dat
+    #       whose zeroed bytes decode as a live white pawn on a1.
+    assert RECORD_BYTES == 462
+    assert RECORD.itemsize == 462
     buf = ReplayBuffer(window_games=8, mean_plies=8, seed=0)
     rows = one_game(3, result=1)
     for r in rows:
@@ -469,7 +474,7 @@ def test_the_record_is_334_bytes_and_round_trips():
     assert set(np.array(buf.data[:3]["policy_move"])[:, :4].flatten()) == {1, 2, 3}
     batch = buf.sample(3, device=DEVICE)
     assert batch.board.shape == (3, 32) and batch.board.dtype is torch.int16
-    assert batch.policy_move.shape == (3, 64)
+    assert batch.policy_move.shape == (3, K_POLICY)
     assert batch.policy_prob.dtype is torch.float16
     assert batch.value.dtype is torch.float32
 

@@ -580,7 +580,7 @@ values are not part of the engine-network contract.
 | **Training window** | settled 2026-07-30: **AZ's literal 500,000 games**, uniform over all positions in the window, evicted by game, oldest first. [`training.md`](training.md) §5.2 |
 | **Reuse factor R** | settled 2026-07-30: **65.2 positions sampled per game generated**, derived from AZ's 700,000 × 4,096 steps against 44M games. [`training.md`](training.md) §6 |
 | **Simulations per move** | settled: **`n = 800`, AlphaZero PUCT**, chosen for convergence rather than for throughput. The sweep downward is a C4 measurement. [`search.md`](search.md) §4.4 |
-| **Tree node layout** | settled by C1 and normative there: the node arrays, `E = 64` children per node, and the pool's bump allocator. [`search.md`](search.md) §4.2, §4.3. §6.3 here still owns the hash and the irreversible bit |
+| **Tree node layout** | settled by C1 and normative there: the node arrays, `E = 96` children per node, and the pool's bump allocator. [`search.md`](search.md) §4.2, §4.3. §6.3 here still owns the hash and the irreversible bit |
 | **Learner placement** | settled: **GPU, alternating with self-play**, on 5000 positions/s against 130 on the CPU. Revisit if the sims sweep moves the requirement |
 | **Playout cap randomisation** | **still open.** KataGo decouples the cost of value and policy targets this way, which would turn "sims" into `(n_small, n_large, p_large)` and make positions stop costing the same. Priced as a seam in [`search.md`](search.md) §11, not scheduled |
 

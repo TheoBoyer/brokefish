@@ -42,7 +42,29 @@ namespace brokefish {
 namespace search {
 
 // §4.3. Two edges per lane in the selection scan; see the file header.
-constexpr int kE = 64;
+// §4.3's edge cap. **Raised 64 -> 96 on 2026-08-02.**
+//
+// ⚠️ It is `constexpr` because `puct_argmax` gives each lane a fixed number of
+// edges and walks them with no predicate on the tail: `kEPerLane` below is that
+// number, and it is only uniform if 32 divides `kE`.
+//
+// Why 96. Measured over 80 000 real self-play roots (`t24h-n256`, 2026-08-02): the
+// true candidate count -- legal moves plus three extra per promotion target -- has
+// mean 23.8, p99 58, p99.9 68 and **max 83**. At 64, truncation fired on 0.25 % of
+// roots, and §4.3 drops the *lowest priors*, which is precisely where an unlearned
+// mate sits: roots with a mate available were at the cap 4.8 % of the time against
+// 0.317 % overall, because mates live in wide positions (45.1 mean edges against
+// 23.6). 96 clears the observed maximum with headroom and costs 50 % on the edge
+// arrays (193 -> 289 MB at B = 1024).
+//
+// ⚠️ 96 makes truncation *not happen on anything we have seen*. It does not make it
+// impossible -- chess reaches ~218 legal moves in constructed positions, and the
+// promotion expansion multiplies that. §6.1a's scan therefore counts the case where
+// truncation drops an edge the rules proved terminal, so a position outside this
+// distribution reports itself instead of quietly costing a mate.
+constexpr int kE = 96;
+static_assert(kE % 32 == 0, "puct_argmax walks kE/32 edges per lane with no tail predicate");
+constexpr int kEPerLane = kE / 32;
 constexpr int kWarps = 8;  // warps per block, matching the engine kernels
 
 // §6.6 first-play urgency, and it must equal `FPU_DRAW` in
@@ -170,7 +192,8 @@ __device__ inline int warp_exclusive_scan(int v, int lane, int* total) {
 // ---------------------------------------------------------------------------
 
 // The PUCT argmax over one node's edges. Warp-collective, uniform result; lane
-// `i` owns edges `i` and `i + 32`, which is the whole reason E is 64.
+// `i` owns edges `i`, `i + 32`, ... `i + 32 * (kEPerLane - 1)`, which is the whole
+// reason E is a multiple of 32.
 //
 // `nvis`, `prior` and `qs` are the node's own edge arrays, each of length kE.
 //
@@ -186,7 +209,7 @@ __device__ inline int puct_argmax(const int16_t* nvis, const __half* prior, cons
     // reduction order is free.
     unsigned own = 0;
 #pragma unroll
-    for (int j = 0; j < 2; ++j) {
+    for (int j = 0; j < kEPerLane; ++j) {
         const int e = lane + 32 * j;
         if (e < nedges) own += (unsigned)nvis[e];
     }
@@ -204,7 +227,7 @@ __device__ inline int puct_argmax(const int16_t* nvis, const __half* prior, cons
     float best = -INFINITY;
     int best_e = kE;
 #pragma unroll
-    for (int j = 0; j < 2; ++j) {
+    for (int j = 0; j < kEPerLane; ++j) {
         const int e = lane + 32 * j;
         if (e >= nedges) continue;
         const float n = (float)nvis[e];

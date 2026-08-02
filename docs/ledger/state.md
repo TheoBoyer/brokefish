@@ -253,7 +253,7 @@ and is not. Deleting one because it looks obvious is how it gets made again.
   hundred. Everything else, `edge_Q` and `node_value` included, is exact.
   `search.md` §12.3 has the margin table and which runs are guaranteed rather
   than empirical.
-  ⚠️ `E = 64` is compile-time (§6.6's scan is two edges per lane), `B` and `Nmax`
+  ⚠️ `E = 96` is compile-time (§6.6's scan is `kE/32` edges per lane), `B` and `Nmax`
   runtime. Changing `E` means editing `kE` in `csrc/search.cuh`.
   ⚠️ **The card throttles harder here than in any earlier benchmark**: 1230-1290 MHz
   at 82 °C through a 57-second move, so the same encoder call reads 59.9k inside the
@@ -547,7 +547,7 @@ and is not. Deleting one because it looks obvious is how it gets made again.
   recomputed `movegen` at training time to rediscover a support the search already knew,
   and rejected storing it on an arithmetic that was simply wrong.
   Consequences: `az_loss` takes no `env`; the dominant tensor went from two `[N, 8192]`
-  fp32 arrays to one `[N, 64]` gather; the `E = 64` truncation question disappears
+  fp32 arrays to one `[N, 96]` gather; the `E` truncation question disappears
   rather than being answered — it could not be answered, since the search truncated with
   the *generating* weights and training holds the *current* ones, and the two disagreed
   in the eighth generation of the first smoke run. The engine-side cross-check moves to

@@ -1,7 +1,7 @@
 """The replay buffer of ``docs/train.md`` §5.
 
 The most recent 500,000 games, sampled uniformly at random over all positions in
-them (AGZ Methods, Optimisation, inherited by AZ). At ~80 plies and 334 B per
+them (AGZ Methods, Optimisation, inherited by AZ). At ~80 plies and 462 B per
 record that is **13.2 GB**, which is why the store is a memory-mapped file rather
 than a host allocation: 15.7 GB of RAM cannot hold it and the access pattern never
 needed it to. One optimiser step draws 4096 records at ~1.2 steps/s, so the load is
@@ -45,20 +45,30 @@ import torch
 from .loss import TrainBatch
 
 # §5.1. The offsets are packed rather than aligned so the record is exactly the
-# 334 B the document sizes the window from; numpy handles the unaligned f4 fields
+# 462 B the document sizes the window from; numpy handles the unaligned f4 fields
 # by copying, and this is a random-read workload where the byte count is what costs.
+# §5.1's policy width. **Raised 64 -> 96 on 2026-08-02, with `search.cuh`'s `kE`.**
+#
+# ⚠️ The two must move together. `training.md` §3.5 makes the record hold the root's
+# *whole* edge set -- that is what lets the loss stop recomputing `movegen` to
+# rediscover a support the search already knew -- and the claim is only literally
+# true while `K_POLICY == E`. A narrower record would silently truncate the softmax
+# denominator on exactly the wide roots where §4.3 already bites.
+K_POLICY = 96
+
 RECORD = np.dtype({
     "names": ["board", "control", "rep", "policy_len", "policy_move", "policy_prob",
               "value", "root_value", "weight_gen"],
-    "formats": [("<i2", 32), "<i2", "u1", "u1", ("<i2", 64), ("<f2", 64),
+    "formats": [("<i2", 32), "<i2", "u1", "u1", ("<i2", K_POLICY), ("<f2", K_POLICY),
                 "<f4", "<f4", "<u2"],
-    "offsets": [0, 64, 66, 67, 68, 196, 324, 328, 332],
-    "itemsize": 334,
+    "offsets": [0, 64, 66, 67, 68, 68 + 2 * K_POLICY, 68 + 4 * K_POLICY,
+                72 + 4 * K_POLICY, 76 + 4 * K_POLICY],
+    "itemsize": 78 + 4 * K_POLICY,
 })
 RECORD_BYTES = RECORD.itemsize
-assert RECORD_BYTES == 334, RECORD_BYTES
-
-K_POLICY = 64
+assert RECORD_BYTES == 462, RECORD_BYTES
+# `policy_len` is `u1`, so the width may never exceed 255.
+assert K_POLICY <= 255, K_POLICY
 
 
 @dataclass
@@ -105,6 +115,17 @@ class ReplayBuffer:
                     f"filesystem has {free / 2**30:.1f} GiB free. Free space, or lower "
                     f"--window-games / --mean-plies (train.md §5.2)")
             mode = "r+" if (resume and exists) else "w+"
+            # ⚠️ A file written at a different `K_POLICY` has a different itemsize, and
+            # `np.memmap` would happily reinterpret it: every field would land at the
+            # wrong offset and a misparsed record decodes as *a live white pawn on a1*
+            # rather than as an error (`CLAUDE.md`). So the size is checked, and an old
+            # buffer refuses instead of poisoning a run with plausible garbage.
+            if exists and os.path.getsize(path) % RECORD_BYTES:
+                raise RuntimeError(
+                    f"{path} is {os.path.getsize(path)} bytes, not a multiple of this "
+                    f"build's {RECORD_BYTES}-byte record (K_POLICY = {K_POLICY}). It "
+                    f"was written by a different edge cap; delete it and let the run "
+                    f"start a fresh buffer.")
             self.data = np.memmap(path, dtype=RECORD, mode=mode, shape=(self.capacity,))
 
         # The ring of completed games. `+1` so a full ring is distinguishable from

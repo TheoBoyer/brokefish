@@ -34,7 +34,7 @@ import torch
 
 from brokefish.env import cuda_impl as env
 from brokefish.search import SearchConfig, search_impl
-from brokefish.search.cuda_impl import TREE_FIELDS
+from brokefish.search.cuda_impl import _ext, TREE_FIELDS
 from brokefish.search.torch_impl import FPU_DRAW, TERMINAL, Search as RefSearch
 from tests.boards import random_positions
 from tests.oracle import batched_eval
@@ -180,7 +180,10 @@ def _pair(boards, control, n, eps=0.0, seed=11, stats=False, tau_plies=30):
     having to switch the noise off.
     """
     B = boards.shape[0]
-    cfg = SearchConfig(n=n, B=B, E=64, eps=eps, tau_plies=tau_plies)
+    # E follows the kernel's compile-time `kE`; pinning a literal here would make
+    # every CUDA test fail the moment the cap moves, which is noise rather than a
+    # signal -- `cuda_impl` already refuses a mismatch on construction.
+    cfg = SearchConfig(n=n, B=B, E=int(_ext().edge_cap()), eps=eps, tau_plies=tau_plies)
     ref = Recording(cfg, hash_eval, env=env, device="cuda", seed=seed)
     cu = search_impl("cuda")(cfg, hash_eval, env=env, device="cuda", seed=seed,
                              collect_stats=stats)
@@ -540,11 +543,12 @@ def test_agrees_under_truncation():
     boards, control = _from_fen(MAX_MOBILITY, copies=4)
     mask, _ = env.movegen(boards, control)
     n_moves = int(env.bitset_to_bool(mask)[0].sum())
-    assert n_moves > 64, f"only {n_moves} legal moves, nothing to truncate"
+    cap = int(_ext().edge_cap())
+    assert n_moves > cap, f"only {n_moves} legal moves, nothing to truncate at E = {cap}"
 
     ref, cu, probe = _pair(boards, control, n=96, eps=0.0, stats=True)
     _run(ref, cu, prior_ulps=0.0, label="truncation ")
-    assert int(cu.node_nedges[0, 0]) == 64
+    assert int(cu.node_nedges[0, 0]) == cap
     counters = cu.device_counters()
     assert counters["truncated_nodes"] > 0
     assert counters["max_edges"] >= n_moves
@@ -563,16 +567,18 @@ def test_the_counters_match_the_reference_stats():
     _run(ref, cu, moves=2, label="counters ")
     got = cu.device_counters()
     want = ref.stats.snapshot()
-    pairs = [("simulations", "simulations"), ("max_edges", "max_edges"),
-             ("truncated_nodes", "n_truncated"), ("max_depth", "max_depth"),
-             ("max_nodes", "max_nodes_used"),
-             ("terminal_descents", "n_terminal_descents"),
-             ("terminal_children", "n_terminal_children"),
-             ("empty_mask_expansions", "n_empty_mask_expansions"),
-             ("depth_p50", "depth_p50"), ("depth_p99", "depth_p99")]
-    for mine, theirs in pairs:
+    # The mapping now lives in `cuda_impl` -- `train/loop.py` needs it too, and a
+    # second copy is how the two blocks drift apart.
+    from brokefish.search.cuda_impl import COUNTER_ALIASES
+    for mine, theirs in COUNTER_ALIASES.items():
         assert got[mine] == want[theirs], \
             f"counter {mine} = {got[mine]}, reference {theirs} = {want[theirs]}"
+    # And the merged view must carry no zero where the kernel measured something.
+    merged = cu.stats_snapshot()
+    for _device_name, canonical in COUNTER_ALIASES.items():
+        assert merged[canonical] == want[canonical], (
+            f"stats_snapshot left {canonical} at the unwritten torch value "
+            f"{merged[canonical]} instead of the kernel's {want[canonical]}")
     assert got["pool_overflow"] == 0 and got["depth_overflow"] == 0
 
 

@@ -217,8 +217,26 @@ class AZNode:
         self.value_sum = 0.0
 
     def q(self) -> float:
-        """AGZ: `Q = W / N`. Zero for an unvisited edge, which is AGZ's `Q(s_L,a) = 0`."""
-        return 0.0 if self.visits == 0 else self.value_sum / self.visits
+        """AGZ: `Q = W / N`. `FPU_DRAW` for an unvisited edge -- see `FPU_DRAW` below."""
+        return FPU_DRAW if self.visits == 0 else self.value_sum / self.visits
+
+
+# §6.6's first-play urgency, transcribed the same way the reference reads it.
+#
+# ⚠️ **0.5, not AGZ's literal 0** (corrected 2026-08-02). AGZ initialises an untried
+# move to `Q(s_L, a) = 0` and AGZ's values live in `[-1, 1]`, so that zero is a
+# *draw*. This transcription -- like the reference -- works in `[0, 1]` (§3.5), where
+# a draw is 0.5, so carrying the literal 0 across makes an untried move score as a
+# certain **loss**. That is not a faithful transcription of AGZ; it is AGZ's constant
+# read in the wrong units, and it is the bug that cost run `c2-8h`
+# (`journal/2026-07-31-value-collapse.md`).
+#
+# ⚠️ This file's whole purpose is to be *independent* of `search/torch_impl.py`, so
+# the value is restated here rather than imported: a shared constant would make the
+# two agree by construction, which is exactly what the comparison must not do.
+# `tests/test_oracle.py::test_the_two_fpu_constants_agree` pins them together instead,
+# so a future change to one is caught rather than silently followed.
+FPU_DRAW = 0.5
 
 
 class AZSearch:
@@ -368,9 +386,9 @@ class AZSearch:
         for i, child in enumerate(node.children):
             u = common * node.priors[i] / (visits[i] + 1.0)
             # The read-time flip: `child.q()` is in the child's mover's frame and the
-            # player choosing here is the other one. An unvisited edge scores 0,
-            # which is AGZ's `Q(s_L,a) = 0` initialisation.
-            q = 0.0 if child is None or child.visits == 0 else 1.0 - child.q()
+            # player choosing here is the other one. An unvisited edge scores
+            # `FPU_DRAW`, and 0.5 is its own complement so the flip is a no-op there.
+            q = FPU_DRAW if child is None or child.visits == 0 else 1.0 - child.q()
             score = u + q
             if score > best_score:
                 runner, best_score, best = best_score, score, i
@@ -571,7 +589,8 @@ def differences(search, row: int, oracle: AZSearch, atol_q: float = 1e-6,
                 diffs.append(f"{at} edge {e}: N {got_n} vs {want_n}")
             # The parity, read the other way round: per-edge Q at the parent has to
             # equal one minus the per-node mean at the child.
-            want_q = 0.0 if child is None or child.visits == 0 else 1.0 - child.q()
+            want_q = (0.0 if child is None or child.visits == 0
+                      else 1.0 - child.q())   # an *edge* with no child has Q = 0 stored
             got_q = float(search.edge_Q[row, i, e])
             if abs(got_q - want_q) > atol_q:
                 diffs.append(f"{at} edge {e}: Q {got_q:.6f} vs {want_q:.6f}")

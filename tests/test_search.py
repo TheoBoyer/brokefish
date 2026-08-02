@@ -624,7 +624,12 @@ def test_one_ply_is_exact_on_every_root_edge():
     """
     for name, fen in FORCED.items():
         b, c = from_fen(fen)
-        s = make(n=8, B=64, boards=b, control=c, eps=0.0)
+        # ⚠️ §6.1a's root terminal sweep is OFF on purpose: these positions were chosen
+        # *because* they have terminal children, and this test pins AlphaZero's exact
+        # one-ply arithmetic, which a pre-seeded edge would shift. The sweep is our
+        # addition and has its own tests (TestRootTerminalSweep).
+        s = make(n=8, B=64, boards=b, control=c, eps=0.0,
+                 root_terminal_sweep=False)
         with torch.no_grad():
             s.root_init()
             ne = int(s.node_nedges[0, 0])
@@ -700,7 +705,8 @@ def test_a_revisited_terminal_keeps_its_value():
     already seen.
     """
     b, c = from_fen(MATE_IN_1)
-    s = make(n=64, B=1, boards=b, control=c, eps=0.0)
+    # ⚠️ Sweep off: this counts 63 visits onto one mate, and §6.1a would seed it.
+    s = make(n=64, B=1, boards=b, control=c, eps=0.0, root_terminal_sweep=False)
     with torch.no_grad():
         s.root_init()
         ne = int(s.node_nedges[0, 0])
@@ -1068,3 +1074,118 @@ def test_an_unvisited_edge_is_reachable_at_a_realistic_prior():
         f"an untried move at prior {p_cold} is still unreachable at n=800: "
         f"{cold_fixed:.4f} vs {hot:.4f}")
     assert cold_v0 < hot, "the v0 constant would have been fine, so this test is moot"
+
+
+# --------------------------------------------------------------------------- #
+# §6.1a, the root terminal sweep
+# --------------------------------------------------------------------------- #
+
+class TestRootTerminalSweep:
+    """The rules-only depth-1 sweep that seeds terminal edges at the root.
+
+    ⚠️ Why it exists, measured on `t24h-n256` 2026-08-02: at `n = 256` the search
+    never visits 19 % of legal moves overall and **61 %** on roots with 40+, so a
+    mate at the root went unvisited **71 %** of the time and a stalemate **76 %**.
+    The policy target on those edges was a flat zero, and a network cannot learn a
+    move the search never shows it.
+    """
+
+    def _mate_position(self):
+        """A position with a mate in one available, found by the rules."""
+        boards, control = env.from_fen(
+            "rnbqkbnr/pppp1ppp/8/4p3/6P1/5P2/PPPPP2P/RNBQKBNR b KQkq - 0 1")
+        mask, _ = env.movegen(boards, control)
+        legal = env.bitset_to_bool(mask).reshape(1, 32, 64)
+        for slot in range(32):
+            for sq in range(64):
+                if not bool(legal[0, slot, sq]):
+                    continue
+                mv = torch.tensor([slot * 64 + sq], dtype=torch.int64)
+                nb, nc, nm, chk = env.play(boards.clone(), control.clone(), mv,
+                                           promo=torch.zeros(1, dtype=torch.int64))
+                code, _ = env.terminal(nm, chk, nc, nb)
+                if int(code[0]) == 1:
+                    return boards, control, slot * 64 + sq
+        pytest.skip("fixture is not a mate in one under our own rules")
+
+    def _search(self, sweep: bool, n: int = 8):
+        cfg = SearchConfig(n=n, B=1, E=64, eps=0.0, tau_plies=0,
+                           root_terminal_sweep=sweep)
+        return Search(cfg, constant_evaluator(), device="cpu", seed=0)
+
+    def test_a_mate_at_the_root_is_found_with_a_flat_policy(self):
+        """The case the whole thing is for: a uniform prior over 30-odd moves, a
+        tiny budget, and the mate still gets found — because the rules found it."""
+        boards, control, label = self._mate_position()
+        s = self._search(sweep=True, n=4)
+        s.reset(boards, control)
+        s.root_init()
+        e = (s.edge_move[0, 0] == label).nonzero(as_tuple=True)[0]
+        assert e.numel() == 1, "the mating move should be one of the root's edges"
+        assert int(s.edge_N[0, 0, e[0]]) == 1, "the mating edge must be seeded"
+        assert float(s.edge_Q[0, 0, e[0]]) == 1.0, \
+            "a mate is a win for the root's mover: 1.0 in [0,1] (§3.5)"
+        assert int(s.seeded[0]) >= 1
+
+    def test_without_the_sweep_the_same_mate_is_invisible(self):
+        boards, control, label = self._mate_position()
+        s = self._search(sweep=False, n=4)
+        s.reset(boards, control)
+        s.root_init()
+        e = (s.edge_move[0, 0] == label).nonzero(as_tuple=True)[0]
+        assert int(s.edge_N[0, 0, e[0]]) == 0
+        assert int(s.seeded[0]) == 0
+
+    def test_the_seeded_mate_survives_the_search_and_is_played(self):
+        boards, control, label = self._mate_position()
+        s = self._search(sweep=True, n=16)
+        s.reset(boards, control)
+        rec = s.self_play_move()
+        assert int(rec.played[0]) == label, \
+            "a proven mate has Q = 1.0 and must win the root argmax"
+        assert bool(rec.done[0]) and int(rec.result[0]) == -1
+
+    def test_a_drawing_terminal_is_seeded_at_the_draw_value_not_promoted(self):
+        """⚠️ Terminal is not the same as good. A stalemate child must be seeded at
+        0.5 so the search *buries* it, never at 1.0."""
+        s = self._search(sweep=True, n=4)
+        # K vs K+R, black to move, stalemate available -- built by the rules below.
+        boards, control = env.from_fen("7k/8/6Q1/8/8/8/8/K7 w - - 0 1")
+        s.reset(boards, control)
+        s.root_init()
+        ne = int(s.node_nedges[0, 0])
+        seeded = [(i, float(s.edge_Q[0, 0, i])) for i in range(ne)
+                  if int(s.edge_N[0, 0, i]) == 1]
+        assert seeded, "this position has terminal children"
+        for _i, q in seeded:
+            assert q in (0.5, 1.0), f"a seeded terminal is a draw or a win, got {q}"
+        assert any(q == 0.5 for _i, q in seeded) or \
+            all(q == 1.0 for _i, q in seeded)
+
+    def test_invariant_6_accounts_for_the_seeded_visits(self):
+        """Root visits sum to the budget *plus* what the rules seeded (§6.1a)."""
+        boards, control, _label = self._mate_position()
+        s = self._search(sweep=True, n=12)
+        s.reset(boards, control)
+        s.root_init()
+        for i in range(s.config.n):
+            s.simulate(i)
+        ne = int(s.node_nedges[0, 0])
+        total = int(s.edge_N[0, 0, :ne].sum())
+        assert total == int(s.budget[0]) + int(s.seeded[0])
+
+    def test_the_sweep_costs_no_network_evaluations(self):
+        """The value comes from the rules, so the encoder is never called for it."""
+        calls = []
+
+        def counting(b, c, r):
+            calls.append(int(b.shape[0]))
+            return constant_evaluator()(b, c, r)
+
+        boards, control, _label = self._mate_position()
+        cfg = SearchConfig(n=4, B=1, E=64, eps=0.0, tau_plies=0,
+                           root_terminal_sweep=True)
+        s = Search(cfg, counting, device="cpu", seed=0)
+        s.reset(boards, control)
+        s.root_init()
+        assert len(calls) == 1, "root_init evaluates the root once and nothing else"

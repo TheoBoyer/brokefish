@@ -365,10 +365,14 @@ chase, and Gate 1a will say whether the argument holds.
 There is no stored legality mask. Expansion converts the mask into edges and the
 edges carry it from then on.
 
-### 4.3 Why `E = 64`
+### 4.3 Why `E = 96`
 
-Measured over the 10 000 positions of `data/cuda_testset`, which come from random
-legal playouts, counting a promotion as four edges:
+**64 until 2026-08-02, then 96.** Both the original bet and the reason it lost are
+kept here, because the way it lost is the interesting part: the histogram was right
+and the decision was still wrong.
+
+The original measurement, over the 10 000 positions of `data/cuda_testset`, which
+come from random legal playouts, counting a promotion as four edges:
 
 | statistic | edges |
 |---|---|
@@ -379,20 +383,44 @@ legal playouts, counting a promotion as four edges:
 | max | 65 |
 | fraction above 64 | 0.01 % |
 
-Three reasons for 64 rather than 48 or 128. The measured tail puts truncation at
-one position in 10⁴. A warp has 32 lanes, so 64 edges is exactly two per lane in
-the selection scan with no predicate on the second pass. And the edge arrays are 90 %
-of a node, so 128 would nearly double the tree, from 2.81 GB to 5.34 GB at the
-sizing of §4.4, to cover a range the histogram says is empty.
+Three reasons for 64 rather than 48 or 128. The measured tail put truncation at one
+position in 10⁴. A warp has 32 lanes, so 64 edges is exactly two per lane in the
+selection scan with no predicate on the second pass. And the edge arrays are 90 % of
+a node, so 128 would nearly double the tree, from 2.81 GB to 5.34 GB at the sizing
+of §4.4, to cover a range the histogram says is empty.
 
-⚠️ The distribution above was measured on random playouts and the policy that
-generates positions changes for the whole run, so `E = 64` is a bet on a moving
-distribution. §15.1 is the monitoring that keeps it a bet rather than an assumption.
+**What the bet missed: truncation is not uniform over the positions that matter.**
+Re-measured on 2026-08-02 over 80 000 roots from the trained `t24h-n256` policy —
+mean 23.8, p99 58, p99.9 68, max 83, and 0 % above 96, so the *aggregate* histogram
+had if anything moved the right way. But conditioning on the roots where a forced
+mate exists:
 
-⚠️ Playouts under-represent open middlegames and the constructed maximum in chess
-is 218, so treat 0.01 % as a floor. Truncation is therefore **counted at runtime**
-and the count is reported with every self-play phase. If it rises, §11 has the
-evolution.
+| | all roots | roots with a mate available |
+|---|---|---|
+| mean edges | 23.6 | 45.1 |
+| expansions at the cap | 0.317 % | 4.80 % |
+
+Mating positions are exactly the wide ones — the losing king is in the open, and the
+attacker's queen and rooks have their full mobility. So the 0.317 % aggregate rate
+was hiding a **15× higher** truncation rate on the one class of node where dropping
+an edge is not a small loss of precision but the loss of a *proved win*. A cap chosen
+against the mean was being applied to the tail that carries the signal.
+
+96 rather than 128: 96 = 3 × 32 is still exactly `kE/32` edges per lane with no tail
+predicate (the scan is written as `kEPerLane` and `static_assert`s `kE % 32 == 0`),
+it clears the measured max of 83 with margin, and it costs 1.5× the tree rather than
+2×. 128 would have bought nothing the histogram says is occupied.
+
+⚠️ The distribution is still measured on a policy that changes for the whole run, so
+`E = 96` remains a bet on a moving distribution. §15.1 is the monitoring that keeps
+it a bet rather than an assumption.
+
+⚠️ Playouts under-represent open middlegames and the constructed maximum in chess is
+218, so treat any measured fraction as a floor. Truncation is therefore **counted at
+runtime** and the count is reported with every self-play phase — `truncated_nodes`
+and `truncated_mass` generally, plus `terminals_truncated`, which counts the strictly
+worse event of the cap dropping an edge the rules had already proved terminal. If
+they rise, §11 has the evolution.
 
 Truncating by prior rank stays inside the training boundary, since the ordering
 comes from the learned policy and carries no chess opinion. What it costs is
@@ -839,7 +867,7 @@ against the reference's gather is what catches a wrong repetition count, which i
 otherwise invisible in the tree until it changes the evaluator's output several
 simulations later.
 
-⚠️ **`E = 64` is compile-time and `B` and `Nmax` are runtime.** §6.6's scan is then
+⚠️ **`E = 96` is compile-time and `B` and `Nmax` are runtime.** §6.6's scan is then
 exactly two edges per lane with no predicate on the second pass, and §12's harness
 still runs at `B = 8`.
 
@@ -907,7 +935,8 @@ cannot reproduce (`training.md` §3.5). The array is `E` wide and zero-padded ei
 so this costs **no bytes at all** — which is why the earlier `[min(E, n)]` width, and
 the "at most `min(E, n)` nonzero entries" reasoning behind it, was a false economy.
 
-A record is 64 + 2 + 1 + 128 + 128 + 1 + 4 + 2 + 4 = **334 B** independently of `n`.
+A record is 64 + 2 + 1 + 192 + 192 + 1 + 4 + 2 + 4 = **462 B** independently of `n`
+(the two 192s are `E = 96` moves at u16 and `E = 96` probabilities at f16).
 
 `value` is the final game outcome from the point of view of the side to move in
 `board`, in `[-1, 1]`. It is written when the game terminates, so a record is
@@ -1295,7 +1324,7 @@ read once per generation, so nothing here costs a host synchronisation.
 
 | statistic | why | what it means if it moves |
 |---|---|---|
-| `max_edges` over all expanded nodes | the `E = 64` bet of §4.3 | a trained policy steers into different position types, and open middlegames carry more legal moves than the random playouts `E` was measured on |
+| `max_edges` over all expanded nodes | the `E = 96` bet of §4.3 | a trained policy steers into different position types, and open middlegames carry more legal moves than the random playouts `E` was measured on |
 | `n_truncated` nodes, and the sum of prior mass discarded | the cost of the bet, not just its frequency | the mass matters more than the count: truncating 66 moves whose tail holds 0.1 % of the prior is harmless, truncating one that holds 20 % is not |
 | `max_depth`, plus p50 and p99 | descent is the one irreducibly serial walk (§4.2) and its latency is proportional to depth | a sharpening policy concentrates visits and deepens trees, so this grows over a run and is the term that would invalidate [the tree-cost prediction](../ledger/perf.md#how-much-the-tree-is-likely-to-cost) |
 | `max_nodes_used` and the mean pool fill | `Nmax = n + 1` is exact, so the interesting quantity is the shortfall | a low fill means many descents ended at terminal nodes, which is wasted encoder batch (§6.3) |

@@ -72,7 +72,13 @@ class TrainConfig:
     # -- the search, mcts.md §4.1
     n_sims: int = 800
     batch_games: int = 4096
-    e_cap: int = 64
+    # Must equal `kE` in `csrc/search.cuh` -- the CUDA search refuses a mismatch
+    # on construction, since the cap is a compile-time constant there. Raised
+    # 64 -> 96 on 2026-08-02: over 80k measured roots the true candidate count
+    # was mean 23.8 / p99 58 / max 83, but *mate* roots averaged 45.1 edges and
+    # hit the old cap 15x more often than average, so truncation was dropping
+    # proved wins. `K_POLICY` in `train/buffer.py` follows it.
+    e_cap: int = 96
     tau_plies: int = 30
     eps: float = 0.25
     alpha: float = 0.3
@@ -407,9 +413,14 @@ class Trainer:
         self.seconds["self_play"] += dt
         self.games_completed += closed
 
-        stats = dict(self.search.stats.snapshot())
-        if cfg.collect_search_stats and hasattr(self.search, "device_counters"):
-            stats.update(self.search.device_counters())
+        # ⚠️ `stats_snapshot` rather than `snapshot() | device_counters()`: the two
+        # blocks name the same quantities differently, so merging them left the
+        # kernel's live value *and* an unwritten torch field reading zero in the same
+        # record. See `cuda_impl.COUNTER_ALIASES`.
+        if cfg.collect_search_stats and hasattr(self.search, "stats_snapshot"):
+            stats = dict(self.search.stats_snapshot())
+        else:
+            stats = dict(self.search.stats.snapshot())
         stats["games_capped"] = self.games_capped
         stats["seconds"] = dt
         stats["moves"] = moves

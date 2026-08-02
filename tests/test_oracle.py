@@ -68,7 +68,14 @@ def _run_both(n=64, E=64, eps=0.0, noise=None, rings=None):
     boards = torch.cat([b for b, _ in pairs])
     control = torch.cat([c for _, c in pairs])
 
-    cfg = SearchConfig(n=n, B=B, E=E, eps=eps, tau_plies=0)
+    # ⚠️ §6.1a's root terminal sweep is OFF here, and must stay off. This suite's
+    # whole value is that `tests/oracle.py` is an *independent transcription of
+    # AGZ* -- the strongest evidence in the project that our search is a correct
+    # reproduction (`journal/2026-07-30-fidelity.md`). The sweep is a documented
+    # deviation with no AlphaZero analogue, so comparing a swept search against
+    # the oracle would only ever prove that the deviation exists.
+    cfg = SearchConfig(n=n, B=B, E=E, eps=eps, tau_plies=0,
+                       root_terminal_sweep=False)
     search = Search(cfg, evaluate=batched_eval, device=DEVICE, seed=0)
     if noise is not None:
         search.dirichlet = lambda valid: torch.where(
@@ -323,3 +330,23 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def test_the_two_fpu_constants_agree():
+    """The oracle restates `FPU_DRAW` rather than importing it — so pin them here.
+
+    ⚠️ `tests/oracle.py` is only worth having because it is an *independent*
+    transcription: if it imported the reference's constants the comparison would
+    agree by construction. The cost of that independence is that a change to one
+    can silently walk away from the other, which is exactly what happened when the
+    reference moved to 0.5 and this file stayed at AGZ's literal 0 — the suite went
+    red and stayed red, and `journal/2026-07-30-fidelity.md` went on citing it as
+    ~99 % evidence that the reference implements `search.md`. This test is the
+    cheap thing that would have caught it.
+    """
+    from brokefish.search.torch_impl import FPU_DRAW as reference
+    from tests.oracle import FPU_DRAW as transcription
+
+    assert transcription == reference == 0.5, (
+        "the reference and the AGZ transcription must score an untried move the "
+        "same way; 0.5 is a draw in the [0,1] frame both of them use (§3.5)")

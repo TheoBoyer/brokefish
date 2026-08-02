@@ -60,9 +60,11 @@ export function scores(trace, state, node) {
   pbc *= Math.sqrt(nv);
   return Array.from(n, (ni, i) => {
     const u = (pbc * prior[i]) / (1 + ni);
-    // First-play urgency: an unvisited edge scores 0, which in the [0,1]
-    // convention is a loss. The table shows it blank, not as 0.
-    const qi = ni > 0 ? q[i] : 0;
+    // First-play urgency: an unvisited edge takes 0.5, the draw. In the [0,1]
+    // convention 0 is a certain loss, so scoring it 0 would make every
+    // unexplored move look lost -- `torch_impl.FPU_DRAW`, spec §6.6. The table
+    // still shows it blank, since it is an assumption and not a measured Q.
+    const qi = ni > 0 ? q[i] : 0.5;
     return { u, q: ni > 0 ? q[i] : null, score: u + qi, N: ni, P: prior[i] };
   });
 }

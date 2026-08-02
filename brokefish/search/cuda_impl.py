@@ -72,6 +72,34 @@ def _ext():
     return load_extension("brokefish_search", ["search.cu"])
 
 
+# §15's two counter blocks and the one mapping between them.
+#
+# ⚠️ **`SearchStats` and this device block are two implementations of the same
+# section**, and `tests/test_search_cuda.py::test_the_counters_match_the_reference_stats`
+# proves they agree run for run. What was *not* handled until 2026-08-02 is the
+# merge: `train/loop.py` did `snapshot() | device_counters()`, and because the two
+# name the same quantity differently, the log carried the live device value *and*
+# the torch field beside it -- which on this path is never written and reads a
+# hard zero. `n_terminal_children = 0` next to `terminal_descent_frac = 0.0104`
+# cost two wrong conclusions in one session ("terminals are not detected", "nothing
+# is truncated"), both of them false negatives in the middle of a bug hunt.
+#
+# The mapping lives here rather than in the test that needed it, so there is one copy.
+COUNTER_ALIASES: Dict[str, str] = {
+    "simulations": "simulations",
+    "max_edges": "max_edges",
+    "truncated_nodes": "n_truncated",
+    "truncated_mass": "truncated_prior_mass",
+    "max_depth": "max_depth",
+    "max_nodes": "max_nodes_used",
+    "terminal_descents": "n_terminal_descents",
+    "terminal_children": "n_terminal_children",
+    "empty_mask_expansions": "n_empty_mask_expansions",
+    "depth_p50": "depth_p50",
+    "depth_p99": "depth_p99",
+}
+
+
 class Search(_ref.Search):
     """One batch of `B` games, each with its own tree, searched on device.
 
@@ -89,8 +117,9 @@ class Search(_ref.Search):
         if config.E != cap:
             raise ValueError(
                 f"the kernel is compiled for E = {cap} and got E = {config.E}. E is a "
-                "compile-time constant because §6.6's scan is two edges per lane with no "
-                "predicate on the second pass; change kE in csrc/search.cuh to move it")
+                f"compile-time constant because §6.6's scan gives each lane kE/32 = "
+                f"{cap // 32} edges with no predicate on the tail; change kE in "
+                f"csrc/search.cuh to move it")
         super().__init__(config, evaluate, env=env if env is not None else _cuda_env,
                          device=device, seed=seed, check_invariants=check_invariants)
         if self.device.type != "cuda":
@@ -172,6 +201,33 @@ class Search(_ref.Search):
             out["depth_p99"] = int((cum >= 0.99 * total).to(torch.uint8).argmax())
         return out
 
+    def stats_snapshot(self) -> Dict[str, float]:
+        """§15's block with **one** name per quantity, device values where they exist.
+
+        ⚠️ Use this rather than `stats.snapshot() | device_counters()`. The torch
+        `SearchStats` fields fed by `on_expand` and `on_simulation` are never written
+        on this path -- those two callbacks live in the reference's `_expand` and
+        `simulate`, and this class replaces both with kernels -- so they report zero
+        rather than reporting nothing. Every one of them is aliased below and
+        overwritten with the device counter that actually measured it; the fields
+        `on_move` fills are shared Python and stay as they are.
+
+        `device_counters()` keeps its raw device names: eight test sites and
+        `bench/bench_search.py` read them, and they are the kernel's own vocabulary.
+        """
+        out = dict(self.stats.snapshot())
+        raw = self.device_counters()
+        for device_name, canonical in COUNTER_ALIASES.items():
+            if device_name in raw:
+                out[canonical] = raw[device_name]
+        # Device-only quantities have no torch counterpart to alias onto.
+        for extra in ("pool_overflow", "depth_overflow", "mean_depth", "depth_sum"):
+            if extra in raw:
+                out[extra] = raw[extra]
+        out["terminal_descent_frac"] = raw.get("terminal_descent_frac",
+                                               out.get("terminal_descent_frac", 0.0))
+        return out
+
     @property
     def _ctr(self) -> torch.Tensor:
         return self._counters if self.collect_stats else self._empty
@@ -197,8 +253,21 @@ class Search(_ref.Search):
         _ext().root_init(self._tree, self.game_board, self.game_control, self.game_hash,
                          self.root_rep)
         policy, promo, value = self._evaluate_staged()
+        # §6.1a's rules scan, before expansion. The codes it produces are what
+        # `_seed_terminal_edges` reads afterwards, and what the `must_keep` channel
+        # into `expand` uses so §4.3's truncation cannot drop a proven terminal.
+        self._root_code = self._root_result = None
+        if self.config.root_terminal_sweep:
+            mask, _ = self.env.movegen(self.game_board, self.game_control)
+            self._root_code, self._root_result = self._root_terminal_scan(mask)
         _ext().expand(self._tree, policy, promo, value, *self._tables, self._ctr)
         self._add_exploration_noise()
+        # §6.1a. Inherited from the reference unchanged: it writes `edge_N` and
+        # `edge_Q` in place, and those are the very tensors `self._tree` hands the
+        # kernels, so the descent sees the seeded values without a kernel change.
+        # That is also what keeps the two implementations identical here by
+        # construction rather than by a second transcription.
+        self._seed_terminal_edges()
 
     # -- §6.2 to §6.5 ------------------------------------------------------- #
 

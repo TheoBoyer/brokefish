@@ -79,6 +79,12 @@ PROMO_SHIFT = MOVE_BITS
 # With 0.5 the same network at n = 800 visits 20 of 20.
 FPU_DRAW = 0.5
 
+# §6.1a. Flat (game, edge) pairs swept at once. The repetition ring is 100 int64 per
+# row, so the sweep's peak is ~800 B per pair; 262 144 keeps it around 200 MB even
+# when every game has a full edge set, which is well inside the 8 GB card and still
+# one pass for any batch the training loop uses.
+SWEEP_MAX_ROWS = 262_144
+
 # spec §4.3's codes in index order, so `SearchStats` can report the histogram by
 # name. Built from `env`'s `TERMINAL_NAMES` rather than restated, so there is exactly
 # one place a code is given a name.
@@ -92,12 +98,18 @@ class SearchConfig:
 
     n: int = 800
     B: int = 4096
-    E: int = 64
+    # §4.3's edge cap, raised 64 -> 96 on 2026-08-02; `csrc/search.cuh` carries the
+    # measurement. Must equal the kernel's compile-time `kE`, which `cuda_impl`
+    # checks on construction rather than trusting.
+    E: int = 96
     pb_c_base: float = 19652.0
     pb_c_init: float = 1.25
     alpha: float = 0.3
     eps: float = 0.25
     tau_plies: int = 30
+    # §6.1a. A rules-only depth-1 sweep of the root's edges, seeding the exact value
+    # of every terminal child. See `Search._seed_terminal_edges`.
+    root_terminal_sweep: bool = True
 
     @property
     def n_max(self) -> int:
@@ -233,6 +245,10 @@ class Search:
         # rather than the constant `n`, which is what playout cap randomisation
         # needs and what is awkward to retrofit. In v0 every entry is `n`.
         self.budget = torch.full((B,), c.n, dtype=torch.int32, device=dev)
+        # §6.1a: visits handed to the root's terminal edges by the rules rather than
+        # by a simulation. They cost no network evaluation, so they are *added* to
+        # the budget rather than taken out of it; invariant 6 accounts for them.
+        self.seeded = torch.zeros((B,), dtype=torch.int32, device=dev)
 
         self._b = torch.arange(B, device=dev)
         self._e = torch.arange(E, device=dev)
@@ -317,9 +333,127 @@ class Search:
         mask, _ = self.env.movegen(self.game_board, self.game_control)
         policy, promo, value = self.evaluate(self.game_board, self.game_control, self.root_rep)
 
+        # §6.1a, in the order that matters: scan the *full* legal move set by the
+        # rules, lift any terminal candidate that expansion would truncate away, and
+        # only then expand. A scan after expansion cannot see a move expansion has
+        # already dropped, and the dropped one is the lowest prior -- the unlearned
+        # mate itself.
+        self._root_code = self._root_result = None
+        if self.config.root_terminal_sweep:
+            self._root_code, self._root_result = self._root_terminal_scan(mask)
+
         root = torch.zeros_like(b)
         self._expand(root, mask, torch.ones_like(self.game_done), policy, promo, value)
         self._add_exploration_noise()
+        self._seed_terminal_edges()
+
+    def _root_terminal_scan(self, mask: torch.Tensor) -> torch.Tensor:
+        """`[B, 32, 64, 4]` spec §4.3 code for every legal candidate at the root.
+
+        The rules-only half of §6.1a, run over the **full legality mask** rather than
+        over the edges that survived expansion — which is the whole point of doing it
+        here. `_expand` truncates to the `E` highest priors, and a mate the network
+        has not learned is a *low* prior by definition, so a post-expansion scan
+        cannot see the very moves it exists to find.
+
+        ⚠️ Measured 2026-08-02 on `t24h-n256`: **4.8 % of roots with a mate available
+        sat at the old `E = 64` cap**, against 0.317 % of roots overall — mates live in
+        wide open positions (45.1 mean edges against 23.6), so truncation lands on
+        them 15× more often than on an average position. And the edge it drops is the
+        lowest-prior one, which is exactly the unlearned mate.
+
+        Promotions are scanned per type: a queen promotion can mate where a knight
+        promotion does not.
+        """
+        board, control = self.game_board, self.game_control
+        legal = self.env.bitset_to_bool(mask)                       # [B,32,64]
+        is_promo = self._promotion_targets(board, control) & legal
+        cand = legal[..., None].expand(-1, -1, -1, 4).clone()
+        cand[..., 1:] &= is_promo[..., None]
+        cand &= ~self.game_done[:, None, None, None]
+
+        code = torch.zeros(cand.shape, dtype=torch.uint8, device=self.device)
+        result = torch.zeros(cand.shape, dtype=torch.int8, device=self.device)
+        r, sl, sq, pm = cand.nonzero(as_tuple=True)
+        if r.numel() == 0:
+            return code, result
+        for lo in range(0, r.numel(), SWEEP_MAX_ROWS):
+            rr, ss, qq, pp = (t[lo:lo + SWEEP_MAX_ROWS] for t in (r, sl, sq, pm))
+            nb, nc, hash_, irrev = self.env.step(
+                board[rr], control[rr], ss * 64 + qq, promo=pp, hash=self.game_hash[rr])
+            # The ring records the position being *left*, exactly as §6.7 does, so a
+            # threefold at the child is detected on the same footing as a real move.
+            ring, length = self.env.push_history(
+                self.game_ring[rr], self.game_ring_len[rr], self.game_hash[rr], irrev)
+            m, in_check = self.env.movegen(nb, nc)
+            cd, rs = self.env.terminal(m, in_check, nc, nb, hash_, ring, length)
+            code[rr, ss, qq, pp] = cd
+            result[rr, ss, qq, pp] = rs
+        return code, result
+
+    def _seed_terminal_edges(self) -> None:
+        """§6.1a. Seed the exact value of every terminal root edge — no network, no
+        simulation, and no second replay: the codes come from `_root_terminal_scan`,
+        which ran before expansion.
+
+        ⚠️ **Why this exists, measured on `t24h-n256` 2026-08-02.** At `n = 256` the
+        search never visits **19 % of legal moves overall and 61 % on roots with 40 or
+        more**, so a mate at the root went unvisited **71 %** of the time and a
+        stalemate **76 %**, and the policy target on those edges was a flat zero. A
+        network cannot learn a move the search never shows it, and its own prior is
+        what decides whether the search looks: low prior, no visit, `pi = 0`, prior
+        falls further. The same absorbing state as the FPU bug, one level up.
+
+        ⚠️ **Stronger than KataGo's forced playouts here, and simpler.** Theirs forces
+        `sqrt(k P(c) sum N)` playouts on *noise* moves, "the vast majority of the time
+        bad moves", so it needs a second mechanism — policy target pruning — to
+        subtract them back out of the target. Here the value is exact and
+        rules-derived, so there is nothing to subtract; and the sweep is exhaustive
+        rather than proportional to the prior, where their formula gives a move with
+        `P = 0.001` zero forced playouts at `n = 256` — exactly the move being missed.
+
+        ⚠️ **Terminal is not the same as good.** A stalemate child is terminal and
+        usually catastrophic; it is seeded at 0.5, which buries it. Seeding
+        establishes the value, it never promotes the move. One visit is sufficient
+        and a second would be waste: the value is exact, not an estimate.
+
+        ⚠️ **A deviation from AlphaZero with no analogue there**
+        (`journal/2026-07-30-fidelity.md` §2.2). AZ ran `n = 800` over ~35 legal
+        moves, where coverage is far better than our 16 of 24 at `n = 256`.
+        """
+        self.seeded.zero_()
+        if not self.config.root_terminal_sweep or self._root_code is None:
+            return
+        ne = self.node_nedges[:, 0].long()
+        valid = (self._e[None, :] < ne[:, None]) & ~self.game_done[:, None]
+        rows, edges = valid.nonzero(as_tuple=True)
+        if rows.numel() == 0:
+            return
+        labels = self.edge_move[rows, 0, edges].to(torch.int64)
+        move = labels & ((1 << MOVE_BITS) - 1)
+        slot, square = move // 64, move % 64
+        promo = (labels >> PROMO_SHIFT) & 0b11
+
+        code = self._root_code[rows, slot, square, promo]
+        term = code != 0
+        # Every terminal the rules found, against the terminals that survived §4.3.
+        # A positive difference means the edge cap dropped a proven mate or draw.
+        found = int((self._root_code != 0).sum())
+        kept = int(term.sum())
+        self.stats.terminals_truncated += max(found - kept, 0)
+        if not bool(term.any()):
+            return
+        hr, he = rows[term], edges[term]
+        # `result` is from the point of view of the player to move in the *child*, so
+        # -1 there means the player who just moved delivered mate: a win for the
+        # root's mover, which is 1.0 in the tree's [0, 1] (§3.5). Every other terminal
+        # is a draw at 0.5. Same parity argument as `_backup`'s flip.
+        won = self._root_result[hr, slot[term], square[term], promo[term]] == -1
+        self.edge_N[hr, 0, he] = 1
+        self.edge_Q[hr, 0, he] = torch.where(
+            won, torch.ones_like(won, dtype=torch.float32),
+            torch.full_like(won, 0.5, dtype=torch.float32))
+        self.seeded.index_add_(0, hr, torch.ones_like(hr, dtype=torch.int32))
 
     def _add_exploration_noise(self) -> None:
         """§6.1's Dirichlet mixture over the root's own edges."""
@@ -685,8 +819,13 @@ class Search:
         valid = self._e[None, :] < self.node_nedges[:, 0].long()[:, None]
         nvis = torch.where(valid, nvis, torch.zeros_like(nvis))
         total = nvis.sum(-1, keepdim=True)
-        if self.check_invariants and not bool((total.squeeze(-1) == self.budget).all()):
-            raise AssertionError("invariant 6: root visits do not sum to the budget")
+        # §6.1a's seeded terminal edges are visits the rules paid for rather than the
+        # network, so the root's total is the budget plus however many were seeded.
+        if self.check_invariants and not bool(
+                (total.squeeze(-1) == (self.budget + self.seeded)).all()):
+            raise AssertionError(
+                "invariant 6: root visits do not sum to the budget plus the "
+                "rules-seeded terminal edges (§6.1a)")
         pi = nvis / total
 
         sampled = torch.multinomial(pi, 1, generator=self._gen).squeeze(-1)
@@ -781,6 +920,11 @@ class SearchStats:
         self.saturated_value = 0
         self.value_samples = 0
         self.terminal_codes = torch.zeros(6, dtype=torch.int64, device=dev)
+        # §6.1a's tripwire: expansion truncated away an edge the rules had *proved*
+        # terminal. `kE = 96` clears every position in 80 000 measured roots, but
+        # chess reaches ~218 legal moves in constructed ones, so this says whether
+        # the headroom ever ran out instead of leaving it to a curve to hint at.
+        self.terminals_truncated = 0
         self.game_lengths = []
 
     # -- collection ------------------------------------------------------- #
@@ -858,6 +1002,7 @@ class SearchStats:
             "n_terminal_descents": self.n_terminal_descents,
             "n_terminal_children": self.n_terminal_children,
             "n_empty_mask_expansions": self.n_empty_mask_expansions,
+            "terminals_truncated": self.terminals_truncated,
             # §15.2, whether the search is doing anything
             "mean_root_max_pi": self.root_max_pi / moves,
             "mean_root_entropy": self.root_entropy / moves,
@@ -907,8 +1052,12 @@ def check_invariants(search: Search) -> None:
 
     valid = (torch.arange(c.E, device=search.device)[None, None, :] < nedges[:, :, None])
     visits = torch.where(valid, search.edge_N.long(), torch.zeros_like(nedges)[:, :, None])
-    if not bool((visits[:, 0].sum(-1) == search.budget).all()):
-        raise AssertionError("6: root visits do not sum to the budget")
+    # §6.1a: the rules-seeded terminal edges are visits the environment paid for
+    # rather than the network, so the root's total is the budget plus them.
+    seeded = getattr(search, "seeded", 0)
+    if not bool((visits[:, 0].sum(-1) == (search.budget + seeded)).all()):
+        raise AssertionError("6: root visits do not sum to the budget plus the "
+                             "rules-seeded terminal edges (§6.1a)")
     if bool(((search.edge_N == 0) & (search.edge_child != -1)).any()):
         raise AssertionError("7: an unvisited edge has a child")
 

@@ -27,6 +27,8 @@ Usage, one traced move::
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import hashlib
 import json
 import os
@@ -37,6 +39,7 @@ import torch
 
 from brokefish.env.interop import label_to_move, to_chess_board
 from brokefish.search.torch_impl import (
+    FPU_DRAW,
     MOVE_BITS,
     Search,
     SearchConfig,
@@ -83,6 +86,17 @@ class TracingSearch(Search):
                  kind: str = "search", seed: int = 0, **kw) -> None:
         if config.B != 1:
             raise ValueError(f"the recorder traces one game; got B = {config.B}")
+        # ⚠️ **§6.1a's root terminal sweep is forced off, and this is a known gap.**
+        # `replay()` -- and its untested JavaScript twin in `static/trace.js` --
+        # rebuilds each node's visit counts by accumulating the per-simulation
+        # deltas from zero, so the visits the sweep seeds *before* the first
+        # simulation are invisible to it and the replayed PUCT scores disagree with
+        # what the search actually did. A viewer that silently misrepresents the
+        # search is worse than one that refuses the case, so it refuses: tracing a
+        # swept search needs `replay` to start from the root record's seeded `N`/`Q`
+        # in both implementations, which is owed work (`debugger.md` §4).
+        if config.root_terminal_sweep:
+            config = replace(config, root_terminal_sweep=False)
         super().__init__(config, evaluate, seed=seed, **kw)
         self.stats = _RecordingStats(config.d_max, self.device, self)
         self.seed = seed
@@ -363,7 +377,11 @@ def puct(trace: dict, state: dict, node: int) -> List[float]:
     import math
     pb_c = math.log((n_v + c["pb_c_base"] + 1.0) / c["pb_c_base"]) + c["pb_c_init"]
     pb_c *= math.sqrt(n_v)
-    return [pb_c * prior[i] / (1.0 + n[i]) + (q[i] if n[i] > 0 else 0.0)
+    # First-play urgency. An unvisited edge takes `FPU_DRAW`, not 0: the tree
+    # works in [0, 1], where 0 is a certain loss and would make every unexplored
+    # move look lost. AGZ's literal 0 belongs to its [-1, 1] frame -- the same
+    # slip the oracle carried. §6.6 and `torch_impl._select` agree on 0.5.
+    return [pb_c * prior[i] / (1.0 + n[i]) + (q[i] if n[i] > 0 else FPU_DRAW)
             for i in range(len(n))]
 
 

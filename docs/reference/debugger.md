@@ -323,7 +323,7 @@ everything after simulation 340" visible.
 ### 7.4 Run summary
 
 Not per-`k`. Depth histogram, terminal codes reached, `n_legal` maximum against
-`E = 64`, truncated prior mass, node pool fill against `Nmax`, and whether
+`E`, truncated prior mass, node pool fill against `Nmax`, and whether
 argmax-visits agrees with argmax-`Q` at the root.
 
 That last one earns its place: `edge_Q` lives in [0,1] and PUCT adds it to the
@@ -490,7 +490,7 @@ real state and not just an accumulator. The derived PUCT score of §3 has to pic
 every `k`, the root edge that simulation `k+1` actually took, which is the one check
 that the derive-do-not-store decision does not quietly break the scrubber. And the
 truncation case is asserted where it fires rather than waited for: 218 legal moves
-against `E = 64`, with the dropped mass recorded.
+against `E`, with the dropped mass recorded.
 
 ⚠️ **The viewer's replay is a second implementation and the suite does not run it.**
 `static/trace.js` was checked against `trace.py`'s `replay` and `puct` over three real

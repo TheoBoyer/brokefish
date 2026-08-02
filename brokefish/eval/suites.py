@@ -408,13 +408,13 @@ def score_suite_policy(suite: Suite, net, impl: Optional[str] = None,
             "blunder_rate": wrong / total if total else 0.0}
 
 
-def _policy_argmax(item: Suite, policy: torch.Tensor, promo: torch.Tensor
-                   ) -> torch.Tensor:
-    """The highest-prior legal edge, in the search's own label encoding.
+def _policy_logits(item, policy: torch.Tensor, promo: torch.Tensor) -> torch.Tensor:
+    """`[N, 32*64*4]` scores over every candidate edge, illegal ones at `-inf`.
 
     §6.4's arithmetic, minus the tree: the promotion log-softmax is added to the
-    policy logit so one argmax settles the target square and the promotion type
-    together.
+    policy logit so one ranking settles the target square and the promotion type
+    together. ``item`` needs only ``boards`` and ``control``, so a `PuzzleSet`
+    works here as well as a `Suite`.
     """
     from .probe import promotion_targets
     mask, _ = env.movegen(item.boards, item.control)
@@ -427,8 +427,33 @@ def _policy_argmax(item: Suite, policy: torch.Tensor, promo: torch.Tensor
     logit = policy.float()[..., None].expand(-1, -1, -1, 4).clone()
     logit += torch.where(is_promo[..., None], lp[:, :, None, :], torch.zeros_like(logit))
     logit = torch.where(cand, logit, torch.full_like(logit, float("-inf")))
-    col = logit.reshape(logit.shape[0], -1).argmax(-1)
+    return logit.reshape(logit.shape[0], -1)
+
+
+def _cols_to_labels(col: torch.Tensor) -> torch.Tensor:
+    """Flat candidate index to the search's own label encoding."""
     return ((col // 4) | ((col % 4) << PROMO_SHIFT)).to(torch.int16)
+
+
+def _policy_topk(item, policy: torch.Tensor, promo: torch.Tensor,
+                 k: int = 1) -> torch.Tensor:
+    """`[N, k]` highest-prior legal edges, best first, as spec §3 labels.
+
+    ⚠️ **A position can have fewer than `k` legal edges**, and `topk` then returns
+    `-inf` slots whose flat index decodes to a real-looking label. Those are filled
+    with the best edge instead, which is the only choice that cannot invent a
+    membership: repeating a move already counted never adds a new hit.
+    """
+    logit = _policy_logits(item, policy, promo)
+    k = min(k, logit.shape[-1])
+    vals, cols = logit.topk(k, dim=-1)
+    cols = torch.where(torch.isfinite(vals), cols, cols[:, :1].expand_as(cols))
+    return _cols_to_labels(cols)
+
+
+def _policy_argmax(item, policy: torch.Tensor, promo: torch.Tensor) -> torch.Tensor:
+    """The single highest-prior legal edge. `_policy_topk` with `k = 1`."""
+    return _policy_topk(item, policy, promo, k=1)[:, 0]
 
 
 def _evaluator(net, impl: Optional[str]) -> Callable:

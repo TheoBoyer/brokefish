@@ -59,15 +59,21 @@ Four evaluation layers, four different questions, four different costs — `eval
 ### ~~D2. The league and the rating fit — layer 2~~ ✅ landed 2026-07-31
 
 `brokefish/eval/{match,elo,league,curve}.py`, specified in `evaluation.md` §5.4,
-built in [the D2 journal entry](journal/2026-07-31-d2-league.md), 54 checks in
+built in [the D2 journal entry](journal/2026-07-31-d2-league.md), 56 checks in
 `tests/test_league.py`. Everything below was the plan; what shipped differs in three
 places, all recorded in §5.4: **no opening book** (8 random legal plies instead —
 UHO breaks draws between engines strong enough to hold a balanced position, which is
 not our failure mode), **the fixed SAI calendar rather than variance-proportional
 pairing** (which needs an online fit and buys nothing yet; `EloFit.predict` is the
 function it will need), and **a score-based Elo scale** rather than BayesElo's
-draw-model one. ⚠️ No league has run on the kernel yet — the card was busy with
-`t4h-n64` — so every timing below is still arithmetic.
+draw-model one.
+
+✅ **Three curves measured, 2026-07-31 and 08-01**: `t4h-n64` +74 ± 17, `t4h-fix`
++53 ± 13 (both at 64 eval sims), `t12h-n128` +451 ± 39 (at 128 eval sims, so a
+different scale — §3 makes the simulation count part of it). 4 677 / 6 027 / 5 186
+games; **9.3 s per pairing at 64 sims and 38 s at 128**, the latter because decisive
+games run 123-138 plies against 60-80. The cost arithmetic below assumed ~17 min for
+1000 games at `n = 800` and is superseded by those measurements.
 
 The curve itself. A checkpoint league where the opponent is our own past self, so the
 opponent strength escalates for free and no external process is involved.
@@ -152,6 +158,174 @@ dominate, so 100 games resolves ±37 Elo — enough only if the claimed margin c
 | **target a CI width, not a game count** | the draw fraction drifts over the run, so fixed `N` over-measures early points and under-measures late ones |
 | **two cost numbers** | training compute only on the curve's x-axis, which is what makes it comparable to AlphaGateau; total project cost published separately |
 | **tablebases: never ours, whatever the opponent is rated with** | §7.2, superseding the two-option sentence in [Measuring strength](#measuring-strength) below |
+
+## Track E: sample efficiency
+
+Opened 2026-08-01, after the `t12h-n128` run.
+
+⚠️ **The objective is Elo per hour. Sample efficiency is a proxy for it, and the two
+are not the same** — corrected 2026-08-01, because the first draft of this section
+stated the proxy as the objective and that inflates every conclusion in it.
+
+The gap is exactly the cost of the thing that bought the sample efficiency. Measured
+on the same landmark:
+
+```
+25% decisive at        positions        wall clock
+t4h-n64                 7.29 M           2.79 h
+t4h-fix                 8.03 M           2.97 h
+t12h-n128               2.69 M           1.80 h
+                       2.7-3.0x         1.55-1.65x
+```
+
+**A 3.0× sample-efficiency gain is a 1.6× Elo/h gain**, because doubling `sims` costs
+2× per position. So the standing rule for this track: *an intervention that buys
+sample efficiency by spending compute per position must beat its own cost factor to
+be worth anything at all.* Sample efficiency is the right proxy for interventions
+that are **free per position** — auxiliary targets, SWA, better inputs, a better
+optimiser — and a misleading one for anything that buys quality with FLOPs.
+
+### E0. The lever, and what it is actually worth
+
+⚠️ **`records per generation is 10 240 in every run so far`** — it is
+`moves_per_phase × games_in_flight` and **does not depend on `sims`**. So doubling
+the simulation budget costs zero extra positions; it costs FLOPs per position. That
+makes the n=64 → n=128 comparison a clean sample-efficiency experiment, and it is the
+sharpest result the project has:
+
+The landmark is the **25 % decisive-game crossing**, over a 20-generation trailing
+window. Positions are counted as `generations × 10 240`, which is the one measure
+valid across all three runs — `t4h-n64` predates the position-denominated cadence, so
+its steps and its samples are not in a fixed ratio.
+
+| | total positions | steps | **25 % decisive at** | league |
+|---|---:|---:|---|---|
+| `t4h-n64` | 10.4 M | 1292 | step 1003 = **7.29 M positions** | +74 ± 17 @64 sims |
+| `t4h-fix` | 10.6 M | 2106 | step 1587 = **8.03 M positions** | +53 ± 13 @64 sims |
+| `t12h-n128` | 18.1 M | 3583 | step 525 = **2.69 M positions** | +451 ± 39 @128 sims |
+
+**2.7–3.0× fewer samples to the same behavioural landmark**, and the final decisive
+rate is 66.1 % against 32.1 % / 32.3 %. The Elo slope went from +24.6 ± 6.2 to
++332 ± 26 per decade of compute — 66 % of Jones' law against 5 %.
+
+The other half of the same measurement is the KL direction, which is what tells us
+the mechanism rather than the size:
+
+```
+n=64 : KL falls 0.443 -> 0.140    the search converges TO the policy -- no signal left
+n=128: KL bottoms 0.123, RISES to 0.186    the search stays AHEAD of the policy
+```
+
+⚠️ **The scales are not comparable.** `t12h-n128`'s league ran at 128 simulations and
+the other two at 64, and `evaluation.md` §3 makes the simulation count part of the
+scale. The anchor's own draw rate proves the scale moved: 41.4 % at 128 sims against
+82.8 % at 64. The `+378` internal rise is measured within one scale and stands; the
+comparison to `+74` is not licensed until a 64-sim league is run on `t12h-n128`.
+
+⚠️ **A measurement that argued the wrong way, recorded so it is not repeated.** A
+sims sweep on the *final `t4h-fix` checkpoint* showed more simulations making the
+target **flatter** (max π 0.154 → 0.132 from n=32 to n=256), and was used to argue
+against raising `sims`. That checkpoint's value head had already collapsed to
+std 0.023, and in that regime Q carries nothing so PUCT's asymptote is π → P. **The
+collapse is a consequence of training at n=64.** Measuring the endpoint of a
+degenerate run and using it to justify continuing the degenerate run is circular; a
+sims sweep is only informative on a healthy net.
+
+### E1. More signal per position
+
+⚠️ The rows marked **free** cost nothing per position, so sample efficiency and Elo/h
+move together for them. The rows marked **paid** buy quality with FLOPs and have to
+clear their own cost factor.
+
+| | what | source | cost |
+|---|---|---|---|
+| **E1.1** | **paid** — **`sims = 256`.** Two points on this curve both moved hard; this is the third. ⚠️ It costs 2× per position, so on the real axis it must reach the landmark **under 1.80 h** — i.e. under ~1.41 M positions against n=128's 2.69 M, a **1.9× sample-efficiency gain merely to break even**. The previous doubling gave 2.7×. If this one gives under 1.9× the lever has saturated and the track's weight moves to E1.2/E1.4/E1.5 | ours, E0 | one run |
+| **E1.2** | **paid, but cheaply** — **Playout cap randomisation.** Large `N` on a fraction `p` of turns for policy targets, cheap `n` elsewhere for value targets | KataGo §3.1; their ablation: *"clearly outperforms a wide variety of possible fixed values of playouts"* over N ∈ {100,150,200,250,600}. Its stated purpose **is** this tension | medium; `Search.budget` is already the per-game tensor and [`search.md`](reference/search.md) §11 prices it |
+| **E1.3** | **free** — **Forced playouts + policy target pruning.** `n_forced(c) = (k·P(c)·ΣN(c'))^½`, k=2, PUCT set to ∞ until met; then subtract those playouts from the *target* unless the move proved good | KataGo §3.2, ablated as NoForcedTP. ⚠️ Their motivation is our FPU bug stated in general form: *"even if a Dirichlet noise move was good, its initial evaluation might be negative, preventing further search"* | medium |
+| **E1.4** | **free** — **Auxiliary policy target** — predict the **opponent's next** policy, `w_opp = 0.15` | KataGo §4.1: *"modest but clear benefit… nearly costless… deserves attention"*. **Fully game-agnostic**, unlike ownership and score | low |
+| **E1.5** | **free** — **Moves-left head** | lc0 ships one with its own loss weight; it is the chess analogue of E1.4 on the value side | low |
+| **E1.6** | **free** — **Stochastic weight averaging** — snapshot per ~250k samples, EMA of 4 at decay 0.75 | KataGo, main run | very low |
+| **E1.7** | **free** — **Balanced win/loss sampling from the buffer** | ELF OpenGo App. C: the value head over-estimated one colour, causing premature resignation and collapsed replay diversity | low |
+
+KataGo's own summary of why this tier is the tier: *"enriching the training data with
+additional targets is valuable when data is limited or expensive."*
+
+### E2. Raise the ceiling — positions that currently teach nothing
+
+**Total move count and a slice of history** ([`spec.md`](reference/spec.md) §7.2 inputs). AZ's Table S1 carries
+`T = 8` stacked positions and a total-move-count plane; we have `T = 1` and no move
+count.
+
+⚠️ **Measured consequence, not a suspicion**: the policy scores **0.035 on
+`avoid_threefold` against a 0.036–0.044 chance baseline** at every checkpoint, while
+the search does it at 0.86 — and threefold is **45–85 % of how our games end**. With
+`T = 1` and only the current position's `rep` flag, nothing in the input distinguishes
+the repeating move from any other. It is an information-theoretic impossibility, and
+no quantity of samples fixes one. Sample efficiency is capped at zero for that slice
+of the data.
+
+Cheapest faithful step: total move count as one embedding table (parallel to
+`emb_clock`), plus the last move as two 64-row per-board tables. The full `T = 8` is
+256 tokens and a real architecture change.
+
+### E3. The exchange rate — compute per sample, not samples
+
+These do **not** improve sample efficiency. They change what a unit of sample
+efficiency costs, which is why they follow E1 rather than lead it.
+
+- **fp8 for the rollout matmuls.** Measured on this card (`CLAUDE.md`): **e4m3→fp32 at
+  41.6 TFLOPS against fp16→fp32 at 18.0**, a 2.3×. It buys E1.1 and E1.2 outright.
+  ⚠️ Ordering matters: if the curve saturates at n=128 this is worth much less, so it
+  follows E1.1's answer. ⚠️ It also needs its own equivalence story — the tree is
+  currently checked bit-for-bit against the fp32 reference, and an fp8 rollout can
+  only promise agreement on the *move*, not on the numbers.
+- **muP, then progressive network sizing.** [`model.py`](../brokefish/nn/model.py) already defers this in
+  place: *"Real muP treats embeddings and readouts differently and that is a training
+  decision (C2), not a forward-pass one."* muP's payoff is hyperparameter transfer
+  across width, which is what makes KataGo's progressive sizing — (6,96) → (10,128) →
+  (15,192) → (20,256) — safe rather than a re-tune at every step. They belong together.
+  A smaller net early also has a real sample-efficiency argument: fewer parameters to
+  fit per position.
+- **Muon.** Orthogonalised momentum on the matrix parameters, AdamW on the rest. The
+  split is apt here: the trunk-gradient decomposition measured the matrix and vector
+  parameters behaving completely differently (the value head is 45× denser per
+  parameter). ⚠️ Unproven in self-play RL; cheap to try, and `bench/`'s interleaved
+  A/B protocol is what would settle it.
+
+### E4. Looped transformer and HRM-adjacent recurrence
+
+More computation per position with **no extra parameters and no extra positions** —
+which is the architectural form of exactly what raising `sims` just bought. On a
+project whose x-axis is compute rather than parameters, a 6.4M-parameter network that
+thinks longer is on-thesis. Adaptive depth per position also fits chess, where
+tactical positions want more work than quiet ones.
+
+Last only because it is the largest bet, not because the axis is wrong.
+
+### E5. The blocker that gates E2 and E4
+
+**Anchor versioning, ~1 hour, and it comes first of anything architectural.**
+`eval/league.py`'s `load_engine` builds a fixed `BrokefishNet`, so any change to the
+input or the architecture makes `checkpoints/anchor.pt` unloadable and breaks the
+entire cost-versus-Elo scale. The match harness takes *evaluators* rather than
+architectures, so the frozen anchor can still play — it needs a versioned constructor
+and nothing more. Without it, every architectural experiment starts a new scale and
+none of them can be compared.
+
+### What Track E has already settled
+
+| | |
+|---|---|
+| **the objective is Elo/h, not Elo per sample** | the same measurement reads 3.0× on samples and 1.6× on the clock. An intervention that buys quality with FLOPs per position must beat its own cost factor |
+| **simulations per target is a first-order lever** | 2.7-3.0× fewer positions and **1.6× less wall clock** to the same landmark, n=64 → n=128, with positions-per-generation held constant at 10 240 |
+| **the repetition problem was a symptom, not a cause** | threefold fell **82.8 % → 4.6 %** of terminations over `t12h-n128` with no change to the inputs. E2's representation gap is real but it was not what capped the previous runs — the search simply stopped needing a draw |
+| **game length and the ply cap are settled at n=128** | mean plateaus at ~180 plies, the cap fires on **0.50 %** and is flat. `--max-plies 512` is comfortable; `--mean-plies 250` is the right buffer sizing, since `window_games` binds first |
+| **the gradient is well behaved at n=128** | `grad_norm` settles at ~0.33 and stays, saturation 0.0000 throughout, `--grad-clip 5.0` fires 16.7 % in the transient and 0 % after. Contrast `t4h-n64`: monotone collapse to 0.19, and a 1.0 clip firing on 99 % of the first 300 steps — an implicit lr schedule rather than a safety net. ⚠️ `weight_norm` drifts +5 % at `adam_wd = 0.01`, flat at 0.1; watch over 24 h |
+| **the KL direction is the diagnostic** | falling KL means the search has converged to the policy and the loop is an expensive identity function; rising KL after an initial fall is what a working loop looks like |
+| **do not down-weight the value loss** | KataGo *up*-weights it (`c_g = 1.5`); AGZ's 0.01 was supervised-only and its own text conditions the 1:1 choice on data abundance |
+| **do not starve the policy loss** | ELF OpenGo: cross-entropy coefficient at 1/362 capped the model at amateur level |
+| **global pooling does not apply** | KataGo §3.3 gives *convolutional* nets the global context our 32-token full-attention transformer already has |
+| **initialisation is unspecified in the literature** | neither AGZ, AZ, KataGo nor ELF states a scheme (all four texts checked 2026-08-01). lc0's source uses `glorot_normal` throughout, which for our head geometry is **1.27× sharper** than our `d^-0.5`. Ours is not an outlier and this is not an ablation worth spending a run on |
 
 ## Measuring strength
 
@@ -253,6 +427,12 @@ D0 ✅ ──> D1 ✅ ──> D2 ──> D3 ──> D4 ──> D5
 **On the path**: C4, then C5. C4 needs D2, because a pilot with no rating fit
 produces GPU time and no curve point.
 
+⚠️ **Revised 2026-08-01: [Track E](#track-e-sample-efficiency) now sits between D2 and C4.** The
+pilot's job is to fix `n` and the config for the full run, and E0 measured a **3.0×
+sample-efficiency difference** between two values of `n` that the pilot would
+otherwise have had to discover at full-run prices. Every hour spent on E1 lowers the
+cost of C5 by more than it costs.
+
 **Off it, and startable now**: D3. (D2 landed 2026-07-31; the synthetic ladder is in
 `tests/test_league.py`, where the fit recovers ratings it was never told.) D3 is an
 async scheduler against UCI processes and shares nothing with the
@@ -274,7 +454,8 @@ as scheduling.
 |---|---|
 | environment, network, search, training loop | ✅ 2026-07-29 to 2026-07-31, A0-B2, C1, C2 |
 | layer 0 and layer 3 diagnostics | ✅ 2026-07-30, D0 and D1, 31.7 s per checkpoint |
-| the league and the rating fit | ✅ 2026-07-31, D2, 54 checks, no league run on the kernel yet |
+| the league and the rating fit | ✅ 2026-07-31, D2, 56 checks; three curves measured 2026-07-31/08-01 |
+| **sample efficiency** | **[Track E](#track-e-sample-efficiency), opened 2026-08-01.** E0 measured; E1.1 is one run; E1.2-E1.7 are days, not weeks. **Sits before C4** |
 | the external match harness | D3, 2-3 days |
 | calibration and the gate | D4 and D5, both blocked on a decision, not on code |
 | first curve points, Gate 2 | end of C4, plus the pilot's own GPU time |

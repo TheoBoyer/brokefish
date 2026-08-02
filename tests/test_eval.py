@@ -493,6 +493,49 @@ class TestPuzzles:
         for b in out["bins"]:
             assert b["rating_lo"] <= b["rating_hi"] and b["rate"] == 1.0
 
+    def test_the_policy_only_curve_agrees_with_the_searched_one_on_a_rigged_net(self, tmp_path):
+        """`score_puzzles_policy` is the same question with the tree removed.
+
+        A network that already prefers the solution needs no search to find it, so a
+        rigged evaluator must score 1.0 both ways. That pins the label decoding and
+        the promotion handling of the policy-only path against the searched one,
+        which is where the two could silently drift apart.
+        """
+        from brokefish.eval.puzzles import (load_puzzles, score_puzzles,
+                                            score_puzzles_policy)
+
+        path, _e = _write_puzzle_csv(tmp_path / "p.csv", n=48, seed=17)
+        puzzles = load_puzzles(path=str(path), device=DEVICE)
+        rigged = _RiggedNet(_rigged_evaluator(
+            suites.Suite("p", "", puzzles.boards, puzzles.control,
+                         puzzles.answer[:, None], puzzles.answer[:, None],
+                         *env.empty_history(len(puzzles), device=DEVICE)),
+            puzzles.answer))
+
+        searched = score_puzzles(puzzles, rigged, n=16, batch=48, device=DEVICE)
+        policy = score_puzzles_policy(puzzles, rigged, batch=48, device=DEVICE)
+        assert policy["solve_rate"] == searched["solve_rate"] == 1.0
+        assert policy["n_sims"] == 0, "the point of this path is that no tree ran"
+        assert policy["n_puzzles"] == len(puzzles)
+        # Every puzzle in exactly one bin, same partition as the searched curve.
+        assert sum(b["n"] for b in policy["bins"]) == len(puzzles)
+        assert [b["rating_lo"] for b in policy["bins"]] == \
+               [b["rating_lo"] for b in searched["bins"]]
+
+    def test_the_policy_only_curve_scores_zero_when_the_net_plays_something_else(self, tmp_path):
+        from brokefish.eval.puzzles import load_puzzles, score_puzzles_policy
+
+        path, _e = _write_puzzle_csv(tmp_path / "p.csv", n=24, seed=18)
+        puzzles = load_puzzles(path=str(path), device=DEVICE)
+        other = _other_legal_move(puzzles.boards, puzzles.control, puzzles.answer)
+        wrong = _RiggedNet(_rigged_evaluator(
+            suites.Suite("p", "", puzzles.boards, puzzles.control,
+                         other[:, None], other[:, None],
+                         *env.empty_history(len(puzzles), device=DEVICE)),
+            other))
+        out = score_puzzles_policy(puzzles, wrong, batch=24, device=DEVICE)
+        assert out["solve_rate"] == 0.0
+
     def test_a_net_that_plays_something_else_scores_zero(self, tmp_path):
         from brokefish.eval.puzzles import load_puzzles, score_puzzles
 

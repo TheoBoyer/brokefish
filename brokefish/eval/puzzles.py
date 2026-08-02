@@ -62,15 +62,38 @@ DEFAULT_PUZZLE_PATH = os.path.join(
 
 @dataclass
 class PuzzleSet:
+    """A puzzle is a **line**, not a move.
+
+    ⚠️ Until 2026-08-02 this held only the first solver move, and everything scored
+    against it measured one move of a sequence averaging **2.32**. That is not a
+    uniform loss: solver moves per puzzle rise from **1.47** in the 400-599 band to
+    **3.66** at 2600-2799, so scoring move one discarded 32 % of an easy puzzle's
+    difficulty and 73 % of a hard one's — which is precisely why the solve rate
+    appeared to *rise* with rating. The whole line is kept now.
+
+    ``step_*`` are the per-solver-move tensors, padded to the longest line: the
+    position the solver faces at its `j`-th turn (having played every earlier move
+    correctly), and the label it must produce. Storing the positions rather than
+    replaying them keeps the scorer a loop over `j` with no game logic in it.
+    """
+
     boards: torch.Tensor       # [N, 32] int16, after the set-up move
     control: torch.Tensor      # [N]     int16
-    answer: torch.Tensor       # [N]     int16, the solution's edge label
+    answer: torch.Tensor       # [N]     int16, the solution's *first* move
     rating: torch.Tensor       # [N]     int32
     deviation: torch.Tensor    # [N]     int32
     puzzle_id: List[str]
+    step_boards: Optional[torch.Tensor] = None    # [N, S, 32] int16
+    step_control: Optional[torch.Tensor] = None   # [N, S]     int16
+    step_answer: Optional[torch.Tensor] = None    # [N, S]     int16
+    step_len: Optional[torch.Tensor] = None       # [N]        int32, solver moves
 
     def __len__(self) -> int:
         return int(self.boards.shape[0])
+
+    @property
+    def has_lines(self) -> bool:
+        return self.step_len is not None
 
 
 def load_puzzles(path: Optional[str] = None, limit: Optional[int] = 20_000,
@@ -99,6 +122,7 @@ def load_puzzles(path: Optional[str] = None, limit: Optional[int] = 20_000,
             "  zstd -d data/lichess_db_puzzle.csv.zst")
 
     fens, first_moves, answers, ratings, devs, ids = [], [], [], [], [], []
+    lines: List[List[str]] = []
     with open(path, newline="") as fh:
         for row in csv.DictReader(fh):
             dev = int(row["RatingDeviation"])
@@ -111,6 +135,7 @@ def load_puzzles(path: Optional[str] = None, limit: Optional[int] = 20_000,
             fens.append(row["FEN"])
             first_moves.append(moves[0])
             answers.append(moves[1])
+            lines.append(moves[1:])
             ratings.append(rating)
             devs.append(dev)
             ids.append(row["PuzzleId"])
@@ -126,11 +151,55 @@ def load_puzzles(path: Optional[str] = None, limit: Optional[int] = 20_000,
                                        (setup & 0x7FF).long(),
                                        promo=(setup.long() >> 11) & 0b11)
     answer = _labels_from_uci(boards, control, answers)
+    step = _walk_lines(boards, control, lines, device)
 
     return PuzzleSet(boards=boards, control=control, answer=answer,
                      rating=torch.tensor(ratings, dtype=torch.int32, device=device),
                      deviation=torch.tensor(devs, dtype=torch.int32, device=device),
-                     puzzle_id=ids)
+                     puzzle_id=ids, **step)
+
+
+def _walk_lines(boards: torch.Tensor, control: torch.Tensor,
+                lines: List[List[str]], device) -> dict:
+    """Play each solution line forward, recording what the solver faces each turn.
+
+    ⚠️ **Labels are position-dependent**, because UCI names a square and the record
+    names a *slot* — so the line cannot be decoded in one pass and has to be walked.
+    The walk advances only the rows that still have moves left, which is what keeps a
+    ten-move puzzle from corrupting a one-move one sharing the batch.
+
+    The line alternates solver, opponent, solver, ... so solver turns are the even
+    indices and the odd ones are replayed as given (teacher forcing: the solver is
+    graded on each move having played every earlier one correctly, which is the only
+    way a later move in the line is a well-posed question at all).
+    """
+    n = len(lines)
+    n_solver = [(len(l) + 1) // 2 for l in lines]
+    S = max(n_solver) if n else 0
+    step_boards = torch.zeros((n, S, 32), dtype=torch.int16, device=device)
+    step_control = torch.zeros((n, S), dtype=torch.int16, device=device)
+    step_answer = torch.zeros((n, S), dtype=torch.int16, device=device)
+
+    b, c = boards.clone(), control.clone()
+    longest = max((len(l) for l in lines), default=0)
+    for j in range(longest):
+        idx = torch.tensor([i for i, l in enumerate(lines) if j < len(l)],
+                           dtype=torch.long, device=device)
+        if idx.numel() == 0:
+            break
+        sub_b, sub_c = b[idx], c[idx]
+        lab = _labels_from_uci(sub_b, sub_c, [lines[i][j] for i in idx.tolist()])
+        if j % 2 == 0:                      # a solver turn: record the question
+            step_boards[idx, j // 2] = sub_b
+            step_control[idx, j // 2] = sub_c
+            step_answer[idx, j // 2] = lab
+        nb, nc, _m, _ck = env.play(sub_b, sub_c, (lab & 0x7FF).long(),
+                                   promo=(lab.long() >> 11) & 0b11)
+        b[idx], c[idx] = nb, nc
+
+    return {"step_boards": step_boards, "step_control": step_control,
+            "step_answer": step_answer,
+            "step_len": torch.tensor(n_solver, dtype=torch.int32, device=device)}
 
 
 def _labels_from_uci(boards: torch.Tensor, control: torch.Tensor,
@@ -201,6 +270,244 @@ def score_puzzles(puzzles: PuzzleSet, net, n: int = 800, impl: Optional[str] = N
     k = int(correct.sum())
     return {"n_puzzles": total, "n_sims": n, "solve_rate": k / total if total else 0.0,
             "ci95": list(_wilson(k, total)), "bins": bins}
+
+
+@torch.no_grad()
+def score_puzzles_policy(puzzles: PuzzleSet, net, impl: Optional[str] = None,
+                         batch: int = 2048, bin_width: int = 200,
+                         ks: Tuple[int, ...] = (1, 3, 5),
+                         device: str = "cuda") -> dict:
+    """The same curve asked of the raw policy, with **no search at all**.
+
+    One forward pass per position instead of `n` simulations, which turns the puzzle
+    curve from the diagnostic that is allowed to be slow into one cheap enough to run
+    beside a training run. `score_suite_policy` is the same idea on the rule suites,
+    and the pairing is the same diagnostic: a policy that is right and a search that
+    is wrong is a different failure from both being wrong.
+
+    ⚠️ **This is what the search cannot do for it.** `state.md` records that a
+    random-init network scores 0.147 *with* 800 simulations against a 0.051 uniform
+    null, and that essentially all of it is mate-in-1 found by terminal nodes rather
+    than by the network — MCTS proves mates with no evaluation function. Removing the
+    search removes that free credit, so this number starts near the uniform baseline
+    and every point above it is the policy's own.
+
+    ⚠️ **Evaluation only** (`evaluation.md` §2). The puzzle set is human games with
+    engine-verified solutions and is inside the tabula rasa boundary *only* because
+    §2 puts evaluation outside it. Nothing that reads this may write to training —
+    which is why the intended caller is an out-of-process watcher, not the loop.
+
+    `rep` is zero everywhere: a puzzle is a position without a history, exactly as
+    `score_puzzles` presents it to `Search.reset`.
+    """
+    from .suites import _evaluator, _policy_topk
+
+    evaluate = _evaluator(net, impl)
+    total = len(puzzles)
+    kmax = max(ks)
+    hit = {k: torch.zeros(total, dtype=torch.bool, device=device) for k in ks}
+    for lo in range(0, total, batch):
+        hi = min(lo + batch, total)
+        item = PuzzleSet(boards=puzzles.boards[lo:hi].to(device),
+                         control=puzzles.control[lo:hi].to(device),
+                         answer=puzzles.answer[lo:hi], rating=puzzles.rating[lo:hi],
+                         deviation=puzzles.deviation[lo:hi],
+                         puzzle_id=puzzles.puzzle_id[lo:hi])
+        rep = torch.zeros(hi - lo, dtype=torch.uint8, device=device)
+        policy, promo, _v = evaluate(item.boards, item.control, rep)
+        top = _policy_topk(item, policy, promo, k=kmax)          # [b, kmax]
+        want = puzzles.answer[lo:hi].to(device)[:, None]
+        for k in ks:
+            hit[k][lo:hi] = (top[:, :k] == want).any(-1)
+    correct = hit[1]
+
+    bins = []
+    r = puzzles.rating
+    on_cpu = {k: hit[k].cpu() for k in ks}
+    lo_edge = int(r.min()) // bin_width * bin_width
+    hi_edge = int(r.max()) // bin_width * bin_width + bin_width
+    for edge in range(lo_edge, hi_edge, bin_width):
+        # `rating` may live on either device; the mask and the tensor it indexes
+        # have to agree, and the bin loop is host-side arithmetic anyway.
+        sel = ((r >= edge) & (r < edge + bin_width)).cpu()
+        m = int(sel.sum())
+        if m == 0:
+            continue
+        n1 = int(on_cpu[1][sel].sum()) if 1 in ks else 0
+        row = {"rating_lo": edge, "rating_hi": edge + bin_width, "n": m,
+               "solved": n1, "rate": n1 / m, "ci95": list(_wilson(n1, m))}
+        # Per-band pass@k as well as the aggregate: the bands are where the shape
+        # lives, and a policy that improves only on the easy end is a different
+        # thing from one that improves everywhere.
+        for k in ks:
+            j = int(on_cpu[k][sel].sum())
+            row[f"pass@{k}"] = j / m
+            row[f"pass@{k}_ci95"] = list(_wilson(j, m))
+        bins.append(row)
+
+    n1 = int(correct.sum())
+    out = {"n_puzzles": total, "n_sims": 0,
+           "solve_rate": n1 / total if total else 0.0,
+           "ci95": list(_wilson(n1, total)), "bins": bins}
+    # pass@k: is the solution anywhere in the policy's top k? `solve_rate` stays
+    # pass@1 so the field means what it has always meant.
+    for k in ks:
+        m = int(hit[k].sum())
+        out[f"pass@{k}"] = m / total if total else 0.0
+        out[f"pass@{k}_ci95"] = list(_wilson(m, total))
+    return out
+
+
+def _move_kinds(boards: torch.Tensor, control: torch.Tensor,
+                labels: torch.Tensor) -> torch.Tensor:
+    """`[N]` category per move: 0 quiet, 1 capture, 2 check, 3 mate.
+
+    Mutually exclusive and ordered by force, so a mating capture counts once, as a
+    mate. This is the decomposition that says *what kind* of move a network can and
+    cannot find — the solve rate says only that something is missing.
+
+    ⚠️ A capture is decided by the destination square holding an **enemy** piece
+    before the move. Getting that comparison backwards silently reports 0 % captures
+    everywhere, which is what it did on the first attempt (2026-08-02).
+    """
+    from .probe import MOVE_MASK, PROMO_SHIFT
+
+    lab = labels.to(torch.int64)
+    mv, pm = lab & MOVE_MASK, (lab >> PROMO_SHIFT) & 0b11
+    dst = mv % 64
+    captured, colour, _sp, _ty, square = env.decode(boards)
+    alive = captured == 0
+    mover_is_white = control > 0
+    enemy_on_dst = torch.zeros(boards.shape[0], dtype=torch.bool, device=boards.device)
+    for slot in range(32):
+        # colour bit 1 is black, so the enemy is `colour == 1` exactly when the mover
+        # is white -- hence the comparison against `mover_is_white`, not its negation.
+        enemy_on_dst |= (alive[:, slot] & ((colour[:, slot] == 1) == mover_is_white)
+                         & (square[:, slot] == dst))
+
+    nb, nc, nm, in_check = env.play(boards.clone(), control.clone(), mv, promo=pm)
+    code, _ = env.terminal(nm, in_check, nc, nb)
+    kind = torch.zeros(boards.shape[0], dtype=torch.int8, device=boards.device)
+    kind = torch.where(enemy_on_dst, torch.ones_like(kind), kind)
+    kind = torch.where(in_check, torch.full_like(kind, 2), kind)
+    kind = torch.where(code == env.CHECKMATE, torch.full_like(kind, 3), kind)
+    return kind
+
+
+KIND_NAMES = ("quiet", "capture", "check", "mate")
+
+
+@torch.no_grad()
+def score_puzzles_line(puzzles: PuzzleSet, net, impl: Optional[str] = None,
+                       batch: int = 2048, bin_width: int = 200,
+                       ks: Tuple[int, ...] = (1, 3, 5),
+                       device: str = "cuda") -> dict:
+    """The whole line, policy only. Two metrics, and they answer different questions.
+
+    - **``solve_rate``** — the net's top move is correct at **every** solver turn.
+      This is what "solved the puzzle" means on Lichess, and it is the only reading
+      under which the puzzle's rating describes the task we set.
+    - **``move_pass@k``** — the fraction of *solver turns*, pooled over all puzzles,
+      whose answer is in the net's top `k`. Each turn is asked with every earlier
+      move played correctly (teacher forcing), so a later move is a well-posed
+      question rather than a consequence of an earlier miss.
+
+    ⚠️ The two diverge hard and the gap is the point. A line of `L` moves needs `L`
+    consecutive hits to solve, so at a per-move rate `p` the solve rate is near
+    `p**L`, and `L` runs 1.47 in the 400-599 band to 3.66 at 2600-2799. Reporting
+    only one of them hides either the compounding or the per-move skill.
+
+    ⚠️ **Evaluation only** (`evaluation.md` §2), as with every puzzle metric here.
+    """
+    from .suites import _evaluator, _policy_topk
+
+    if not puzzles.has_lines:
+        raise ValueError("this PuzzleSet was built before line support; reload it")
+    evaluate = _evaluator(net, impl)
+    n, S = len(puzzles), puzzles.step_answer.shape[1]
+    kmax = max(ks)
+    lens = puzzles.step_len.to(device)
+    # [N, S] per-turn hits, and [N] whether every turn of the line was hit at k=1.
+    turn_hit = {k: torch.zeros((n, S), dtype=torch.bool, device=device) for k in ks}
+    sol_kind = torch.zeros((n, S), dtype=torch.int8, device=device)
+    net_kind = torch.zeros((n, S), dtype=torch.int8, device=device)
+
+    for j in range(S):
+        rows = (lens > j).nonzero(as_tuple=True)[0]
+        if rows.numel() == 0:
+            break
+        for lo in range(0, rows.numel(), batch):
+            r = rows[lo:lo + batch]
+            item = PuzzleSet(boards=puzzles.step_boards[r, j].to(device),
+                             control=puzzles.step_control[r, j].to(device),
+                             answer=puzzles.step_answer[r, j], rating=puzzles.rating[r],
+                             deviation=puzzles.deviation[r], puzzle_id=[])
+            rep = torch.zeros(r.numel(), dtype=torch.uint8, device=device)
+            policy, promo, _v = evaluate(item.boards, item.control, rep)
+            top = _policy_topk(item, policy, promo, k=kmax)
+            want = puzzles.step_answer[r, j].to(device)[:, None]
+            for k in ks:
+                turn_hit[k][r, j] = (top[:, :k] == want).any(-1)
+            # What kind of move was asked for, and what kind the net actually chose.
+            sol_kind[r, j] = _move_kinds(item.boards, item.control, want[:, 0])
+            net_kind[r, j] = _move_kinds(item.boards, item.control, top[:, 0])
+
+    valid = torch.arange(S, device=device)[None, :] < lens[:, None]
+    solved = (turn_hit[1] | ~valid).all(-1)
+    n_turns = int(valid.sum())
+
+    bins = []
+    r_cpu = puzzles.rating.cpu()
+    solved_cpu = solved.cpu()
+    valid_cpu = valid.cpu()
+    hit_cpu = {k: turn_hit[k].cpu() for k in ks}
+    lo_edge = int(r_cpu.min()) // bin_width * bin_width
+    hi_edge = int(r_cpu.max()) // bin_width * bin_width + bin_width
+    for edge in range(lo_edge, hi_edge, bin_width):
+        sel = ((r_cpu >= edge) & (r_cpu < edge + bin_width))
+        m = int(sel.sum())
+        if m == 0:
+            continue
+        t = int(valid_cpu[sel].sum())
+        sv = int(solved_cpu[sel].sum())
+        row = {"rating_lo": edge, "rating_hi": edge + bin_width, "n": m,
+               "n_turns": t, "mean_line": t / m,
+               "solved": sv, "solve_rate": sv / m, "ci95": list(_wilson(sv, m))}
+        for k in ks:
+            j = int((hit_cpu[k][sel] & valid_cpu[sel]).sum())
+            row[f"move_pass@{k}"] = j / t if t else 0.0
+            row[f"move_pass@{k}_ci95"] = list(_wilson(j, t))
+        bins.append(row)
+
+    sv = int(solved.sum())
+    out = {"n_puzzles": n, "n_turns": n_turns, "n_sims": 0,
+           "mean_line": n_turns / n if n else 0.0,
+           "solve_rate": sv / n if n else 0.0, "ci95": list(_wilson(sv, n)),
+           "bins": bins}
+    for k in ks:
+        j = int((turn_hit[k] & valid).sum())
+        out[f"move_pass@{k}"] = j / n_turns if n_turns else 0.0
+        out[f"move_pass@{k}_ci95"] = list(_wilson(j, n_turns))
+
+    # ⚠️ The decomposition that explains the aggregate. A network that has learned
+    # "take material" and nothing else scores respectably overall while missing every
+    # mate, and only this split says so. `asked` is a property of the puzzle set and
+    # is constant across checkpoints; `played` and `pass@1` are the network's.
+    kinds = {}
+    for idx, name in enumerate(KIND_NAMES):
+        want_sel = (sol_kind == idx) & valid
+        m = int(want_sel.sum())
+        kinds[name] = {
+            "asked": m / n_turns if n_turns else 0.0,
+            "played": float(((net_kind == idx) & valid).sum()) / n_turns if n_turns else 0.0,
+            "pass@1": int((turn_hit[1] & want_sel).sum()) / m if m else 0.0,
+            "n_turns": m,
+        }
+        for k in ks:
+            kinds[name][f"pass@{k}"] = (int((turn_hit[k] & want_sel).sum()) / m
+                                        if m else 0.0)
+    out["kinds"] = kinds
+    return out
 
 
 def uniform_baseline(puzzles: PuzzleSet) -> float:

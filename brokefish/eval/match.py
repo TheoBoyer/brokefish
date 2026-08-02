@@ -182,10 +182,21 @@ class HalfResult:
 class MatchResult:
     """What one pairing did, from A's point of view.
 
-    ``unfinished`` games are **dropped**, not scored. Calling a game that ran past
-    `max_plies` a draw is the one adjudication this harness could make without an
-    engine, and it is exactly the bias the draw rate is being measured for; the
-    count is reported instead so a run where it is not ~0 is visible.
+    ⚠️ **Games past `max_plies` are scored as draws, not dropped** (changed
+    2026-08-02). The first version dropped them, on the reasoning that calling an
+    unfinished game a draw is an adjudication the harness cannot justify. That was
+    wrong in the direction that matters: the games that run long are **precisely the
+    drawn ones**, so dropping them removes draws from the sample and inflates the
+    Elo spread — measured at **35 % dropped** in the first `t24h-n256` league, rising
+    with the strength gap because stronger pairings play longer.
+
+    Scoring them drawn is also what a weak network holding a stronger one has
+    *earned*, it is what the fifty-move rule would eventually give, it is what every
+    engine tournament does, and it is what our own training loop already does
+    (`train.md` §5.4, `loop.py:_apply_ply_cap`) — so dropping here made evaluation
+    disagree with training about the same event.
+
+    ``unfinished`` still counts them, so the adjudication rate stays visible.
     """
 
     a_wins: int = 0
@@ -230,7 +241,7 @@ def play_match(eval_a: Callable, eval_b: Callable,
                openings: torch.Tensor, control: torch.Tensor,
                n_sims: int = 64, max_plies: int = 512,
                search_impl: str = "cuda", device: str | torch.device = "cuda",
-               seed: int = 0) -> MatchResult:
+               seed: int = 0, adjudicate: bool = True) -> MatchResult:
     """Play every opening twice, colours swapped, and score it for A.
 
     ``eval_a`` and ``eval_b`` are evaluators in the sense of
@@ -251,14 +262,23 @@ def play_match(eval_a: Callable, eval_b: Callable,
         half = _play_half(eval_a, eval_b, a_is_white, openings, control,
                           n_sims=n_sims, max_plies=max_plies,
                           search_impl=search_impl, device=device, seed=seed)
-        _accumulate(out, half, a_is_white)
+        _accumulate(out, half, a_is_white, adjudicate=adjudicate)
     return out
 
 
-def _accumulate(out: MatchResult, half: HalfResult, a_is_white: bool) -> None:
-    """Fold one half into the running score. The only place the sign lives."""
+def _accumulate(out: MatchResult, half: HalfResult, a_is_white: bool,
+                adjudicate: bool = True) -> None:
+    """Fold one half into the running score. The only place the sign lives.
+
+    With ``adjudicate`` (the default) a game past `max_plies` scores as a draw; see
+    `MatchResult`. ``unfinished`` counts them either way.
+    """
     fin = half.finished
-    out.unfinished += int((~fin).sum())
+    n_unfinished = int((~fin).sum())
+    out.unfinished += n_unfinished
+    if adjudicate and n_unfinished:
+        out.draws += n_unfinished
+        out.codes["adjudicated"] = out.codes.get("adjudicated", 0) + n_unfinished
     if not bool(fin.any()):
         return
     white = half.white_result[fin].to(torch.int32)

@@ -144,6 +144,18 @@ class TrainConfig:
     # Keep every checkpoint as a weights-only snapshot alongside the rolling one, so
     # a finished run yields a *curve* and not a single endpoint. 26 MB each.
     keep_checkpoints: bool = False
+
+    # -- the puzzle probe, `evaluation.md` §2 and `eval/watch.py`
+    #
+    # ⚠️ An **absolute** progress signal, which is the one thing self-play cannot give:
+    # every other number is relative to an opponent that moves with the network, or
+    # tied to a search budget that makes two leagues incomparable. Runs after each
+    # checkpoint, ~20 s against ~40 min of training. `puzzle_limit = 0` turns it off.
+    #
+    # ⚠️ Its cost is **not** added to `seconds`, so it never reaches the curve's
+    # x-axis (train.md §10: self-play plus gradient and nothing else).
+    puzzle_probe: bool = True
+    puzzle_limit: int = 20_000
     buffer_snapshot_every: int = 10_000
     autocast: bool = True              # §8.2, bf16 forward and backward
 
@@ -332,6 +344,15 @@ class Trainer:
         self.games_capped = 0
         self.generation = 0
         self.seconds = {"self_play": 0.0, "gradient": 0.0}
+        # Built here rather than at the call site so the 20 000-puzzle load happens
+        # once for the run. `run` returns None -- see `eval/watch.PuzzleProbe`.
+        self.probe = None
+        if cfg.puzzle_probe and cfg.puzzle_limit > 0:
+            from brokefish.eval.watch import PuzzleProbe
+            self.probe = PuzzleProbe(
+                limit=cfg.puzzle_limit, device=self.device,
+                detail_path=os.path.join("logs", f"{run}-puzzles.jsonl"))
+
         self.t_start = time.time()
 
         if resume:
@@ -771,6 +792,11 @@ class Trainer:
                     torch.save(self.net.state_dict(),
                                os.path.join(checkpoint_dir,
                                             f"{self.run}-{self.step:06d}.pt"))
+                # ⚠️ The return value is discarded because there is none: the probe
+                # logs directly and returns None, so no evaluation score exists in
+                # this process for anything to select on (evaluation.md §2).
+                if self.probe is not None:
+                    self.probe.run(self.net, self.log, self.step)
                 next_ckpt = self.step + cfg.checkpoint_every
                 if with_buffer:
                     next_snap = self.step + cfg.buffer_snapshot_every
@@ -841,6 +867,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resume", default=None)
     p.add_argument("--allow-config-change", action="store_true")
     p.add_argument("--buffer-dir", default=TrainConfig.buffer_dir)
+    p.add_argument("--puzzle-limit", type=int, default=TrainConfig.puzzle_limit,
+                   help="puzzles scored after each checkpoint; 0 disables the probe")
     p.add_argument("--checkpoints", default="checkpoints")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--impl", default="cuda", choices=("cuda", "torch"),
@@ -872,6 +900,7 @@ def config_from_args(args) -> TrainConfig:
         encoder=args.encoder, deterministic=not args.nondeterministic,
         checkpoint_every=args.checkpoint_every,
         keep_checkpoints=args.keep_checkpoints,
+        puzzle_limit=args.puzzle_limit,
         buffer_snapshot_every=args.buffer_snapshot_every, audit_every=args.audit_every,
         optimizer=args.optimizer, adam_wd=args.adam_wd, grad_clip=args.grad_clip,
         betas=tuple(args.betas), warmup_steps=args.warmup,

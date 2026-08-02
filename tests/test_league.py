@@ -276,24 +276,41 @@ class TestLockstep:
 
 class TestAccumulation:
 
-    def test_unfinished_games_are_dropped_and_counted(self):
-        """Never adjudicated as draws: that is the bias the draw rate measures."""
+    def _half(self):
         from brokefish.eval.match import HalfResult
-
-        half = HalfResult(
+        return HalfResult(
             white_result=torch.tensor([1, 0, -1, 0], dtype=torch.int8),
             finished=torch.tensor([True, True, True, False]),
             plies=torch.tensor([10, 20, 30, 0], dtype=torch.int32),
             code=torch.tensor([1, 4, 1, 0], dtype=torch.uint8))
+
+    def test_unfinished_games_are_scored_as_draws(self):
+        """Changed 2026-08-02, and the reason is a measurement.
+
+        Dropping them looked conservative and was not: games run long *because*
+        neither side can convert, so the dropped set is almost entirely draws and
+        removing it inflates the Elo spread. The first `t24h-n256` league dropped
+        **35 %**, rising with the strength gap. A draw is also what the fifty-move
+        rule would eventually give, what a weak net holding a strong one earned, and
+        what `loop.py:_apply_ply_cap` already does on the training side.
+        """
         out = MatchResult()
-        _accumulate(out, half, a_is_white=True)
-        assert (out.a_wins, out.draws, out.b_wins, out.unfinished) == (1, 1, 1, 1)
-        assert out.games == 3
-        assert out.codes == {"checkmate": 2, "threefold": 1}
+        _accumulate(out, self._half(), a_is_white=True)
+        assert (out.a_wins, out.draws, out.b_wins) == (1, 2, 1)
+        assert out.unfinished == 1, "the adjudication rate stays visible"
+        assert out.games == 4
+        assert out.codes == {"checkmate": 2, "threefold": 1, "adjudicated": 1}
 
         mirror = MatchResult()
-        _accumulate(mirror, half, a_is_white=False)
-        assert (mirror.a_wins, mirror.draws, mirror.b_wins) == (1, 1, 1)
+        _accumulate(mirror, self._half(), a_is_white=False)
+        assert (mirror.a_wins, mirror.draws, mirror.b_wins) == (1, 2, 1)
+
+    def test_dropping_is_still_reachable_for_an_A_B(self):
+        out = MatchResult()
+        _accumulate(out, self._half(), a_is_white=True, adjudicate=False)
+        assert (out.a_wins, out.draws, out.b_wins, out.unfinished) == (1, 1, 1, 1)
+        assert out.games == 3
+        assert "adjudicated" not in out.codes
 
     def test_a_win_as_black_is_a_win(self):
         from brokefish.eval.match import HalfResult
@@ -598,11 +615,21 @@ class TestRunLeague:
         assert report["fit"]["anchor"] == "anchor"
         assert report["curve"][0]["elo"] == 0.0, "the anchor is the zero of the scale"
 
-    def test_every_pairing_played_the_games_it_was_asked_for(self, league):
+    def test_every_game_is_scored_none_are_lost(self, league):
+        """Stronger than it was before adjudication landed (2026-08-02).
+
+        When unfinished games were dropped the invariant was
+        `games + unfinished == asked`, i.e. some games vanished from the fit. Now
+        every game is scored — `unfinished` counts how many of them were *decided
+        by the ply cap* rather than by the rules, so it is a diagnostic rather than
+        a leak.
+        """
         _pool, report = league
+        asked = report["config"]["games_per_pairing"]
         for m in report["matches"]:
-            assert m["games"] + m["unfinished"] == report["config"]["games_per_pairing"]
-        assert report["config"]["games_played"] == sum(m["games"] for m in report["matches"])
+            assert m["games"] == asked, "no game may be lost from the fit"
+            assert m["unfinished"] <= m["draws"], "an adjudicated game is a draw"
+        assert report["config"]["games_played"] == asked * len(report["matches"])
 
     def test_the_cost_axis_is_joined_by_this_writer(self, league):
         # §5.3: euros and Elo are written by the same writer or they get joined by
@@ -736,16 +763,55 @@ class TestAntiSelection:
         return [os.path.join(root, f) for f in sorted(os.listdir(root))
                 if f.endswith(".py")]
 
-    def test_training_never_imports_evaluation(self):
+    def test_the_probe_hands_the_training_process_no_score(self):
+        """The guarantee, moved from the module graph to the dataflow (2026-08-02).
+
+        The old rule was "train must not import eval", a proxy that also forced the
+        puzzle measurement into a second process. The real rule is that no evaluation
+        score may reach a training decision, and it is enforced directly now:
+        `PuzzleProbe.run` writes to the logger and **returns None**, so there is no
+        value inside the training process to threshold, compare, or select on.
+        """
+        import inspect
+        from brokefish.eval.watch import PuzzleProbe
+
+        # `from __future__ import annotations` stringifies it, so accept both forms.
+        sig = inspect.signature(PuzzleProbe.run)
+        assert sig.return_annotation in (None, "None", type(None)), \
+            "run must be annotated -> None; the absence of a return value IS the guard"
+        src = inspect.getsource(PuzzleProbe.run)
+        assert "return None" not in src.replace("-> None", "")
+        for line in src.splitlines():
+            body = line.strip()
+            assert not (body.startswith("return ") and body != "return"), \
+                f"PuzzleProbe.run must return nothing, found: {body}"
+
+    def test_the_loop_discards_the_probe_and_never_branches_on_it(self):
+        """The call site may not bind the probe's output to a name, nor test it."""
+        import re
+        src = open(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "brokefish", "train", "loop.py")).read()
+        calls = [l.strip() for l in src.splitlines() if ".probe.run(" in l]
+        assert calls, "the loop should call the probe"
+        for c in calls:
+            assert re.match(r"^(self\.)?probe\.run\(|^self\.probe\.run\(", c), \
+                f"the probe's result must be discarded, not bound: {c}"
+        # And nothing in the loop may read a puzzle metric back out.
+        assert "puzzles/" not in src, \
+            "the loop must not name a puzzle metric; it cannot act on what it cannot see"
+
+    def test_training_still_imports_no_league_machinery(self):
+        """Relaxed for the probe only. The league is still entirely out of reach."""
         offenders = []
         for path in self._train_sources():
             src = open(path).read()
-            if "brokefish.eval" in src or "from .eval" in src or "from ..eval" in src:
-                offenders.append(os.path.basename(path))
+            for needle in ("eval.league", "eval.elo", "eval.curve", "eval.match"):
+                if needle in src:
+                    offenders.append((os.path.basename(path), needle))
         assert not offenders, (
-            f"{offenders} reach into brokefish.eval. Evaluation output may not flow "
-            f"backwards (evaluation.md §2); a training loop that reads a league "
-            f"rating is selecting checkpoints on it.")
+            f"{offenders} reach into the league. A training loop that reads an Elo "
+            f"rating is selecting checkpoints on it (evaluation.md §2).")
 
     def test_training_never_reads_a_league_report(self):
         # Deliberately the *artefacts*, not the word "Elo": `train/sync.py` says

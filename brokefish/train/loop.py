@@ -82,6 +82,14 @@ class TrainConfig:
     tau_plies: int = 30
     eps: float = 0.25
     alpha: float = 0.3
+    # §6.6a. Collapse a node onto its proved-winning edges, so the target on a root
+    # with a mate is a point mass on it and the mate is actually played. **Off**, so
+    # a run started today reproduces every number measured before 2026-08-03; the
+    # measurement it exists to fix, over `t9h-n128-sweep`'s finished buffer, is that a
+    # mate in one took a **median 0.302** of the visits and was the argmax only
+    # **56.1 %** of the time. It touches **0.89 %** of positions, so expect `loss` and
+    # `kl` not to move; what should move is the mate rate and the game length.
+    terminal_collapse: bool = False
 
     # -- the buffer, §5
     window_games: int = 500_000
@@ -327,7 +335,8 @@ class Trainer:
 
         self.search = search_impl("cuda" if cfg.impl == "cuda" else "torch")(
             SearchConfig(n=cfg.n_sims, B=cfg.batch_games, E=cfg.e_cap,
-                         tau_plies=cfg.tau_plies, eps=cfg.eps, alpha=cfg.alpha),
+                         tau_plies=cfg.tau_plies, eps=cfg.eps, alpha=cfg.alpha,
+                         terminal_collapse=cfg.terminal_collapse),
             evaluate=self.packed.evaluate(), env=self.env, device=device,
             seed=cfg.seed, check_invariants=False,
             **({"collect_stats": cfg.collect_search_stats} if cfg.impl == "cuda" else {}))
@@ -828,6 +837,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="§6's reuse factor: how many times each generated position is "
                         "trained on. 0.815 is AZ's 65.2-per-game at an assumed 80-ply "
                         "game. Pass 65.2/mean_plies to reproduce the old per-game rule")
+    p.add_argument("--terminal-collapse", action="store_true",
+                   help="§6.6a: send a node's simulations to its proved-winning edges "
+                        "and store the target as a point mass on them. Off by default "
+                        "-- it changes both the move played and the training target, "
+                        "so a run with it is not comparable to one without")
     p.add_argument("--window-games", type=int, default=TrainConfig.window_games)
     p.add_argument("--mean-plies", type=int, default=TrainConfig.mean_plies)
     p.add_argument("--max-plies", type=int, default=TrainConfig.max_plies)
@@ -916,7 +930,8 @@ def config_from_args(args) -> TrainConfig:
         optimizer=args.optimizer, adam_wd=args.adam_wd, grad_clip=args.grad_clip,
         betas=tuple(args.betas), warmup_steps=args.warmup,
         decay=args.decay, lr_min=args.lr_min,
-        tau_plies=args.tau_plies, eps=args.eps, alpha=args.alpha)
+        tau_plies=args.tau_plies, eps=args.eps, alpha=args.alpha,
+        terminal_collapse=args.terminal_collapse)
     if args.smoke:
         cfg.n_sims, cfg.batch_games, cfg.moves_per_phase = 32, 256, 8
         cfg.window_games, cfg.mean_plies, cfg.max_plies = 2000, 128, 160

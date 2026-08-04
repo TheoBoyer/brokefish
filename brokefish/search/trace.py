@@ -97,6 +97,15 @@ class TracingSearch(Search):
         # in both implementations, which is owed work (`debugger.md` §4).
         if config.root_terminal_sweep:
             config = replace(config, root_terminal_sweep=False)
+        # ⚠️ §6.6a's collapse is forced off for a second, independent reason, so
+        # restoring the sweep above will not restore this one. `replay()` and
+        # `static/trace.js` both re-derive the PUCT score from `edge_prior`, `edge_N`
+        # and `edge_Q`, and at a collapsed node the search maximises none of those --
+        # it maximises `-N` over the winning edges, which no trace field records. The
+        # viewer would show a ranking the search did not use and give no sign of it.
+        # Tracing a collapsed search needs `edge_win` in the format (`debugger.md` §4).
+        if config.terminal_collapse:
+            config = replace(config, terminal_collapse=False)
         super().__init__(config, evaluate, seed=seed, **kw)
         self.stats = _RecordingStats(config.d_max, self.device, self)
         self.seed = seed

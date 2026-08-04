@@ -110,6 +110,10 @@ class SearchConfig:
     # §6.1a. A rules-only depth-1 sweep of the root's edges, seeding the exact value
     # of every terminal child. See `Search._seed_terminal_edges`.
     root_terminal_sweep: bool = True
+    # §6.6a. Collapse a node onto its proved-winning edges. **Off by default**: it
+    # changes the move played and the training target, so every number measured
+    # before 2026-08-03 was measured without it. See `Search._puct_scores`.
+    terminal_collapse: bool = False
 
     @property
     def n_max(self) -> int:
@@ -224,6 +228,17 @@ class Search:
         self.edge_child = torch.full((B, N, E), -1, dtype=torch.int16, device=dev)
         self.edge_N = z((B, N, E), torch.int16)
         self.edge_Q = z((B, N, E), torch.float32)
+        # §6.6a's collapse mask: edge `e` of node `v` leads to a child the rules
+        # have proved is checkmate **for `v`'s own mover**. Written in two places
+        # and read in one, and the parity is the trap: see `_create_child`.
+        #
+        # Allocated only when the collapse is on. It is [B, Nmax, E] uint8, which is
+        # 315 MB at the Gate 1a shape (B = 4096, n = 800) against 3.8 GB for the
+        # edge arrays it rides beside -- payable when the feature is on, not payable
+        # by every run that leaves it off. An empty tensor is how `cuda_impl` and the
+        # kernels read "off", the same convention `counters` already uses.
+        self.edge_win = (z((B, N, E), torch.uint8) if c.terminal_collapse
+                         else z((0,), torch.uint8))
 
         self.path_node = z((B, D), torch.int16)
         self.path_edge = z((B, D), torch.uint8)
@@ -454,6 +469,13 @@ class Search:
             won, torch.ones_like(won, dtype=torch.float32),
             torch.full_like(won, 0.5, dtype=torch.float32))
         self.seeded.index_add_(0, hr, torch.ones_like(hr, dtype=torch.int32))
+        # §6.6a. The sweep is the only place a root's winning edge is known *before*
+        # any simulation descends into it -- no child node exists yet, so nothing
+        # else can see it. Without this the collapse would not fire at the root
+        # until the edge had already been chosen on its PUCT merits, which is the
+        # whole case it exists to remove.
+        if self.edge_win.numel():
+            self.edge_win[hr, 0, he] = won.to(torch.uint8)
 
     def _add_exploration_noise(self) -> None:
         """§6.1's Dirichlet mixture over the root's own edges."""
@@ -516,8 +538,14 @@ class Search:
 
     # -- §6.6 --------------------------------------------------------------- #
 
-    def _select(self, v: torch.Tensor) -> torch.Tensor:
-        """The PUCT argmax over node `v`'s edges, one row per game."""
+    def _puct_scores(self, v: torch.Tensor) -> torch.Tensor:
+        """§6.6's selection score for every edge of node `v`, `-inf` off the edge set.
+
+        Split out of :meth:`_select` so that §12's differential probe measures the
+        function the search actually maximises instead of a transcription of it. The
+        FPU bug of 2026-08-02 was three independent copies of this expression and one
+        of them carrying AGZ's literal 0; there is no reason to keep a fourth.
+        """
         c = self.config
         b = self._b
         nvis = self.edge_N[b, v].to(torch.float32)
@@ -534,7 +562,40 @@ class Search:
         # the remap did.
         score = pb_c * prior + torch.where(nvis > 0, q, torch.full_like(q, FPU_DRAW))
         score = torch.where(valid, score, torch.full_like(score, float("-inf")))
-        return _lowest_argmax(score)
+
+        if self.edge_win.numel():
+            # §6.6a, the collapse. A node with a proved-winning edge is not a node
+            # with an estimate worth refining: its value is 1.0 exactly and every
+            # winning edge is equally optimal, so PUCT has nothing left to decide.
+            #
+            # Why it is needed at all, measured on `t9h-n128-sweep`'s finished buffer:
+            # of 88,322 positions in the newest 600 games, **785 had a mate in one**
+            # (0.89 %). §6.1a put the mating move in the root's edge set 100.0 % of the
+            # time -- and PUCT then gave it a **median 0.302** of the visits and made it
+            # the argmax only **56.1 %** of the time (53.6 % past `tau_plies`, where the
+            # move played *is* the argmax). Not one of the 785 targets was a point mass.
+            #
+            # The reason is not subtle. Those roots are already won -- `root_value` mean
+            # 0.886 -- so a proved 1.0 beats its rivals by ~0.11, while a fresh edge's
+            # exploration term is worth ~0.42, and 128 simulations over 42.4 edges is
+            # 3.0 visits each. Exploration wins and the mate goes unplayed. The effect is
+            # monotone in the edge count, which is the same statement: under 30 edges the
+            # mate takes 0.631 of the visits, over 60 it takes 0.203.
+            #
+            # `-nvis` rather than a constant, so the visits round-robin over the
+            # winners and `pi` comes out uniform over them: ties break to the lowest
+            # edge index in `_lowest_argmax`, which is the same rule the kernel's
+            # warp reduction applies.
+            win = (self.edge_win[b, v] != 0) & valid
+            score = torch.where(win.any(-1, keepdim=True),
+                                torch.where(win, -nvis,
+                                            torch.full_like(score, float("-inf"))),
+                                score)
+        return score
+
+    def _select(self, v: torch.Tensor) -> torch.Tensor:
+        """The PUCT argmax over node `v`'s edges, one row per game."""
+        return _lowest_argmax(self._puct_scores(v))
 
     # -- §6.2 --------------------------------------------------------------- #
 
@@ -639,6 +700,17 @@ class Search:
             (result[terminal_rows].float() + 1.0) / 2.0).to(torch.float16)
         self.edge_child[rows, parent[rows], edge[rows]] = c[rows].to(torch.int16)
         self.node_count[rows] += 1
+        if self.edge_win.numel():
+            # §6.6a, and the parity is the whole risk. `result` is from the point of
+            # view of the mover in the **child**, so -1 there means the child's mover
+            # is checkmated -- a proved win for the mover at `parent`, which is the
+            # node whose edge this is. Same flip as `node_value` two lines up
+            # (-1 -> 0.0) and as `_seed_root_terminals`' `won`. Reversed, this
+            # collapses every node onto the move that loses on the spot, and it would
+            # look like the search silently got worse rather than like a bug.
+            wr = rows[(code[rows] != 0) & (result[rows] == -1)]
+            if wr.numel():
+                self.edge_win[wr, parent[wr], edge[wr]] = 1
 
         expand = fresh & (code == 0)
         return c, (rep - 1).clamp(0, 2).to(torch.uint8), code, mask, expand
@@ -690,6 +762,8 @@ class Search:
         self.edge_child[rows, nodes] = -1
         self.edge_N[rows, nodes] = 0
         self.edge_Q[rows, nodes] = 0
+        if self.edge_win.numel():
+            self.edge_win[rows, nodes] = 0
 
     def _promotion_targets(self, boards: torch.Tensor, control: torch.Tensor) -> torch.Tensor:
         """``[B, 32, 64] bool``: the move ``p -> s`` promotes.
@@ -828,6 +902,30 @@ class Search:
                 "rules-seeded terminal edges (§6.1a)")
         pi = nvis / total
 
+        if self.edge_win.numel():
+            # §6.6a. **The one place `pi` is not the visit distribution**, and it is
+            # deliberate. The collapse already sends every simulation to the winning
+            # edges, so `nvis` is nearly there -- but §6.1a seeded one visit on each
+            # *drawing* terminal edge too, and those keep it. A stalemate child at a
+            # won root is the single worst move on the board and would carry ~0.008 of
+            # the target; and `budget + seeded` rarely divides evenly among `w`
+            # winners, so the survivors would sit at +-1 visit of each other.
+            #
+            # Every proved win here is a mate **in one** -- the sweep is depth 1 and a
+            # deeper proof cannot reach the root's own edge set -- so the winners are
+            # equally optimal and uniform is exact rather than an approximation.
+            # ⚠️ That stops being true the moment a proof propagates from below: wins
+            # of different lengths are not equally good, and this line would need
+            # CrazyAra's `END_IN_PLY` to pick the shortest.
+            #
+            # `edge_N` is untouched, so invariant 6 above still reads the visits the
+            # simulations actually made.
+            win = (self.edge_win[:, 0] != 0) & valid
+            collapsed = win.any(-1, keepdim=True)
+            w = win.to(pi.dtype)
+            pi = torch.where(collapsed, w / w.sum(-1, keepdim=True).clamp(min=1.0), pi)
+            self.stats.collapsed_roots += int(collapsed.sum())
+
         sampled = torch.multinomial(pi, 1, generator=self._gen).squeeze(-1)
         best = _lowest_argmax(pi)
         e = torch.where(self.game_ply < c.tau_plies, sampled, best)
@@ -925,6 +1023,10 @@ class SearchStats:
         # chess reaches ~218 legal moves in constructed ones, so this says whether
         # the headroom ever ran out instead of leaving it to a curve to hint at.
         self.terminals_truncated = 0
+        # §6.6a: roots whose `pi` was collapsed onto a proved mate. Zero when the
+        # collapse is off, and its ratio to `moves` is the share of positions the
+        # feature can possibly have touched -- ~1.1 % measured on `t9h-n128-sweep`.
+        self.collapsed_roots = 0
         self.game_lengths = []
 
     # -- collection ------------------------------------------------------- #
@@ -1003,6 +1105,7 @@ class SearchStats:
             "n_terminal_children": self.n_terminal_children,
             "n_empty_mask_expansions": self.n_empty_mask_expansions,
             "terminals_truncated": self.terminals_truncated,
+            "collapsed_roots": self.collapsed_roots,
             # §15.2, whether the search is doing anything
             "mean_root_max_pi": self.root_max_pi / moves,
             "mean_root_entropy": self.root_entropy / moves,

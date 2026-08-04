@@ -1189,3 +1189,162 @@ class TestRootTerminalSweep:
         s.reset(boards, control)
         s.root_init()
         assert len(calls) == 1, "root_init evaluates the root once and nothing else"
+
+
+# --------------------------------------------------------------------------- #
+# §6.6a, the terminal collapse
+# --------------------------------------------------------------------------- #
+
+# White has a mate in one and there are **two** of them, so the collapsed target
+# has to be shared rather than being a point mass on whichever came first.
+TWO_MATES = "6k1/5ppp/8/8/8/8/5PPP/R3R1K1 w - - 0 1"
+# White has **no** mate here, and exactly one of its 14 legal moves (Kg1-h1) walks
+# into Rxa1#. So the root must carry no win bit at all while a node one ply down
+# carries one -- which is the parity, and a sign error swaps exactly those two.
+ALLOWS_MATE = "r5k1/5ppp/8/8/8/8/5PPP/B5K1 w - - 0 1"
+ALLOWS_MATE_LOSING_MOVE = "g1h1"
+
+
+def _ucis(board, labels):
+    """Edge labels as UCI, in edge order."""
+    from brokefish.env.notation import to_uci
+
+    lab = labels.to(torch.int64)
+    k = lab.numel()
+    return to_uci(board.expand(k, 32), lab & ((1 << MOVE_BITS) - 1),
+                  (lab >> MOVE_BITS) & 0b11)
+
+
+def _root_ucis(s):
+    """The root's edge set. ⚠️ Only after `root_init`; before it there are none."""
+    k = int(s.node_nedges[0, 0])
+    assert k > 0, "the root has no edges yet: call root_init() first"
+    return _ucis(s.node_board[0, 0], s.edge_move[0, 0, :k])
+
+
+def _record_ucis(record):
+    """The stored target's support, which §10 keeps in the root's edge order."""
+    k = int(record.policy_len[0])
+    return _ucis(record.board[0], record.policy_move[0, :k])
+
+
+def _win_bits_agree_with_the_rules(s):
+    """§6.6a's mask, both directions, over every allocated node.
+
+    ⚠️ This is the parity check and it is an equality, not a statistic. A win bit
+    means *the mover at this node* is delivering mate, which in the [0, 1]
+    convention is `node_value == 0.0` at the child -- a certain loss for whoever
+    moves there. Reverse the sign and every one of these flips, the collapse steers
+    onto the move that loses on the spot, and nothing else in the suite would say so.
+    """
+    bad = []
+    for v in range(int(s.node_count[0])):
+        for f in range(int(s.node_nedges[0, v])):
+            c = int(s.edge_child[0, v, f])
+            marked = int(s.edge_win[0, v, f]) != 0
+            if c < 0:
+                # A seeded root edge nothing has descended into yet has no node to
+                # check against; the collapse visits it first, so this is rare.
+                continue
+            is_win = (int(s.node_flags[0, c] & TERMINAL) == env.CHECKMATE
+                      and float(s.node_value[0, c]) == 0.0)
+            if marked != is_win:
+                bad.append((v, f, marked, is_win))
+    return bad
+
+
+def test_the_collapse_is_off_by_default():
+    """Every number measured before 2026-08-03 was measured without it."""
+    assert SearchConfig().terminal_collapse is False
+    s = make(n=4, B=1)
+    assert s.edge_win.numel() == 0, "the mask is not allocated when the flag is off"
+
+    # And the pathology it exists to remove is still there with the flag off: at
+    # n = 128 over this root PUCT does not put the mate anywhere near a point mass.
+    b, c = from_fen(MATE_IN_1)
+    s = make(n=128, B=1, boards=b, control=c, tau_plies=0, eps=0.0)
+    with torch.no_grad():
+        record = s.self_play_move()
+    pi = record.policy_prob[0].float()
+    assert float(pi.max()) < 1.0, \
+        "the un-collapsed target became a point mass; the default changed"
+
+
+def test_the_collapse_makes_the_root_target_a_point_mass():
+    """One mate, so `pi` is a Dirac on it -- at `n = 32`, not the 800 §12 needs."""
+    b, c = from_fen(MATE_IN_1)
+    s = make(n=32, B=1, boards=b, control=c, tau_plies=0, eps=0.0,
+             terminal_collapse=True)
+    with torch.no_grad():
+        record = s.self_play_move()
+    e = _record_ucis(record).index("e1e8")
+    pi = record.policy_prob[0].float()
+    assert float(pi[e]) == 1.0, f"pi on the mate is {float(pi[e])}, not 1"
+    assert float(pi.sum()) == 1.0 and int((pi > 0).sum()) == 1
+    assert bool(s.game_done[0]) and int(record.result[0]) == -1, "the mate was not played"
+    assert s.stats.collapsed_roots == 1
+
+
+def test_the_collapse_splits_the_target_over_equal_mates():
+    """Two mates in one are equally optimal, so the target is uniform over them.
+
+    Every proved win at the root is a mate **in one** -- §6.1a's sweep is depth 1 --
+    so uniform is exact. It stops being exact the day a proof propagates from below.
+    """
+    b, c = from_fen(TWO_MATES)
+    s = make(n=32, B=1, boards=b, control=c, tau_plies=0, eps=0.0,
+             terminal_collapse=True)
+    with torch.no_grad():
+        record = s.self_play_move()
+    ucis = _record_ucis(record)
+    pi = record.policy_prob[0].float()
+    want = {ucis.index("e1e8"), ucis.index("a1a8")}
+    got = set((pi > 0).nonzero().flatten().tolist())
+    assert got == want, f"mass on {sorted(got)}, expected {sorted(want)}"
+    for e in want:
+        assert float(pi[e]) == 0.5
+
+
+def test_the_collapse_gets_the_parity_right_below_the_root():
+    """The root has no win; one ply down, one does. A sign error swaps them."""
+    b, c = from_fen(ALLOWS_MATE)
+    s = make(n=384, B=1, boards=b, control=c, tau_plies=0, eps=0.0,
+             terminal_collapse=True)
+    with torch.no_grad():
+        s.root_init()
+        ucis = _root_ucis(s)
+        for i in range(s.config.n):
+            s.simulate(i)
+
+    assert int(s.edge_win[0, 0].sum()) == 0, \
+        "the root was marked as winning and White has no mate here: the parity is inverted"
+    assert not _win_bits_agree_with_the_rules(s)
+
+    interior = int(s.edge_win[0, 1:int(s.node_count[0])].sum())
+    assert interior > 0, ("no interior win was ever proved, so the collapse below the "
+                          "root went untested; raise n or pick a narrower fixture")
+
+    # The move that walks into mate is refuted rather than promoted. Without the
+    # collapse the child's Q is whatever the untrained value head says; with it,
+    # every descent through that child returns a certain loss.
+    e = ucis.index(ALLOWS_MATE_LOSING_MOVE)
+    assert int(s.edge_child[0, 0, e]) >= 0, "the losing move was never tried"
+    assert float(s.edge_Q[0, 0, e]) < 0.5, \
+        f"Q on the mate-allowing move is {float(s.edge_Q[0, 0, e]):.3f}: not a refutation"
+
+
+def test_the_collapse_leaves_the_visit_invariant_alone():
+    """`edge_N` is untouched by the target rewrite, so invariant 6 still reads it."""
+    b, c = from_fen(TWO_MATES)
+    s = make(n=48, B=2, boards=b, control=c, tau_plies=0, eps=0.25,
+             terminal_collapse=True)
+    with torch.no_grad():
+        s.root_init()
+        for i in range(s.config.n):
+            s.simulate(i)
+        check_invariants(s)
+        ne = s.node_nedges[:, 0].long()
+        valid = torch.arange(s.config.E, device=s.device)[None, :] < ne[:, None]
+        total = torch.where(valid, s.edge_N[:, 0].long(), torch.zeros_like(valid.long()))
+        assert bool((total.sum(-1) == (s.budget + s.seeded).long()).all())
+        s.select_and_advance()

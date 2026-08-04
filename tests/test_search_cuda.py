@@ -49,6 +49,9 @@ FIFTY_MOVE = "4k3/8/8/8/8/8/8/4K2R w - - 99 1"
 # every candidate's logit is a policy entry read identically on both sides and
 # §4.3's truncation has to agree exactly rather than to a tolerance.
 MAX_MOBILITY = "R6R/3Q4/1Q4Q1/4Q3/2Q4Q/Q4Q2/pp1Q4/kBNN1KB1 w - - 0 1"
+# White mates in one with Re1-e8, and it is the only mate, so §6.6a collapses the
+# root onto a single edge and the two implementations have to agree on which.
+MATE_IN_1 = "6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1"
 # Pawnless, so no promotion can ever appear and every candidate's logit under
 # `flat_eval` is exactly zero. See `test_flat_priors_agree_bit_for_bit`.
 PAWNLESS = ("4k3/8/8/8/8/8/8/R3K2R w KQ - 0 1",
@@ -135,18 +138,15 @@ class Probe:
 
     @staticmethod
     def _scores(s, v):
-        c = s.config
-        nvis = s.edge_N[s._b, v].to(torch.float32)
-        prior = s.edge_prior[s._b, v].float()
-        q = s.edge_Q[s._b, v]
-        valid = s._e[None, :] < s.node_nedges[s._b, v].long()[:, None]
-        n_v = torch.where(valid, nvis, torch.zeros_like(nvis)).sum(-1, keepdim=True)
-        pb = torch.log((n_v + c.pb_c_base + 1.0) / c.pb_c_base) + c.pb_c_init
-        pb = pb * n_v.sqrt() / (nvis + 1.0)
-        # §6.6's FPU, mirroring `_select`. It must be the same constant or the margin
-        # and perturbation below describe a score function nothing computes.
-        score = pb * prior + torch.where(nvis > 0, q, torch.full_like(q, FPU_DRAW))
-        return torch.where(valid, score, torch.full_like(score, float("-inf")))
+        """The reference's own score function, applied to whichever tree is passed.
+
+        ⚠️ It **calls** `_puct_scores` rather than restating it. This used to be a
+        transcription, and the constant in it had to be kept in step by hand -- which
+        is the shape of the bug that produced four copies of the FPU slip. `cuda_impl`
+        inherits the method, so `_scores(cu, v)` scores the kernel's tree with the
+        reference's arithmetic, which is exactly what the perturbation below means.
+        """
+        return s._puct_scores(v)
 
     def __call__(self, v):
         a = self._scores(self.ref, v)
@@ -171,7 +171,8 @@ class Probe:
         return self.inner(v)
 
 
-def _pair(boards, control, n, eps=0.0, seed=11, stats=False, tau_plies=30):
+def _pair(boards, control, n, eps=0.0, seed=11, stats=False, tau_plies=30,
+          collapse=False):
     """A reference and a kernel search over the same games, from the same seed.
 
     The Dirichlet noise is not injected. Both classes inherit §6.1's torch
@@ -183,7 +184,8 @@ def _pair(boards, control, n, eps=0.0, seed=11, stats=False, tau_plies=30):
     # E follows the kernel's compile-time `kE`; pinning a literal here would make
     # every CUDA test fail the moment the cap moves, which is noise rather than a
     # signal -- `cuda_impl` already refuses a mismatch on construction.
-    cfg = SearchConfig(n=n, B=B, E=int(_ext().edge_cap()), eps=eps, tau_plies=tau_plies)
+    cfg = SearchConfig(n=n, B=B, E=int(_ext().edge_cap()), eps=eps, tau_plies=tau_plies,
+                       terminal_collapse=collapse)
     ref = Recording(cfg, hash_eval, env=env, device="cuda", seed=seed)
     cu = search_impl("cuda")(cfg, hash_eval, env=env, device="cuda", seed=seed,
                              collect_stats=stats)
@@ -222,6 +224,15 @@ def _differences(ref, cu, prior_ulps=1.0, atol_q=0.0):
         if not bool((x == y).all()):
             where = (x != y).nonzero()[:3].tolist()
             out.append(f"{f}: {int((x != y).sum())} entries differ, first at {where}")
+
+    # §6.6a's mask, when it is allocated. Comparing only its *effect* would let the
+    # two implementations disagree about which edges are winning and stay green for
+    # as long as the disagreement never reached a node the descent revisited.
+    if ref.edge_win.numel():
+        x, y = ref.edge_win[:, :live], cu.edge_win[:, :live]
+        if not bool((x == y).all()):
+            out.append(f"edge_win: {int((x != y).sum())} entries differ, first at "
+                       f"{(x != y).nonzero()[:3].tolist()}")
 
     p, q = ref.edge_prior[:, :live].float(), cu.edge_prior[:, :live].float()
     if prior_ulps == 0.0:
@@ -746,3 +757,43 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# --------------------------------------------------------------------------- #
+# §6.6a, the terminal collapse
+# --------------------------------------------------------------------------- #
+
+def test_agrees_with_the_collapse_on_a_won_root():
+    """The root is proved won, so every simulation is collapsed from the first.
+
+    This is the branch the plain suite never enters: with the flag off `edge_win` is
+    a null pointer in the kernel and an empty tensor in the reference, so nothing
+    above exercises the ballot, the `-N` score or the seeded mask.
+    """
+    boards, control = _from_fen(MATE_IN_1, copies=2)
+    ref, cu, probe = _pair(boards, control, n=96, eps=0.0, collapse=True)
+    _run(ref, cu, moves=1, label="collapse, won root: ")
+    assert int(ref.edge_win[0, 0].sum()) == 1, "the sweep proved no win on a mate in one"
+
+
+def test_agrees_with_the_collapse_on_random_positions():
+    """Most roots have no win, so this is the pass-through branch plus the interior.
+
+    Several moves, so nodes are created below the root and `_create_child`'s half of
+    the mask -- the half where the parity is written a second time -- is compared
+    against the kernel's rather than only against the rules.
+    """
+    boards, control = _live(24, plies=60, seed=5)
+    ref, cu, probe = _pair(boards, control, n=96, eps=0.25, collapse=True)
+    _run(ref, cu, moves=3, label="collapse, random: ")
+    _report(probe, "collapse, random")
+
+
+def test_agrees_with_the_collapse_deep_in_the_endgame():
+    """Where mates are dense, so the interior branch actually fires."""
+    boards, control = _live(24, plies=160, seed=9)
+    ref, cu, probe = _pair(boards, control, n=128, eps=0.25, collapse=True, stats=True)
+    _run(ref, cu, moves=3, label="collapse, endgame: ")
+    live = int(max(ref.node_count.max(), cu.node_count.max()))
+    marked = int(ref.edge_win[:, :live].sum())
+    print(f"    collapse, endgame: {marked} winning edges proved across the batch")

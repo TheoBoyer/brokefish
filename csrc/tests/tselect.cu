@@ -53,13 +53,18 @@ struct Rng {
 // §6.6, the selection score
 // --------------------------------------------------------------------------- //
 
+// `win` is §6.6a's mask, or nullptr for the plain scan. The kernel takes it rather
+// than two kernels taking one each, so the collapse is exercised through the same
+// entry point the descent uses.
 __global__ void puct_kernel(const int16_t* nvis, const __half* prior, const float* qs,
-                            const int* nedges, Params p, int* out, int cases) {
+                            const uint8_t* win, const int* nedges, Params p, int* out,
+                            int cases) {
     const int c = blockIdx.x * kWarps + (int)(threadIdx.x >> 5);
     if (c >= cases) return;
     const int lane = (int)(threadIdx.x & 31);
     const size_t off = (size_t)c * kE;
-    const int e = puct_argmax(nvis + off, prior + off, qs + off, nedges[c], lane, p);
+    const int e = puct_argmax(nvis + off, prior + off, qs + off,
+                              win ? win + off : nullptr, nedges[c], lane, p);
     if (lane == 0) out[c] = e;
 }
 
@@ -77,7 +82,14 @@ int host_puct(const int16_t* nvis, const __half* prior, const float* qs, int ned
     for (int e = 0; e < nedges; ++e) {
         const double n = (double)nvis[e];
         const double u = pb_root / (n + 1.0);
-        const double q = n > 0.0 ? (double)qs[e] : 0.0;
+        // ⚠️ §6.6's first-play urgency, and it must be `kFpuDraw`. This line read a
+        // literal 0.0 until 2026-08-03 and the check had been failing 71 of 20 000
+        // cases since the FPU fix of 2026-07-31 -- the **fourth** independent copy of
+        // this expression to carry AGZ's `[-1, 1]` zero into the `[0, 1]` tree, after
+        // `tests/oracle.py`, `search/trace.py` and `debugger/static/trace.js`. It
+        // survived because `csrc/tests` is a separate no-Python build that `pytest`
+        // never runs, so nothing said so out loud.
+        const double q = n > 0.0 ? (double)qs[e] : (double)kFpuDraw;
         const double score = u * (double)__half2float(prior[e]) + q;
         if (score > best) {
             second = best;
@@ -130,7 +142,7 @@ int test_puct() {
     CHECK(cudaMalloc(&d_out, cases * sizeof(int)));
 
     puct_kernel<<<(cases + kWarps - 1) / kWarps, kWarps * 32>>>(
-        d_nvis, d_prior, d_qs, d_nedges, Params{kBase, kInit}, d_out, cases);
+        d_nvis, d_prior, d_qs, nullptr, d_nedges, Params{kBase, kInit}, d_out, cases);
     CHECK(cudaGetLastError());
     std::vector<int> got(cases);
     CHECK(cudaMemcpy(got.data(), d_out, cases * sizeof(int), cudaMemcpyDeviceToHost));
@@ -205,7 +217,7 @@ int test_tie_break() {
     int* d_out = nullptr;
     CHECK(cudaMalloc(&d_out, n * sizeof(int)));
     puct_kernel<<<(n + kWarps - 1) / kWarps, kWarps * 32>>>(
-        d_nvis, d_prior, d_qs, d_nedges, Params{kBase, kInit}, d_out, n);
+        d_nvis, d_prior, d_qs, nullptr, d_nedges, Params{kBase, kInit}, d_out, n);
     CHECK(cudaGetLastError());
     std::vector<int> got(n);
     CHECK(cudaMemcpy(got.data(), d_out, n * sizeof(int), cudaMemcpyDeviceToHost));
@@ -225,6 +237,102 @@ int test_tie_break() {
     CHECK(cudaFree(d_qs));
     CHECK(cudaFree(d_nedges));
     CHECK(cudaFree(d_out));
+    return bad;
+}
+
+// §6.6a, the collapse. Two claims, and the second is the one a bug would hide in:
+//
+//   * with at least one winning edge, the scan returns the **least-visited** one,
+//     ties to the lowest index -- that is what makes the visits round-robin and
+//     `pi` come out uniform over the winners;
+//   * with none, the scan is bit-for-bit the plain PUCT scan, so passing the mask
+//     costs nothing on the 99 % of nodes that have no proved win.
+//
+// Exact, no tolerance: the collapsed branch compares small integers and never
+// touches a prior, so there is no fp32-against-fp64 floor to hide behind.
+int test_collapse() {
+    const int cases = 20000;
+    std::vector<int16_t> nvis((size_t)cases * kE, 0);
+    std::vector<__half> prior((size_t)cases * kE, __float2half(0.0f));
+    std::vector<float> qs((size_t)cases * kE, 0.0f);
+    std::vector<uint8_t> win((size_t)cases * kE, 0);
+    std::vector<int> nedges(cases);
+
+    Rng rng{0x5EED5EEDULL};
+    for (int c = 0; c < cases; ++c) {
+        // Regime 0 has no winner at all, which is the "identical to the plain scan"
+        // half. The rest carry 1..4 winners, placed anywhere in the edge set so the
+        // warp reduction has to cross lane boundaries to find them.
+        const int regime = c % 4;
+        const int ne = 1 + rng.below(kE);
+        nedges[c] = ne;
+        for (int e = 0; e < ne; ++e) {
+            const size_t i = (size_t)c * kE + e;
+            const int n = rng.below(200);
+            nvis[i] = (int16_t)n;
+            prior[i] = __float2half((float)rng.unit());
+            qs[i] = n > 0 ? (float)rng.unit() : 0.0f;
+        }
+        if (regime != 0) {
+            const int w = 1 + rng.below(4);
+            for (int k = 0; k < w; ++k) win[(size_t)c * kE + rng.below(ne)] = 1;
+        }
+    }
+
+    int16_t* d_nvis = to_device(nvis);
+    __half* d_prior = to_device(prior);
+    float* d_qs = to_device(qs);
+    uint8_t* d_win = to_device(win);
+    int* d_nedges = to_device(nedges);
+    int* d_out = nullptr;
+    int* d_off = nullptr;
+    CHECK(cudaMalloc(&d_out, cases * sizeof(int)));
+    CHECK(cudaMalloc(&d_off, cases * sizeof(int)));
+
+    puct_kernel<<<(cases + kWarps - 1) / kWarps, kWarps * 32>>>(
+        d_nvis, d_prior, d_qs, d_win, d_nedges, Params{kBase, kInit}, d_out, cases);
+    CHECK(cudaGetLastError());
+    // The same inputs with the mask withheld, so "no winner behaves exactly like
+    // the plain scan" is checked against the kernel itself rather than against the
+    // host reference's rounding.
+    puct_kernel<<<(cases + kWarps - 1) / kWarps, kWarps * 32>>>(
+        d_nvis, d_prior, d_qs, nullptr, d_nedges, Params{kBase, kInit}, d_off, cases);
+    CHECK(cudaGetLastError());
+    std::vector<int> got(cases), plain(cases);
+    CHECK(cudaMemcpy(got.data(), d_out, cases * sizeof(int), cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(plain.data(), d_off, cases * sizeof(int), cudaMemcpyDeviceToHost));
+
+    int bad = 0, collapsed = 0, passthrough = 0;
+    for (int c = 0; c < cases; ++c) {
+        const size_t off = (size_t)c * kE;
+        int want = -1, fewest = 1 << 30;
+        for (int e = 0; e < nedges[c]; ++e) {
+            if (!win[off + e]) continue;
+            if ((int)nvis[off + e] < fewest) {
+                fewest = (int)nvis[off + e];
+                want = e;
+            }
+        }
+        if (want < 0) {
+            ++passthrough;
+            want = plain[c];
+        } else {
+            ++collapsed;
+        }
+        if (got[c] == want) continue;
+        if (bad++ < 5)
+            printf("  case %d: kernel chose %d, expected %d (%s)\n", c, got[c], want,
+                   fewest < (1 << 30) ? "collapsed" : "pass-through");
+    }
+    printf("  %-34s %s  (%d collapsed, %d pass-through)\n", "puct_argmax collapse",
+           bad ? "FAIL" : "OK", collapsed, passthrough);
+    CHECK(cudaFree(d_nvis));
+    CHECK(cudaFree(d_prior));
+    CHECK(cudaFree(d_qs));
+    CHECK(cudaFree(d_win));
+    CHECK(cudaFree(d_nedges));
+    CHECK(cudaFree(d_out));
+    CHECK(cudaFree(d_off));
     return bad;
 }
 
@@ -488,6 +596,7 @@ int main() {
     int failures = 0;
     failures += test_puct();
     failures += test_tie_break();
+    failures += test_collapse();
     failures += test_expand();
     printf(failures ? "\nFAILED (%d checks)\n" : "\nall checks passed\n", failures);
     return failures ? 1 : 0;

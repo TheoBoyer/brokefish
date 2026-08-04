@@ -6,6 +6,15 @@ error only shows up as plausible-looking wrong numbers eight layers downstream.
 
     nvcc -arch=sm_89 -O3 -std=c++17 -I. -I.. tdirect.cu -o tdirect && ./tdirect
 
+⚠️ **Nothing runs these automatically.** `pytest tests/` does not reach them, so a
+check here can be red for days and say nothing. It has happened: `tselect.cu`'s host
+reference kept AGZ's literal `Q = 0` first-play urgency through the fix of
+2026-07-31 and failed **71 of 20 000 cases** until 2026-08-03 — the fourth
+independent copy of that expression to carry the `[-1, 1]` constant into the `[0, 1]`
+tree, after `tests/oracle.py`, `search/trace.py` and `debugger/static/trace.js`. Build
+and run every binary here after touching a kernel, and before believing a green
+`pytest`.
+
 `core.cuh` is `encoder.cu` with the torch bindings stripped, so the tests compile
 the real code rather than a copy of it. Regenerate it after editing the kernel:
 
@@ -22,7 +31,7 @@ host helpers in front of it, so the marker moved.)
 | `tperft.cu` | **perft against the published node counts**, all six standard positions, startpos to depth 6. The only oracle here that is not this repository | green, 1.01 s |
 | `tstep.cu` | **the board mutation of spec §4.2**: the 32 slot words and the control word after every legal move of every position, promotions expanded to four, one null move each | bit-exact over 322 246 cases |
 | `tmovegen.cu` | **the first-order move generator**, stage by stage against the PyTorch engine's own dump: base bitsets, pawns, sliders, castling, the friendly filter, the control-mode attack map and `in_check` | bit-exact over 10 000 positions |
-| `tselect.cu` | **docs/mcts.md §6.6 and §6.4**: the PUCT scan and its tie-break, and the canonical edge enumeration with promotions and truncation, against a host reference in double | 20 000 selections, 400 enumerations, no dump needed |
+| `tselect.cu` | **docs/mcts.md §6.6, §6.6a and §6.4**: the PUCT scan and its tie-break, §6.6a's terminal collapse in both branches, and the canonical edge enumeration with promotions and truncation, against a host reference in double | 20 000 selections, 20 000 collapse cases, 400 enumerations, no dump needed |
 | `tdirect.cu` | **the packed weight layout**: `gemm_direct` against a host reference that reimplements `pack_b` from the fragment definition | bit-exact |
 | `tgemm.cu` | A, B and D fragment layouts for one 32x32 tile | bit-exact |
 | `tg2.cu` | the same at A row pitches 40 and 264 | bit-exact |

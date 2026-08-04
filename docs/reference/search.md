@@ -728,12 +728,93 @@ position-independent move. The same network with `Q = 0.5` visits 20 of 20 at
 `n = 800`. The story is in
 [the 2026-07-31 collapse post-mortem](../journal/2026-07-31-value-collapse.md).
 
+### 6.6a The terminal collapse
+
+`terminal_collapse`, **off by default**. On a node with at least one edge whose child
+the rules have proved is checkmate, the selection score of §6.6 is replaced by
+
+```
+win(e)   = the child of e is checkmate for THIS node's mover
+score(e) = win(e) ? -edge_N[b][v][e] : -infinity      if any win(e)
+```
+
+so the simulations round-robin over the winning edges and reach nothing else. Ties
+break to the lowest edge index, as in §6.6.
+
+**Why.** §6.1a guarantees a mate at the root is *present* in the edge set; it does
+not guarantee it is *chosen*. Measured over run `t9h-n128-sweep`'s finished buffer —
+88,322 positions in the newest 600 games, of which **785 had a mate in one (0.89 %)**:
+
+| | |
+|---|---|
+| the mating move was in the record's support | **100.0 %** |
+| median `pi` on it | **0.302** (mean 0.401, p10 0.039) |
+| targets that were a point mass (`pi > 0.99`) | **0 of 785** |
+| the mate was the argmax | **56.1 %** (53.6 % past `tau_plies`, where the argmax *is* the move played) |
+| mean visits on the mating edge | 51.3 of 128 |
+
+Those roots are already won — `root_value` mean **0.886** — so a proved `1.0` leads its
+rivals by ~0.11 while a fresh edge's exploration term is worth ~0.42, and 128
+simulations over 42.4 edges is 3.0 visits each. Exploration wins. The effect is
+monotone in the edge count, which is the same statement said twice: under 30 edges the
+mate takes 0.631 of the visits, over 60 edges it takes 0.203.
+
+⚠️ **The parity is the whole risk.** `win(e)` means the mover *at this node* delivers
+mate, i.e. the child's `result` is `-1` in the child's own frame, i.e.
+`node_value[child] == 0.0` — a certain loss for whoever moves there. It is the same
+flip as §6.5's backup and as §6.1a's seeding. Inverted, the collapse steers onto the
+move that loses on the spot, and nothing in the aggregates would say so.
+`tests/test_search.py::test_the_collapse_gets_the_parity_right_below_the_root` checks
+both directions of the mask against the rules over every allocated node.
+
+**What it is not.** There is no proof propagation, no solved-node state, and no
+handling of proved draws. A proved *draw* is good only when everything else is proved
+lost, which needs the resolved-children logic of a full solver; §6.1a already seeds a
+stalemate child at 0.5 precisely so that it stays buried, and the collapse must not
+promote it. Only WIN collapses.
+
+**Placement in the literature.** MCTS-Solver (Winands, Björnsson & Saito 2008)
+backpropagates proved wins and losses; Leela's `certainty propagation` states the
+play-time half of this exactly — *"if we have a certain win at root we can play it
+immediately, regardless of the visits that move received"* — and CrazyAra's
+`Exact-win-MCTS 2.0` prunes a proved loss with `Q = -inf`. None of them publish what
+becomes of the **training target**; KataGo's policy target pruning is the precedent
+that a target may legitimately differ from the visit distribution, and Gumbel
+AlphaZero is the general form of the complaint — at a small simulation budget the
+normalised visit count is not a policy improvement operator at all.
+
+* Winands, Björnsson & Saito, *Monte-Carlo Tree Search Solver*, Computers and Games 2008 — [pdf](https://dke.maastrichtuniversity.nl/m.winands/documents/uctloa.pdf)
+* [lc0 MCTS-Solver / certainty propagation](https://github.com/Videodr0me/leela-chess-experimental/wiki/MCTS-Solver---Certainty-Propagation-and-Autoextending), and [PR #487](https://github.com/LeelaChessZero/lc0/pull/487/files)
+* Czech, Korus & Kersting, *Monte-Carlo Graph Search for AlphaZero*, ICAPS 2021 — [ar5iv](https://ar5iv.labs.arxiv.org/html/2012.11045)
+* Wu, *Accelerating Self-Play Learning in Go* (KataGo), 2019 — [ar5iv](https://ar5iv.labs.arxiv.org/html/1902.10565)
+* Danihelka et al., *Policy improvement by planning with Gumbel*, ICLR 2022 — [pdf](https://davidstarsilver.wordpress.com/wp-content/uploads/2025/04/gumbel-alphazero.pdf)
+
+**Cost.** One `[B, Nmax, E]` uint8 mask, allocated only when the flag is on — 315 MB at
+the Gate 1a shape against 3.8 GB for the edge arrays. Selection gains one warp ballot.
+No simulations are saved: `descent` and the encoder launch on the full batch whatever
+the descent did, so this is a quality change and not a throughput one.
+
 ### 6.7 `select_and_advance`
 
 At the root, form `pi(a) = N(a) / n` and pick the move:
 
 * `game_ply[b] < tau_plies`: sample from `pi`.
 * otherwise: `argmax N(a)`, ties by lowest edge index.
+
+⚠️ **With §6.6a on there is one exception, and it is the only place `pi` is not the
+visit distribution.** If any root edge is a proved win, `pi` is set to **uniform over
+exactly those edges** and zero elsewhere. Two reasons it is not left to the visit
+counts alone: §6.1a seeds one visit on each *drawing* terminal edge too, and a
+stalemate child at a won root is the worst move on the board — it would carry ~0.008 of
+the target; and `budget + seeded` rarely divides evenly among the winners, so they
+would sit at ±1 visit of each other. Every proved win at the root is a mate **in one**,
+since §6.1a's sweep is depth 1, so the winners are equally optimal and uniform is exact
+rather than an approximation. 72.5 % of the time there is exactly one of them.
+
+⚠️ The moment a proof reaches the root from *below*, that stops being true — wins of
+different lengths are not equally good and this line would need CrazyAra's `END_IN_PLY`
+to prefer the shortest. `edge_N` is left untouched, so invariant 6 still reads the
+visits the simulations actually made.
 
 Then emit the training record of §10, push the pre-move hash into the game ring per
 [spec §6.3](spec.md#63-detecting-a-repetition-on-device), apply the move to the real game position with
@@ -1300,6 +1381,7 @@ exercised rather than assumed.
 | virtual loss | `search.md` §1.1 files it as an addition, and [the fidelity audit](../journal/2026-07-30-fidelity.md) §2.1(a) argues it is a deviation: AGZ's search ran threaded with virtual loss and AZ defers to AGZ, so v0's tree is slightly more concentrated than AlphaZero's at the same `n`. Ten minutes with the AGZ Methods settles it |
 | `tau_plies` in plies or moves | 30 plies in v0. AGZ says "the first 30 moves", which is a ply in Go and a pair in chess. [the fidelity audit](../journal/2026-07-30-fidelity.md) §2.1(c) |
 | fp16 priors under a trained policy | §4.2 stores priors as fp16, where a prior below 6e-8 flushes to zero and its exploration term is zero forever. Harmless at today's flat policy, unmeasured at a sharp one, and §15 has no counter for it. [the fidelity audit](../journal/2026-07-30-fidelity.md) §2.2 |
+| how far the terminal collapse should reach | depth 1 in §6.6a: the root's proved wins come from §6.1a's exhaustive sweep, and below the root a win is only found where ordinary exploration happens to land on it. Measured on `t9h-n128-sweep`, **~0.25 terminal children are discovered per search of 128 simulations** below the root, so there is little raw material to propagate at this budget and the case for a full MCTS-Solver is a bet on `n` going *up*. Extending it needs a solved-node state, the DRAW logic §6.6a deliberately omits, and `END_IN_PLY` to prefer the shorter mate |
 | the game-length cap | absent in v0. AZ's Domain Knowledge item 5 terminates chess games "exceeding a maximum number of steps (determined by typical game length)" and scores them drawn; the pseudocode uses 512 plies. Our rules end games only as chess does, which is stricter and can produce longer games |
 
 ---

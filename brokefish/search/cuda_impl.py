@@ -56,7 +56,12 @@ from .torch_impl import MoveRecord, SearchConfig, SearchStats, check_invariants 
 TREE_FIELDS = (
     "node_board", "node_control", "node_hash", "node_value", "node_nedges",
     "node_flags", "node_parent", "node_pedge",
-    "edge_move", "edge_prior", "edge_child", "edge_N", "edge_Q",
+    # `edge_win` is §6.6a's collapse mask and is the one field that may be **empty**:
+    # `torch_impl` allocates it only when `terminal_collapse` is on, and `make_tree`
+    # reads an empty tensor as a null pointer, which is how the kernels see "off".
+    # Same convention as the counter block, and it means the flag has exactly one
+    # representation instead of a bool that can disagree with an allocation.
+    "edge_move", "edge_prior", "edge_child", "edge_N", "edge_Q", "edge_win",
     "path_node", "path_edge", "path_len",
     "game_ring", "game_ring_len", "node_count", "budget",
     "leaf_board", "leaf_control", "leaf_rep", "leaf_node", "leaf_flags",

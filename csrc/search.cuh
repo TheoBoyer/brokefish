@@ -131,6 +131,12 @@ struct Tree {
     int16_t* edge_child;     // [B, N, kE]
     int16_t* edge_N;         // [B, N, kE]
     float* edge_Q;           // [B, N, kE]
+    // §6.6a's collapse mask, [B, N, kE], **or nullptr**. Non-zero where the child
+    // this edge leads to is checkmate for the mover *at this node*. Null is how the
+    // host says `terminal_collapse` is off, which is the same "empty tensor means
+    // absent" convention `Counters` uses, so the feature has one representation and
+    // not a flag that can disagree with an allocation.
+    uint8_t* edge_win;
 
     int16_t* path_node;      // [B, D]
     uint8_t* path_edge;      // [B, D]
@@ -202,8 +208,12 @@ __device__ inline int warp_exclusive_scan(int v, int lane, int* total) {
 // node every score is exactly 0 (`sqrt(N_v) == 0` kills the exploration term and
 // first-play urgency zeroes Q), so every edge ties and the tie-break alone
 // decides the first descent below every new node.
+// `win` is §6.6a's mask for this node's edges, or nullptr when the collapse is off.
+// It is passed rather than derived because a root's winning edge is seeded by §6.1a
+// before any child node exists, so there is nothing on device to derive it from.
 __device__ inline int puct_argmax(const int16_t* nvis, const __half* prior, const float* qs,
-                                 int nedges, int lane, const Params& p) {
+                                 const uint8_t* win, int nedges, int lane,
+                                 const Params& p) {
     // The reference's `torch.where(valid, nvis, 0).sum(-1)`. Non-negative
     // integers summing to at most `n`, so integer and fp32 agree exactly and the
     // reduction order is free.
@@ -224,6 +234,20 @@ __device__ inline int puct_argmax(const int16_t* nvis, const __half* prior, cons
     const float root = sqrtf(n_v);
     const float pb_root = __fmul_rn(pb, root);
 
+    // §6.6a. One warp-wide ballot decides whether this node is collapsed, before
+    // the scoring loop, so the branch below is uniform across the warp and the
+    // reference's `win.any(-1)` is reproduced exactly rather than per lane.
+    bool collapsed = false;
+    if (win) {
+        bool mine = false;
+#pragma unroll
+        for (int j = 0; j < kEPerLane; ++j) {
+            const int e = lane + 32 * j;
+            if (e < nedges && win[e]) mine = true;
+        }
+        collapsed = __any_sync(kAll, mine);
+    }
+
     float best = -INFINITY;
     int best_e = kE;
 #pragma unroll
@@ -231,9 +255,19 @@ __device__ inline int puct_argmax(const int16_t* nvis, const __half* prior, cons
         const int e = lane + 32 * j;
         if (e >= nedges) continue;
         const float n = (float)nvis[e];
-        const float u = __fdiv_rn(pb_root, __fadd_rn(n, 1.0f));
-        const float q = n > 0.0f ? qs[e] : kFpuDraw;
-        const float score = __fadd_rn(__fmul_rn(u, __half2float(prior[e])), q);
+        float score;
+        if (collapsed) {
+            // The value here is exact and every winning edge is equally optimal, so
+            // there is nothing for PUCT to weigh. `-n` sends the next visit to the
+            // least-visited winner, which is what makes `pi` uniform over them.
+            // Exact in fp32: `n` is a non-negative integer below 2^15.
+            if (!win[e]) continue;
+            score = -n;
+        } else {
+            const float u = __fdiv_rn(pb_root, __fadd_rn(n, 1.0f));
+            const float q = n > 0.0f ? qs[e] : kFpuDraw;
+            score = __fadd_rn(__fmul_rn(u, __half2float(prior[e])), q);
+        }
         // j ascends with the edge index, so a plain `>` already breaks the
         // within-lane tie towards the lower index.
         if (score > best) {
@@ -582,6 +616,10 @@ __global__ void root_init_kernel(Tree t, const uint16_t* __restrict__ game_board
         t.edge_child[e0 + e] = -1;
         t.edge_N[e0 + e] = 0;
         t.edge_Q[e0 + e] = 0.0f;
+        // §6.6a. The tree is rebuilt every move (`node_count = 1` below), so a
+        // stale win bit from the previous move's root would be read against this
+        // move's edge set -- different position, same indices, no way to notice.
+        if (t.edge_win) t.edge_win[e0 + e] = 0;
     }
 
     // The root's repetition count is over the game ring alone: no tree exists
@@ -642,6 +680,7 @@ __global__ void descent_kernel(Tree t, Luts g, Params p, int s,
             }
             const size_t ev = edge_at(t, b, v);
             const int e = puct_argmax(t.edge_N + ev, t.edge_prior + ev, t.edge_Q + ev,
+                                      t.edge_win ? t.edge_win + ev : nullptr,
                                       (int)t.node_nedges[node_at(t, b, v)], lane, p);
             if (lane == 0) {
                 path_node[d] = (int16_t)v;
@@ -716,6 +755,7 @@ __global__ void descent_kernel(Tree t, Luts g, Params p, int s,
                 t.edge_child[ec + e] = -1;
                 t.edge_N[ec + e] = 0;
                 t.edge_Q[ec + e] = 0.0f;
+                if (t.edge_win) t.edge_win[ec + e] = 0;
             }
             if (lane == 0) {
                 const size_t nc = node_at(t, b, c);
@@ -731,6 +771,14 @@ __global__ void descent_kernel(Tree t, Luts g, Params p, int s,
                 if (code != kNone)
                     t.node_value[nc] = __float2half(((float)tr.result + 1.0f) / 2.0f);
                 t.edge_child[edge_at(t, b, parent) + chosen] = (int16_t)c;
+                // §6.6a. `tr.result` is from the point of view of the mover in the
+                // **child**, so -1 is a checkmate delivered *into* this node: a
+                // proved win for the mover at `parent`, whose edge this is. The
+                // line above stores the same fact as a value (-1 -> 0.0); this
+                // stores it as a selectable one. Reversed, the collapse picks the
+                // move that loses on the spot -- mirror of `_create_child`.
+                if (t.edge_win && code != kNone && tr.result == -1)
+                    t.edge_win[edge_at(t, b, parent) + chosen] = 1;
             }
         }
     }

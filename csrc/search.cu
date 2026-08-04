@@ -73,8 +73,8 @@ Tree make_tree(const TensorMap& m) {
         const torch::Tensor& x = lookup(m, name, dt, 3);
         TORCH_CHECK(x.size(0) == B && x.size(1) == N && x.size(2) == kE, "'", name,
                     "' must be [B, Nmax, ", kE, "], got ", x.sizes(),
-                    ". E is a compile-time constant because §6.6's scan is two edges "
-                    "per lane with no predicate on the second pass");
+                    ". E is a compile-time constant because §6.6's scan gives each "
+                    "lane kE/32 edges with no predicate on the tail");
         return x;
     };
     auto game_field = [&](const char* name, torch::ScalarType dt) -> const torch::Tensor& {
@@ -96,6 +96,29 @@ Tree make_tree(const TensorMap& m) {
     t.edge_child = raw<int16_t>(edge_field("edge_child", torch::kInt16));
     t.edge_N = raw<int16_t>(edge_field("edge_N", torch::kInt16));
     t.edge_Q = raw<float>(edge_field("edge_Q", torch::kFloat));
+
+    // §6.6a's collapse mask. The one tree field that is allowed to be **empty**:
+    // `torch_impl` allocates it only when `terminal_collapse` is on, because it is
+    // 315 MB at the Gate 1a shape, and a null pointer is what the kernels read as
+    // "off". Anything other than empty or the full edge shape is a caller bug and
+    // must not be silently treated as off -- a [B, N] tensor here would mean the
+    // collapse quietly stopped happening in a run that asked for it.
+    {
+        auto it = m.find("edge_win");
+        TORCH_CHECK(it != m.end(), "tree is missing 'edge_win'");
+        const torch::Tensor& x = it->second;
+        TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kUInt8,
+                    "'edge_win' must be a contiguous uint8 CUDA tensor");
+        if (x.numel() == 0) {
+            t.edge_win = nullptr;
+        } else {
+            TORCH_CHECK(x.dim() == 3 && x.size(0) == B && x.size(1) == N
+                            && x.size(2) == kE,
+                        "'edge_win' must be empty or [B, Nmax, ", kE, "], got ",
+                        x.sizes());
+            t.edge_win = raw<uint8_t>(x);
+        }
+    }
 
     const auto& path_node = lookup(m, "path_node", torch::kInt16, 2);
     TORCH_CHECK(path_node.size(0) == B, "path_node must be [B, Dmax]");

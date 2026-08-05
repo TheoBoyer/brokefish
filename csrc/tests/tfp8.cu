@@ -177,11 +177,11 @@ int test_mma_layout() {
 
 // -- 3. the activation quantiser ------------------------------------------ //
 
-constexpr int QM = 32, QK = 128;
+constexpr int QM = 32, QK = fp8::kRowK;
 
 __global__ void quant_kernel(const __half* src, uint8_t* dst, float* scale, int pitch) {
     extern __shared__ uint8_t smem[];
-    fp8::quantise_tile(smem, pitch, scale, 1, src, QK, QM, threadIdx.x);
+    fp8::quantise_row<QK>(smem, pitch, scale, 1, src, QK, QM, threadIdx.x);
     __syncwarp();
     for (int i = threadIdx.x; i < QM * pitch; i += 32) dst[i] = smem[i];
 }
@@ -190,15 +190,20 @@ __global__ void quant_kernel(const __half* src, uint8_t* dst, float* scale, int 
 // bytes landing over the front of the fp16 row that produced them. That is what makes
 // the whole scheme cost no shared memory, and it is a different test: with separate
 // buffers no lane can clobber another's source, so the read/write ordering inside
-// `quantise_tile` is never exercised. It was wrong, and this is what found it.
+// `quantise_row` is never exercised. It was wrong, and this is what found it.
+//
+// The row is now 256 wide, so it is two write-tiles rather than one, and the ordering
+// has a second half to get right: tile 1's writes land on bytes [128, 256) while its
+// own reads are at bytes [512, 1024). That direction is safe; the reverse would not be,
+// which is why `quantise_row` walks tiles in ascending order and says so.
 __global__ void quant_inplace_kernel(const __half* src, uint8_t* dst, float* scale,
                                      int hpitch) {
     extern __shared__ __half hsmem[];
     uint8_t* bytes = reinterpret_cast<uint8_t*>(hsmem);
     for (int i = threadIdx.x; i < QM * hpitch; i += 32) hsmem[i] = src[i];
     __syncwarp();
-    fp8::quantise_tile(bytes, hpitch * (int)sizeof(__half), scale, 1,
-                       hsmem, hpitch, QM, threadIdx.x);
+    fp8::quantise_row<QK>(bytes, hpitch * (int)sizeof(__half), scale, 1,
+                          hsmem, hpitch, QM, threadIdx.x);
     __syncwarp();
     for (int i = threadIdx.x; i < QM * hpitch * (int)sizeof(__half); i += 32)
         dst[i] = bytes[i];
@@ -248,7 +253,7 @@ int test_quantise() {
             }
         }
     }
-    printf("  %-38s %s  (32 rows x 128, byte-exact)\n", "quantise_tile",
+    printf("  %-38s %s  (32 rows x 256, byte-exact)\n", "quantise_row",
            bad ? "FAIL" : "OK");
 
     // The same rows again, quantised over themselves.
@@ -271,7 +276,7 @@ int test_quantise() {
             if (got != want && ibad++ < 6)
                 printf("  in place [%d][%d]: 0x%02x, want 0x%02x\n", m, k, got, want);
         }
-    printf("  %-38s %s  (dst and src are the same memory)\n", "quantise_tile, in place",
+    printf("  %-38s %s  (dst and src are the same memory)\n", "quantise_row, in place",
            ibad ? "FAIL" : "OK");
     CHECK(cudaFree(d_ib)); CHECK(cudaFree(d_isc));
     CHECK(cudaFree(d_src)); CHECK(cudaFree(d_dst)); CHECK(cudaFree(d_scale));
@@ -280,34 +285,37 @@ int test_quantise() {
 
 // -- 4. the tile ----------------------------------------------------------- //
 
-constexpr int GM = 32, GK = 256, GN = 256;
-constexpr int NK32 = GK / 32, KT = GK / fp8::kTileK, NB = GN / fp8::kBlockN;
+constexpr int GM = 32, GK = fp8::kRowK, GN = 256;
+constexpr int NK32 = GK / 32, NB = GN / fp8::kBlockN;
 
 __global__ void gemm_kernel(const uint8_t* a, const float* as, const uint2* w,
-                            const float* ws, float* out, int pitch) {
+                            const float* ws, __half* out, int pitch) {
     const int lane = threadIdx.x;
     for (int n8_0 = 0; n8_0 < GN / 8; n8_0 += 4) {
-        float acc[2][4][4] = {};
-        fp8::gemm_fp8<NK32, NK32>(acc, a, pitch, as, KT, w, ws, KT, n8_0, 0, lane);
+        uint32_t acc[2][4][2];
+        fp8::gemm_fp8_row<NK32, NK32, /*ADD=*/false>(acc, a, pitch, as, 1, w, ws,
+                                                     n8_0, 0, lane);
         const int g = lane / 4, t = lane % 4;
 #pragma unroll
         for (int m = 0; m < 2; ++m)
 #pragma unroll
             for (int p = 0; p < 4; ++p) {
                 const int col = (n8_0 + p) * 8 + 2 * t;
-                out[(size_t)(m * 16 + g) * GN + col] = acc[m][p][0];
-                out[(size_t)(m * 16 + g) * GN + col + 1] = acc[m][p][1];
-                out[(size_t)(m * 16 + g + 8) * GN + col] = acc[m][p][2];
-                out[(size_t)(m * 16 + g + 8) * GN + col + 1] = acc[m][p][3];
+                const __half2 d0 = h2(acc[m][p][0]), d1 = h2(acc[m][p][1]);
+                out[(size_t)(m * 16 + g) * GN + col] = __low2half(d0);
+                out[(size_t)(m * 16 + g) * GN + col + 1] = __high2half(d0);
+                out[(size_t)(m * 16 + g + 8) * GN + col] = __low2half(d1);
+                out[(size_t)(m * 16 + g + 8) * GN + col + 1] = __high2half(d1);
             }
     }
 }
 
 // `exact`: A and W take values in {0, 1}, so after scaling every quantised value is
-// 0 or 16, every product is 0 or 256, and every partial sum is a multiple of 256 well
-// inside fp16's exactly-representable integers. The comparison is then an **equality**
-// whatever the hardware does internally, which is what pins the layout, the packing
-// and the two scale indices.
+// 0 or `kQMax`, every product is 0 or `kQMax^2`, and every partial sum is a multiple
+// of `kQMax^2` well inside fp16's exactly-representable integers -- at q_max = 8 the
+// largest is 256 * 64 = 16384, where fp16's spacing is 16 and 64 is a multiple of it.
+// The comparison is then an **equality** whatever the hardware does internally, which
+// is what pins the layout, the packing and the two scale axes.
 //
 // ⚠️ The realistic case cannot be an equality and the reason is a finding in itself:
 // modelling the accumulator as `fp16(C + exact_32_products)` -- what quant.py assumes
@@ -317,9 +325,11 @@ __global__ void gemm_kernel(const uint8_t* a, const float* as, const uint2* w,
 // doing something similar, and it is unmeasured here. The authority for the numerical
 // question is brokefish/nn/validate.py in prior space, not this tolerance.
 int test_gemm(bool exact) {
-    // Host-side quantisation, the scheme of brokefish/nn/quant.py: activation scale
-    // per row per 128-tile, weight scale per 128x128 block. Magnitudes vary by row,
-    // by k-tile and by n-block, so a scale applied along the wrong axis is caught.
+    // Host-side quantisation, the scheme of brokefish/nn/quant.py: **one** activation
+    // scale per row and **one** weight scale per 128 output columns, both covering the
+    // whole reduction. Magnitudes vary by row and by n-block, so a scale applied along
+    // the wrong axis is caught; they deliberately also vary along k, which the scheme
+    // now absorbs into the single scale rather than tracking.
     std::vector<float> A(GM * GK), W((size_t)GN * GK);
     for (int m = 0; m < GM; ++m)
         for (int k = 0; k < GK; ++k)
@@ -332,31 +342,27 @@ int test_gemm(bool exact) {
                                           : (float((n * 7 + k * 3) % 11) - 5.0f)
                                             * ldexpf(1.0f, (n / 128) % 3);
 
-    std::vector<float> as(GM * KT), ws(NB * KT);
+    std::vector<float> as(GM), ws(NB);
     std::vector<uint8_t> aq(GM * GK), wq((size_t)GN * GK);
-    for (int m = 0; m < GM; ++m)
-        for (int t = 0; t < KT; ++t) {
-            float amax = 0;
-            for (int k = 0; k < 128; ++k)
-                amax = fmaxf(amax, fabsf(A[m * GK + t * 128 + k]));
-            const float sc = amax > 0 ? amax / fp8::kQMax : 1.0f;
-            as[m * KT + t] = sc;
-            for (int k = 0; k < 128; ++k)
-                aq[m * GK + t * 128 + k] = host_e4m3(A[m * GK + t * 128 + k] / sc);
-        }
-    for (int b = 0; b < NB; ++b)
-        for (int t = 0; t < KT; ++t) {
-            float amax = 0;
-            for (int n = 0; n < 128; ++n)
-                for (int k = 0; k < 128; ++k)
-                    amax = fmaxf(amax, fabsf(W[(size_t)(b * 128 + n) * GK + t * 128 + k]));
-            const float sc = amax > 0 ? amax / fp8::kQMax : 1.0f;
-            ws[b * KT + t] = sc;
-            for (int n = 0; n < 128; ++n)
-                for (int k = 0; k < 128; ++k)
-                    wq[(size_t)(b * 128 + n) * GK + t * 128 + k] =
-                        host_e4m3(W[(size_t)(b * 128 + n) * GK + t * 128 + k] / sc);
-        }
+    for (int m = 0; m < GM; ++m) {
+        float amax = 0;
+        for (int k = 0; k < GK; ++k) amax = fmaxf(amax, fabsf(A[m * GK + k]));
+        const float sc = amax > 0 ? amax / fp8::kQMax : 1.0f;
+        as[m] = sc;
+        for (int k = 0; k < GK; ++k) aq[m * GK + k] = host_e4m3(A[m * GK + k] / sc);
+    }
+    for (int b = 0; b < NB; ++b) {
+        float amax = 0;
+        for (int n = 0; n < 128; ++n)
+            for (int k = 0; k < GK; ++k)
+                amax = fmaxf(amax, fabsf(W[(size_t)(b * 128 + n) * GK + k]));
+        const float sc = amax > 0 ? amax / fp8::kQMax : 1.0f;
+        ws[b] = sc;
+        for (int n = 0; n < 128; ++n)
+            for (int k = 0; k < GK; ++k)
+                wq[(size_t)(b * 128 + n) * GK + k] =
+                    host_e4m3(W[(size_t)(b * 128 + n) * GK + k] / sc);
+    }
 
     // Pack: (n8, k32, lane) -> {B[4t..4t+3][g], B[4t+16..4t+19][g]}, B[k][n] = W[n][k].
     std::vector<uint32_t> packed((size_t)(GN / 8) * NK32 * 32 * 2);
@@ -379,13 +385,14 @@ int test_gemm(bool exact) {
     for (int m = 0; m < GM; ++m)
         for (int k = 0; k < GK; ++k) a_smem[(size_t)m * pitch + k] = aq[m * GK + k];
 
-    uint8_t* d_a = nullptr; float *d_as = nullptr, *d_ws = nullptr, *d_out = nullptr;
+    uint8_t* d_a = nullptr; float *d_as = nullptr, *d_ws = nullptr;
+    __half* d_out = nullptr;
     uint32_t* d_w = nullptr;
     CHECK(cudaMalloc(&d_a, a_smem.size()));
     CHECK(cudaMalloc(&d_as, as.size() * 4));
     CHECK(cudaMalloc(&d_w, packed.size() * 4));
     CHECK(cudaMalloc(&d_ws, ws.size() * 4));
-    CHECK(cudaMalloc(&d_out, (size_t)GM * GN * 4));
+    CHECK(cudaMalloc(&d_out, (size_t)GM * GN * sizeof(__half)));
     CHECK(cudaMemcpy(d_a, a_smem.data(), a_smem.size(), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(d_as, as.data(), as.size() * 4, cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(d_w, packed.data(), packed.size() * 4, cudaMemcpyHostToDevice));
@@ -393,47 +400,44 @@ int test_gemm(bool exact) {
     gemm_kernel<<<1, 32>>>(d_a, d_as, reinterpret_cast<const uint2*>(d_w), d_ws,
                            d_out, pitch);
     CHECK(cudaGetLastError());
-    std::vector<float> got((size_t)GM * GN);
-    CHECK(cudaMemcpy(got.data(), d_out, got.size() * 4, cudaMemcpyDeviceToHost));
+    std::vector<__half> got((size_t)GM * GN);
+    CHECK(cudaMemcpy(got.data(), d_out, got.size() * sizeof(__half),
+                     cudaMemcpyDeviceToHost));
 
-    // Reference: the same quantised bytes, with the **fp16 accumulator modelled**.
-    // The hardware sums 32 products inside one mma at more than fp16 precision and
-    // rounds only when adding to C, so the model is `acc = fp16(acc + exact_32)` --
-    // the same one `quant.py::_tile_product` uses. Summing in double instead left a
-    // 1.3e-3 relative gap that looked like a bug and was the accumulator; modelling
-    // it turns the check back into an equality, which is what a layout or indexing
-    // error has to survive.
+    // Reference: the same quantised bytes, with **both roundings modelled** -- the
+    // fp16 mma accumulator every 32 products, and the fp16 the descaled result is
+    // written back into. The second one is new: the output of a GEMM is now an fp16
+    // fragment rather than an fp32 array, because that is what removed the running
+    // accumulator and its 960 B of spill.
     int bad = 0;
     double worst = 0.0, scale = 0.0, scale_hint = 0.0;
-    for (int m = 0; m < GM; ++m)
-        for (int n = 0; n < GN; ++n)
-            scale_hint = fmax(scale_hint, fabs((double)got[(size_t)m * GN + n]));
+    for (size_t i = 0; i < got.size(); ++i)
+        scale_hint = fmax(scale_hint, fabs((double)__half2float(got[i])));
     for (int m = 0; m < GM; ++m)
         for (int n = 0; n < GN; ++n) {
-            double want = 0.0;
-            for (int t = 0; t < KT; ++t) {
-                float acc16 = 0.0f;
-                for (int c = 0; c < 128 / 32; ++c) {
-                    double part = 0.0;
-                    for (int k = 0; k < 32; ++k) {
-                        const int kk = t * 128 + c * 32 + k;
-                        part += (double)host_from_e4m3(aq[m * GK + kk])
-                                * host_from_e4m3(wq[(size_t)n * GK + kk]);
-                    }
-                    acc16 = __half2float(__float2half(acc16 + (float)part));
+            float acc16 = 0.0f;
+            for (int c = 0; c < GK / 32; ++c) {
+                double part = 0.0;
+                for (int k = 0; k < 32; ++k) {
+                    const int kk = c * 32 + k;
+                    part += (double)host_from_e4m3(aq[m * GK + kk])
+                            * host_from_e4m3(wq[(size_t)n * GK + kk]);
                 }
-                want += (double)acc16 * as[m * KT + t] * ws[(n / 128) * KT + t];
+                acc16 = __half2float(__float2half(acc16 + (float)part));
             }
-            const double d = fabs(got[(size_t)m * GN + n] - want);
+            // The kernel's own order: (acc * sa) * sw in fp32, then one fp16 store.
+            const float want = __half2float(__float2half(acc16 * as[m] * ws[n / 128]));
+            const double d = fabs(__half2float(got[(size_t)m * GN + n]) - want);
             worst = fmax(worst, d);
-            scale = fmax(scale, fabs(want));
+            scale = fmax(scale, fabs((double)want));
             const double tol = exact ? 0.0 : 3e-3 * scale_hint;
             if (d > tol && bad++ < 5)
                 printf("  out[%d][%d]: %g, want %g\n", m, n,
-                       got[(size_t)m * GN + n], want);
+                       __half2float(got[(size_t)m * GN + n]), want);
         }
     printf("  %-38s %s  (32x256x256, worst %.3g on %.3g = %.1e rel)\n",
-           exact ? "gemm_fp8, exactly representable" : "gemm_fp8, realistic values",
+           exact ? "gemm_fp8_row, exactly representable"
+                 : "gemm_fp8_row, realistic values",
            bad ? "FAIL" : "OK", worst, scale, worst / fmax(scale, 1.0));
     CHECK(cudaFree(d_a)); CHECK(cudaFree(d_as)); CHECK(cudaFree(d_w));
     CHECK(cudaFree(d_ws)); CHECK(cudaFree(d_out));
@@ -448,66 +452,74 @@ int test_gemm(bool exact) {
 // with an activation buffer holding only that chunk. Every other test used
 // `k32_0 = 0`, where a global and a local k index are the same number -- and two bugs
 // lived in exactly that difference.
-constexpr int SM_ = 32, SK = 1024, SN = 256, SCHUNK = 256;
-constexpr int SNK32 = SK / 32, SKT = SK / fp8::kTileK, SNB = SN / fp8::kBlockN;
-constexpr int TPC = SCHUNK / fp8::kTileK;          // k-tiles per chunk
+constexpr int SM_ = 32, SK = 1024, SN = 256, SCHUNK = fp8::kRowK;
+constexpr int SNK32 = SK / 32, SNB = SN / fp8::kBlockN;
 
 __global__ void slice_kernel(const uint8_t* a, const float* as, const uint2* w,
-                             const float* ws, float* out, int pitch) {
+                             const float* ws, __half* out, int pitch) {
     const int lane = threadIdx.x;
     for (int n8_0 = 0; n8_0 < SN / 8; n8_0 += 4) {
-        float acc[2][4][4] = {};
+        uint32_t acc[2][4][2] = {};
         for (int c = 0; c < SK / SCHUNK; ++c)
-            // The activation chunk is local; its scales are offset but keep the
-            // global stride, which is what the kernel will do with `hid`.
-            fp8::gemm_fp8<SCHUNK / 32, SNK32>(
-                acc, a + (size_t)c * SM_ * pitch, pitch, as + c * TPC, SKT,
-                w, ws, SKT, n8_0, c * (SCHUNK / 32), lane);
+            // The activation chunk is local and carries its own per-row scale; the
+            // weight is addressed globally from `k32_0`. ADD folds the four descaled
+            // chunks together in fp16, which is what encoder.cu does with `ff`.
+            fp8::gemm_fp8_row<SCHUNK / 32, SNK32, /*ADD=*/true>(
+                acc, a + (size_t)c * SM_ * pitch, pitch, as + c * SM_, 1,
+                w, ws, n8_0, c * (SCHUNK / 32), lane);
         const int g = lane / 4, t = lane % 4;
 #pragma unroll
         for (int m = 0; m < 2; ++m)
 #pragma unroll
             for (int p = 0; p < 4; ++p) {
                 const int col = (n8_0 + p) * 8 + 2 * t;
-                out[(size_t)(m * 16 + g) * SN + col] = acc[m][p][0];
-                out[(size_t)(m * 16 + g) * SN + col + 1] = acc[m][p][1];
-                out[(size_t)(m * 16 + g + 8) * SN + col] = acc[m][p][2];
-                out[(size_t)(m * 16 + g + 8) * SN + col + 1] = acc[m][p][3];
+                const __half2 d0 = h2(acc[m][p][0]), d1 = h2(acc[m][p][1]);
+                out[(size_t)(m * 16 + g) * SN + col] = __low2half(d0);
+                out[(size_t)(m * 16 + g) * SN + col + 1] = __high2half(d0);
+                out[(size_t)(m * 16 + g + 8) * SN + col] = __low2half(d1);
+                out[(size_t)(m * 16 + g + 8) * SN + col + 1] = __high2half(d1);
             }
     }
 }
 
 int test_gemm_slice() {
+    // Binary inputs, so every mma partial is exact and the only rounding left is the
+    // one this test exists to pin: the fp16 the running total is kept in between
+    // chunks. A per-chunk magnitude step makes the four scales differ, so a kernel
+    // that quietly shared one across chunks fails here.
     std::vector<float> A(SM_ * SK), W((size_t)SN * SK);
     for (int m = 0; m < SM_; ++m)
-        for (int k = 0; k < SK; ++k) A[m * SK + k] = float((m * 11 + k * 5) % 2);
+        for (int k = 0; k < SK; ++k)
+            A[m * SK + k] = float((m * 11 + k * 5) % 2) * ldexpf(1.0f, k / SCHUNK);
     for (int n = 0; n < SN; ++n)
         for (int k = 0; k < SK; ++k) W[(size_t)n * SK + k] = float((n * 7 + k * 3) % 2);
 
-    std::vector<float> as(SM_ * SKT), ws(SNB * SKT);
+    const int NC = SK / SCHUNK;
+    std::vector<float> as(NC * SM_), ws(SNB);
     std::vector<uint8_t> aq(SM_ * SK), wq((size_t)SN * SK);
-    for (int m = 0; m < SM_; ++m)
-        for (int t = 0; t < SKT; ++t) {
+    for (int c = 0; c < NC; ++c)
+        for (int m = 0; m < SM_; ++m) {
             float amax = 0;
-            for (int k = 0; k < 128; ++k) amax = fmaxf(amax, fabsf(A[m * SK + t * 128 + k]));
+            for (int k = 0; k < SCHUNK; ++k)
+                amax = fmaxf(amax, fabsf(A[m * SK + c * SCHUNK + k]));
             const float sc = amax > 0 ? amax / fp8::kQMax : 1.0f;
-            as[m * SKT + t] = sc;
-            for (int k = 0; k < 128; ++k)
-                aq[m * SK + t * 128 + k] = host_e4m3(A[m * SK + t * 128 + k] / sc);
+            as[c * SM_ + m] = sc;
+            for (int k = 0; k < SCHUNK; ++k)
+                aq[m * SK + c * SCHUNK + k] =
+                    host_e4m3(A[m * SK + c * SCHUNK + k] / sc);
         }
-    for (int b = 0; b < SNB; ++b)
-        for (int t = 0; t < SKT; ++t) {
-            float amax = 0;
-            for (int n = 0; n < 128; ++n)
-                for (int k = 0; k < 128; ++k)
-                    amax = fmaxf(amax, fabsf(W[(size_t)(b * 128 + n) * SK + t * 128 + k]));
-            const float sc = amax > 0 ? amax / fp8::kQMax : 1.0f;
-            ws[b * SKT + t] = sc;
-            for (int n = 0; n < 128; ++n)
-                for (int k = 0; k < 128; ++k)
-                    wq[(size_t)(b * 128 + n) * SK + t * 128 + k] =
-                        host_e4m3(W[(size_t)(b * 128 + n) * SK + t * 128 + k] / sc);
-        }
+    for (int b = 0; b < SNB; ++b) {
+        float amax = 0;
+        for (int n = 0; n < 128; ++n)
+            for (int k = 0; k < SK; ++k)
+                amax = fmaxf(amax, fabsf(W[(size_t)(b * 128 + n) * SK + k]));
+        const float sc = amax > 0 ? amax / fp8::kQMax : 1.0f;
+        ws[b] = sc;
+        for (int n = 0; n < 128; ++n)
+            for (int k = 0; k < SK; ++k)
+                wq[(size_t)(b * 128 + n) * SK + k] =
+                    host_e4m3(W[(size_t)(b * 128 + n) * SK + k] / sc);
+    }
 
     std::vector<uint32_t> packed((size_t)(SN / 8) * SNK32 * 32 * 2);
     for (int n8 = 0; n8 < SN / 8; ++n8)
@@ -526,19 +538,20 @@ int test_gemm_slice() {
 
     // The activation buffer is laid out chunk by chunk, as `hid` is refilled.
     const int pitch = fp8::a_pitch(SCHUNK);
-    std::vector<uint8_t> a_smem((size_t)(SK / SCHUNK) * SM_ * pitch, 0);
-    for (int c = 0; c < SK / SCHUNK; ++c)
+    std::vector<uint8_t> a_smem((size_t)NC * SM_ * pitch, 0);
+    for (int c = 0; c < NC; ++c)
         for (int m = 0; m < SM_; ++m)
             for (int k = 0; k < SCHUNK; ++k)
                 a_smem[((size_t)c * SM_ + m) * pitch + k] = aq[m * SK + c * SCHUNK + k];
 
-    uint8_t* d_a = nullptr; float *d_as = nullptr, *d_ws = nullptr, *d_out = nullptr;
+    uint8_t* d_a = nullptr; float *d_as = nullptr, *d_ws = nullptr;
+    __half* d_out = nullptr;
     uint32_t* d_w = nullptr;
     CHECK(cudaMalloc(&d_a, a_smem.size()));
     CHECK(cudaMalloc(&d_as, as.size() * 4));
     CHECK(cudaMalloc(&d_w, packed.size() * 4));
     CHECK(cudaMalloc(&d_ws, ws.size() * 4));
-    CHECK(cudaMalloc(&d_out, (size_t)SM_ * SN * 4));
+    CHECK(cudaMalloc(&d_out, (size_t)SM_ * SN * sizeof(__half)));
     CHECK(cudaMemcpy(d_a, a_smem.data(), a_smem.size(), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(d_as, as.data(), as.size() * 4, cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(d_w, packed.data(), packed.size() * 4, cudaMemcpyHostToDevice));
@@ -546,29 +559,33 @@ int test_gemm_slice() {
     slice_kernel<<<1, 32>>>(d_a, d_as, reinterpret_cast<const uint2*>(d_w), d_ws,
                             d_out, pitch);
     CHECK(cudaGetLastError());
-    std::vector<float> got((size_t)SM_ * SN);
-    CHECK(cudaMemcpy(got.data(), d_out, got.size() * 4, cudaMemcpyDeviceToHost));
+    std::vector<__half> got((size_t)SM_ * SN);
+    CHECK(cudaMemcpy(got.data(), d_out, got.size() * sizeof(__half),
+                     cudaMemcpyDeviceToHost));
 
-    // Binary inputs again, so every partial sum is exact and this is an equality.
     int bad = 0;
     double worst = 0.0;
     for (int m = 0; m < SM_; ++m)
         for (int n = 0; n < SN; ++n) {
-            double want = 0.0;
-            for (int t = 0; t < SKT; ++t) {
+            float acc = 0.0f;                     // the fp16 running total, modelled
+            for (int c = 0; c < NC; ++c) {
                 double part = 0.0;
-                for (int k = 0; k < 128; ++k)
-                    part += (double)host_from_e4m3(aq[m * SK + t * 128 + k])
-                            * host_from_e4m3(wq[(size_t)n * SK + t * 128 + k]);
-                want += part * as[m * SKT + t] * ws[(n / 128) * SKT + t];
+                for (int k = 0; k < SCHUNK; ++k) {
+                    const int kk = c * SCHUNK + k;
+                    part += (double)host_from_e4m3(aq[m * SK + kk])
+                            * host_from_e4m3(wq[(size_t)n * SK + kk]);
+                }
+                const float o = (float)part * as[c * SM_ + m] * ws[n / 128] + acc;
+                acc = __half2float(__float2half(o));
             }
-            const double d = fabs(got[(size_t)m * SN + n] - want);
+            const double d = fabs(__half2float(got[(size_t)m * SN + n]) - acc);
             worst = fmax(worst, d);
             if (d != 0.0 && bad++ < 5)
-                printf("  out[%d][%d]: %g, want %g\n", m, n, got[(size_t)m * SN + n], want);
+                printf("  out[%d][%d]: %g, want %g\n", m, n,
+                       __half2float(got[(size_t)m * SN + n]), acc);
         }
     printf("  %-38s %s  (32x1024x256 in 4 chunks, worst %g)\n",
-           "gemm_fp8, ff2 k-slice", bad ? "FAIL" : "OK", worst);
+           "gemm_fp8_row, ff2 k-slice + ADD", bad ? "FAIL" : "OK", worst);
     CHECK(cudaFree(d_a)); CHECK(cudaFree(d_as)); CHECK(cudaFree(d_w));
     CHECK(cudaFree(d_ws)); CHECK(cudaFree(d_out));
     return bad;

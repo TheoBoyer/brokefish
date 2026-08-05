@@ -173,7 +173,13 @@ class FusedEncoder:
                 # ⚠️ `Q_MAX` explicitly, never the default. The activations are
                 # quantised to `fp8::kQMax` inside the kernel and the two have to be
                 # the same number or the fp16 accumulator overflows.
-                qb, sc = quantise_weights_bytes(w.float(), Q_MAX)
+                #
+                # ⚠️ `tile_k = K`: one scale per 128 output columns for the **whole**
+                # reduction, because `gemm_fp8_row` runs one fp16 accumulator over the
+                # whole depth and can only descale once. A per-128-k scale here would
+                # be silently ignored except for its first column, which is a wrong
+                # answer that stays finite and plausible.
+                qb, sc = quantise_weights_bytes(w.float(), Q_MAX, tile_k=w.shape[1])
                 blobs.append(pack_b_fp8(qb).reshape(-1))
                 scales.append(sc.reshape(-1))
         self._wq8 = torch.cat(blobs).contiguous().cuda()

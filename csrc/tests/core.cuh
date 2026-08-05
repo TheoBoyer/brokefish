@@ -70,24 +70,26 @@ struct Fp8Off {                                  // bytes, per layer
     static constexpr int stride = w_ff2 + Dm * DFF;
 };
 struct Fp8SOff {                                 // floats, per layer
-    static constexpr int s_ff1 = 0;              // [DFF/128][D/128]
-    static constexpr int s_ff2 = s_ff1 + (DFF / 128) * (Dm / 128);
-    static constexpr int stride = s_ff2 + (Dm / 128) * (DFF / 128);
+    // One scale per 128 output columns, covering the **whole** reduction -- the fp16
+    // accumulator runs the full 256-deep GEMM, so every k-group must share a scale.
+    static constexpr int s_ff1 = 0;              // [DFF/128]
+    static constexpr int s_ff2 = s_ff1 + DFF / 128;
+    static constexpr int stride = s_ff2 + Dm / 128;
 };
 
 // The quantised activations are written **over** the fp16 row that produced them, so
 // they cost no shared memory -- which they had to, because SMEM_HALVES is already at
 // the static_assert. Reusing the fp16 row pitch is also better for banks than a packed
 // 260 would be: 528 / 4 = 132 words, and 132 mod 32 = 4, so the eight lanes sharing a
-// `t` land on eight distinct banks. The per-row tile scales go in the row padding that
+// `t` land on eight distinct banks. The per-row scale goes in the row padding that
 // AROW already carries.
 namespace fp8cfg {
 constexpr int kAPitch = AROW * (int)sizeof(half);            // 528 B
 constexpr int kScaleOff = Dm * (int)sizeof(half);            // 512 B, into the padding
 constexpr int kScaleStride = kAPitch / (int)sizeof(float);   // 132 floats
-constexpr int kTilesD = Dm / fp8::kTileK;                    // 2
-static_assert(kAPitch - kScaleOff >= kTilesD * (int)sizeof(float),
-              "the row padding cannot hold this row's tile scales");
+static_assert(Dm == fp8::kRowK, "one scale per row means one scale for the whole row");
+static_assert(kAPitch - kScaleOff >= (int)sizeof(float),
+              "the row padding cannot hold this row's scale");
 static_assert(kAPitch % sizeof(float) == 0 && kScaleOff % sizeof(float) == 0,
               "the scales must land 4-byte aligned inside the row");
 static_assert(HCHUNK == Dm, "the ff2 activation chunk reuses ff1's row geometry");
@@ -758,63 +760,32 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
         __syncthreads();
 
         uint32_t ff[2][4][2];
-        float ffq[2][4][4];
+        zero_frags(ff);
         if constexpr (FP8) {
-#pragma unroll
-            for (int m = 0; m < 2; ++m)
-#pragma unroll
-                for (int p = 0; p < 4; ++p)
-#pragma unroll
-                    for (int q = 0; q < 4; ++q) ffq[m][p][q] = 0.0f;
-            // Quantise the normed input **in place**, once for all four chunks. Tile t
-            // writes bytes [128t, 128t+128) of a row while reading halves
-            // [128t, 128t+128) = bytes [256t, 256t+256), so an ascending tile order
-            // never overwrites a source it has not already read; the `__shfl` inside
-            // quantise_tile orders the eight lanes of a row, and rows are disjoint
-            // across warps.
+            // Quantise the normed input **in place**, once for all four chunks: one
+            // scale for the whole 256-wide row, which is what lets `gemm_fp8_row` keep
+            // a single fp16 accumulator. `quantise_row` owns the three aliasing
+            // orderings this relies on; they are documented there.
             uint8_t* aq = reinterpret_cast<uint8_t*>(bufB);
             float* as = reinterpret_cast<float*>(aq + fp8cfg::kScaleOff);
             const int r0 = warp * (T / NWARPS);
-            // ⚠️ `__syncwarp` between tiles, and no unrolling across them. Tile 1
-            // writes bytes [128, 256) of a row that tile 0 is still reading as halves
-            // [0, 128) = bytes [0, 256). Program order per lane makes that safe and
-            // nothing else does: the two views have different pointer types so the
-            // compiler may reorder them, and the eight lanes of a row need not be in
-            // step under independent thread scheduling.
-#pragma unroll 1
-            for (int t = 0; t < fp8cfg::kTilesD; ++t) {
-                fp8::quantise_tile(aq + (size_t)r0 * fp8cfg::kAPitch + t * fp8::kTileK,
-                                   fp8cfg::kAPitch,
-                                   as + (size_t)r0 * fp8cfg::kScaleStride + t,
-                                   fp8cfg::kScaleStride,
-                                   bufB + (size_t)r0 * AROW + t * fp8::kTileK, AROW,
-                                   T / NWARPS, lane);
-                __syncwarp();
-            }
+            fp8::quantise_row<Dm>(aq + (size_t)r0 * fp8cfg::kAPitch, fp8cfg::kAPitch,
+                                  as + (size_t)r0 * fp8cfg::kScaleStride,
+                                  fp8cfg::kScaleStride,
+                                  bufB + (size_t)r0 * AROW, AROW, T / NWARPS, lane);
             __syncthreads();
-        } else {
-            zero_frags(ff);
         }
         for (int c = 0; c < DFF / HCHUNK; ++c) {
             uint32_t hacc[2][4][2];
             // ff1 is [1024][256]: chunk c starts at n-tile 32c.
             if constexpr (FP8) {
-                float h[2][4][4];
-#pragma unroll
-                for (int m = 0; m < 2; ++m)
-#pragma unroll
-                    for (int p = 0; p < 4; ++p)
-#pragma unroll
-                        for (int q = 0; q < 4; ++q) h[m][p][q] = 0.0f;
-                fp8::gemm_fp8<NK, NK>(
-                    h, reinterpret_cast<const uint8_t*>(bufB), fp8cfg::kAPitch,
+                fp8::gemm_fp8_row<NK, NK, /*ADD=*/false>(
+                    hacc, reinterpret_cast<const uint8_t*>(bufB), fp8cfg::kAPitch,
                     reinterpret_cast<const float*>(
                         reinterpret_cast<const uint8_t*>(bufB) + fp8cfg::kScaleOff),
                     fp8cfg::kScaleStride,
                     reinterpret_cast<const uint2*>(Wq + Fp8Off::w_ff1),
-                    Sq + Fp8SOff::s_ff1, fp8cfg::kTilesD,
-                    c * 32 + warp * 4, 0, lane);
-                fp8::frags_from_f32(hacc, h);
+                    Sq + Fp8SOff::s_ff1, c * 32 + warp * 4, 0, lane);
             } else {
                 zero_frags(hacc);
                 gemm_direct<NK, NK>(hacc, bufB, AROW, W + Off::w_ff1, c * 32 + warp * 4, 0, lane);
@@ -836,36 +807,36 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
             if constexpr (FP8) {
                 // Same in-place quantisation, on this chunk of the hidden. Its input
                 // is post-ReLU and therefore non-negative, so its partial sums get no
-                // sign cancellation -- this is where `q_max = 16`'s 8x accumulator
+                // sign cancellation -- this is where `q_max = 8`'s 4x accumulator
                 // headroom is doing real work rather than being slack.
+                //
+                // Each chunk carries its **own** scale and is descaled before being
+                // added into `ff`, so the four never have to agree on one -- which
+                // matters because chunk 3's amax is not knowable when chunk 0 is
+                // quantised, only 256 of the 1024 hidden units being resident.
                 uint8_t* hq = reinterpret_cast<uint8_t*>(hid);
                 float* hs = reinterpret_cast<float*>(hq + fp8cfg::kScaleOff);
                 const int r0 = warp * (T / NWARPS);
-#pragma unroll 1
-                for (int t = 0; t < fp8cfg::kTilesD; ++t) {
-                    fp8::quantise_tile(hq + (size_t)r0 * fp8cfg::kAPitch + t * fp8::kTileK,
-                                       fp8cfg::kAPitch,
-                                       hs + (size_t)r0 * fp8cfg::kScaleStride + t,
-                                       fp8cfg::kScaleStride,
-                                       hid + (size_t)r0 * HROW + t * fp8::kTileK, HROW,
-                                       T / NWARPS, lane);
-                    __syncwarp();
-                }
+                fp8::quantise_row<HCHUNK>(hq + (size_t)r0 * fp8cfg::kAPitch,
+                                          fp8cfg::kAPitch,
+                                          hs + (size_t)r0 * fp8cfg::kScaleStride,
+                                          fp8cfg::kScaleStride,
+                                          hid + (size_t)r0 * HROW, HROW,
+                                          T / NWARPS, lane);
                 __syncthreads();
                 // ⚠️ The weight is addressed globally from `k32_0 = 8c`; the activation
-                // buffer holds only this chunk and is addressed from zero. gemm_fp8
-                // keeps the two indices apart -- csrc/tests/tfp8.cu's fifth check is
-                // exactly this call shape, and two bugs lived in the difference.
-                fp8::gemm_fp8<HCHUNK / 32, DFF / 32>(
-                    ffq, hq, fp8cfg::kAPitch, hs, fp8cfg::kScaleStride,
+                // buffer holds only this chunk and is addressed from zero.
+                // gemm_fp8_row keeps the two indices apart -- csrc/tests/tfp8.cu's
+                // k-slice check is exactly this call shape, and two bugs lived in the
+                // difference.
+                fp8::gemm_fp8_row<HCHUNK / 32, DFF / 32, /*ADD=*/true>(
+                    ff, hq, fp8cfg::kAPitch, hs, fp8cfg::kScaleStride,
                     reinterpret_cast<const uint2*>(Wq + Fp8Off::w_ff2),
-                    Sq + Fp8SOff::s_ff2, DFF / fp8::kTileK,
-                    warp * 4, c * (HCHUNK / 32), lane);
+                    Sq + Fp8SOff::s_ff2, warp * 4, c * (HCHUNK / 32), lane);
             } else {
                 gemm_direct<8, DFF / 32>(ff, hid, HROW, W + Off::w_ff2, warp * 4, c * 8, lane);
             }
         }
-        if constexpr (FP8) fp8::frags_from_f32(ff, ffq);
         add_bias(ff, W + Off::b_ff2, warp * DH, lane);
         // bufB is dead: the first barrier of the last FFN chunk is already past
         // every warp's read of it, so the staged sum needs no barrier of its own

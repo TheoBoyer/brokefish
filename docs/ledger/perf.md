@@ -33,6 +33,24 @@ dwarfed the true delta of 0.35 ms.
 | | GO target | ~350 | 45-50k | **cleared** |
 | 10 | B2: boards in, policy/promo/value out — **a different measurement**, see below | **263.0** | **62.3k** | ×3.25 vs the torch full model |
 | 11 | **Gate 1a: the whole MCTS of `search.md` §6 on device** at `n=800`, `B=4096`. **Another different measurement**, see below | 57 220 ms/move | **57.0k useful** | tree costs 4.4 % |
+| 12 | B2 + **e4m3 FFN**, activation scale per 128-element k-tile | — | — | **×1.154** over row 10 |
+| 13 | B2 + **e4m3 FFN, one scale per row** (`gemm_fp8_row`), current fp8 default | — | **82.2k** | **×1.214** over row 10 |
+
+Rows 12 and 13 are ratios and not absolutes on purpose: they come from `speed.py`, an
+order-balanced six-round A/B against the fp16 kernel in the *same process*, and the
+absolute number moves with the card's temperature far more than the delta does. Two
+consecutive runs read ×1.214 (fp16 67.7k, fp8 82.2k) and ×1.218 (fp16 65.8k, fp8
+80.2k) — the ratio is stable to 0.3 % while the absolute moved 2.8 %.
+
+⚠️ **Row 13's win is a register story, not an arithmetic one.** fp8 halves the mma
+work either way; what row 12 could not spend was registers. `__launch_bounds__(THREADS,
+2)` allows exactly 65536 / (2 × 256) = 128 of them, and row 12's `float acc[2][4][4]`
+running total — needed only because the scale changed every 128 k-elements — spilled
+960 B against the fp16 path's 64 B. **Giving it the registers instead is a measured
+loss**: at 1 CTA/SM it uses 200 registers, spills nothing, and runs **×0.978**, because
+16 warps per SM is the whole of this kernel's latency hiding. One scale per row removes
+the second accumulator instead of feeding it: 200 B of spill, ×1.214.
+`docs/journal/2026-08-05-fp8-per-row.md`.
 
 Rows 0-9 all measure the same thing, activations in and activations out, and are
 comparable to each other. **Row 10 is not on that ladder**: it takes 64 bytes of

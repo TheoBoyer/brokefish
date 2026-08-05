@@ -232,9 +232,34 @@ def test_the_python_and_cuda_q_max_agree():
     mma summed past fp16's 65504, and the infinity became a NaN two tiles later. Every
     component tested clean in isolation and 116 boards of 128 came out NaN."""
     from brokefish.nn._build import load_extension
-    from brokefish.nn.quant import Q_MAX
+    from brokefish.nn.quant import Q_MAX, ROW_K
 
     ext = load_extension("brokefish_encoder", ["encoder.cu"])
     assert float(ext.fp8_q_max()) == Q_MAX
-    # And the bound it exists to satisfy: one mma sums 32 products of two operands.
-    assert MMA_K * Q_MAX * Q_MAX < 65504.0
+    # ⚠️ The bound it exists to satisfy, and it is over **the whole row**, not one mma.
+    # `gemm_fp8_row` runs a single fp16 accumulator for all `ROW_K` products so that it
+    # needs no fp32 running total and no per-tile descale -- which is what took the
+    # spill from 960 B to 200 B and the kernel from 1.154x to 1.214x. The price is that
+    # the accumulator bound is `ROW_K` times bigger than the per-mma one.
+    assert ROW_K * Q_MAX * Q_MAX <= 65504.0 / 3.0, "fp16 accumulator margin"
+    assert ROW_K % MMA_K == 0
+
+
+def test_the_shipping_weight_scale_covers_the_whole_reduction():
+    """⚠️ `_pack_fp8` must pass `tile_k = K`, and getting it wrong is silent.
+
+    `gemm_fp8_row` descales once, reading `w_scale[n8 / 16]` with no k index at all. A
+    packer that still emitted a scale per 128 k-elements would hand it an array whose
+    first `N / 128` entries are the k-tile-0 scales, so every output would be scaled by
+    the wrong block's constant -- in range, finite, and wrong by a factor that looks
+    like quantisation error.
+    """
+    from brokefish.nn.quant import Q_MAX, ROW_K, quantise_weights_bytes
+
+    w = torch.randn(1024, ROW_K, device="cuda")
+    _, sc = quantise_weights_bytes(w, Q_MAX, tile_k=w.shape[1])
+    assert sc.shape == (1024 // 128, 1), sc.shape
+    # And the per-tile form it replaced, which must now be rejected by shape at the
+    # call site rather than accepted and half-read.
+    _, wrong = quantise_weights_bytes(w, Q_MAX)
+    assert wrong.shape == (1024 // 128, ROW_K // 128) != sc.shape

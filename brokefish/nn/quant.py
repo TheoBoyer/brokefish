@@ -82,10 +82,19 @@ TILE_K = 128
 BLOCK_N = 128
 MMA_K = 32
 
-#: ⚠️ **Must equal `fp8::kQMax` in csrc/fp8_gemm.cuh.** This is the value a tile's
+#: ⚠️ **Must equal `fp8::kRowK` in csrc/fp8_gemm.cuh.** The k-depth one activation
+#: scale covers, and therefore the depth of the kernel's single fp16 accumulator. The
+#: shipping scheme scales per *row* rather than per 128-tile, because the per-tile form
+#: needs an `float acc[2][4][4]` running total on top of the mma fragment and the
+#: kernel has exactly 128 registers -- 65536 / (2 CTAs * 256 threads). Measured:
+#: per-tile spilled 960 B and ran 1.154x; giving it the registers instead
+#: (`__launch_bounds__(THREADS, 1)`, 200 registers, no spill) ran **0.978x**.
+ROW_K = 256
+
+#: ⚠️ **Must equal `fp8::kQMax` in csrc/fp8_gemm.cuh.** This is the value a row's
 #: maximum is mapped to instead of e4m3's 448, and it is what keeps the fp16
-#: accumulator in range: 32 products of two `q_max`-bounded operands is `32 q_max^2`,
-#: which at 16 is 8192 against fp16's 65504 and at 448 is 6.4e6.
+#: accumulator in range: `ROW_K` products of two `q_max`-bounded operands is
+#: `ROW_K * q_max^2`, which at 8 is 16384 against fp16's 65504 and at 448 is 5.1e7.
 #:
 #: It cost a day. `quantise_weights_bytes` defaulted to `E4M3_MAX` while the kernel
 #: quantised activations at 16, so weight * activation reached 7168, one mma summed to
@@ -93,7 +102,9 @@ MMA_K = 32
 #: *next* tile's amax was infinite -- making `inv` zero and `inf * 0` a NaN. 116 boards
 #: in 128 came out NaN and every isolated component tested clean.
 #: `tests/test_quant.py::test_the_python_and_cuda_q_max_agree` now pins the two.
-Q_MAX = 16.0
+Q_MAX = 8.0
+
+assert ROW_K * Q_MAX * Q_MAX <= 65504.0 / 3.0, "fp16 accumulator margin"
 
 
 @dataclass(frozen=True)

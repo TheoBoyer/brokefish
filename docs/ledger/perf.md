@@ -35,6 +35,34 @@ dwarfed the true delta of 0.35 ms.
 | 11 | **Gate 1a: the whole MCTS of `search.md` §6 on device** at `n=800`, `B=4096`. **Another different measurement**, see below | 57 220 ms/move | **57.0k useful** | tree costs 4.4 % |
 | 12 | B2 + **e4m3 FFN**, activation scale per 128-element k-tile | — | — | **×1.154** over row 10 |
 | 13 | B2 + **e4m3 FFN, one scale per row** (`gemm_fp8_row`), current fp8 default | — | **82.2k** | **×1.214** over row 10 |
+| 14 | **Gate 1 with the fp8 encoder**, the whole of `search.md` §6 on device at `n=800`, `B=4096` | 45 470 ms/move | **71.5k useful** | tree costs 5.4 % |
+| 14b | the same at `n=128`, which is what self-play ships since Track E | 6 910 ms/move | **75.4k useful** | tree costs 6.1 % |
+
+Row 14 replaces row 11 as the gate number and is the same measurement: `bench_search`,
+B = 4096 at 30 random plies, 4087 distinct live positions, 3 interleaved rounds. The
+same-day fp16 control was run rather than differencing against July:
+
+| n | fp16 useful/s | fp8 useful/s | in-loop ratio | fp16 encoder | fp8 encoder |
+|---|---|---|---|---|---|
+| 128 | 58 948 | **75 401** | **×1.279** | 62 646 | 81 068 |
+| 800 | 57 492 | **71 542** | **×1.244** | 60 682 | 76 036 |
+
+Today's fp16 at n=800 reads 57 492 against row 11's 56 996 from 2026-07-30 — 0.9 %
+apart, which is what validates comparing the two dates at all.
+
+⚠️ Two things about row 11 that are **not** the encoder, both confirmed by the control
+reproducing them. Mean depth fell from 5.8/28 to 2.7/9: that is the FPU fix of
+2026-07-31, since AGZ's literal `Q = 0` in a `[0, 1]` tree makes an unvisited child look
+like a loss and drives the search deep. And §4.3 truncation went from "443 nodes
+dropping 2.317 of prior mass" to zero, because `SearchConfig.E` moved 64 → 96.
+`bench_search` had that cap hardcoded in its own log line and so printed `(E = 64)`
+next to 76 live edges and zero truncations, which cannot both be true; now it prints
+`SearchConfig().E`.
+
+The in-loop fp8 ratio (×1.244 to ×1.279) is **higher** than `speed.py`'s ×1.215 to
+×1.220 on the same kernels. Unexplained. The runs differ in heat soak (45 s rounds here
+against 20 tight reps) and in the net (random init here, a trained checkpoint there);
+neither should move throughput and I have not measured which does.
 
 Rows 12 and 13 are ratios and not absolutes on purpose: they come from `speed.py`, an
 order-balanced six-round A/B against the fp16 kernel in the *same process*, and the

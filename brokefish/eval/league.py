@@ -73,6 +73,7 @@ class PoolEntry:
     name: str
     step: int
     path: Optional[str]       # None only for a freshly minted anchor
+    run: str = ""             # which training run it came from; "" for the anchor
 
 
 ANCHOR_SEED = 20260731
@@ -160,25 +161,43 @@ def subsample(items: Sequence, limit: Optional[int]) -> List:
     return out
 
 
-def build_pool(run: str, checkpoint_dir: str = "checkpoints",
+def build_pool(runs, checkpoint_dir: str = "checkpoints",
                anchor_path: str = DEFAULT_ANCHOR_PATH,
                limit: Optional[int] = 32) -> List[PoolEntry]:
-    """The anchor at index 0, then the run's checkpoints in step order.
+    """The anchor at index 0, then every run's checkpoints **interleaved by step**.
 
     Index 0 is the anchor on purpose: the SAI calendar then connects it to
     checkpoints 1, 2, 3, 6, 8 and 12 for free, so the zero of the scale is a real
     node in the graph rather than an assumption bolted on afterwards.
+
+    ⚠️ **Several runs are sorted together, not concatenated, and that is the whole
+    point.** Two runs rated in two leagues share only the anchor, which pins the zero
+    of each scale but not its slope, so the difference between them is confounded with
+    whatever the two Bradley-Terry fits did to the units — measured on 2026-08-05, a
+    +24 Elo mean gap between `t7h-fp8` and its control that could not be told from a
+    fit artefact. Concatenating the pools would barely help: `sai_pairings` connects
+    index i to i+{1,2,3,6,8,12}, so appending run B after run A gives cross-run edges
+    only at the seam. Sorting by step interleaves them, and then **every** offset is a
+    cross-run edge for half its length. That is what makes one scale one scale.
+
+    `limit` is per run, so the pool is about `len(runs) * limit` players and the
+    calendar grows linearly with it.
     """
-    pool = [PoolEntry(name=ANCHOR_NAME, step=0, path=ensure_anchor(anchor_path))]
-    found = discover_checkpoints(run, checkpoint_dir)
-    if not found:
-        raise FileNotFoundError(
-            f"no {run}-NNNNNN.pt snapshots in {checkpoint_dir}/. A run only writes "
-            f"them with --keep-checkpoints; the rolling {run}.pt is one endpoint and "
-            f"a curve needs a history.")
-    for step, path in subsample(found, None if limit is None else max(1, limit - 1)):
-        pool.append(PoolEntry(name=f"{run}@{step}", step=step, path=path))
-    return pool
+    if isinstance(runs, str):
+        runs = [runs]
+    runs = list(dict.fromkeys(runs))          # de-duplicate, keep order
+    entries: List[PoolEntry] = []
+    for run in runs:
+        found = discover_checkpoints(run, checkpoint_dir)
+        if not found:
+            raise FileNotFoundError(
+                f"no {run}-NNNNNN.pt snapshots in {checkpoint_dir}/. A run only writes "
+                f"them with --keep-checkpoints; the rolling {run}.pt is one endpoint "
+                f"and a curve needs a history.")
+        for step, path in subsample(found, None if limit is None else max(1, limit - 1)):
+            entries.append(PoolEntry(name=f"{run}@{step}", step=step, path=path, run=run))
+    entries.sort(key=lambda e: (e.step, e.run))
+    return [PoolEntry(name=ANCHOR_NAME, step=0, path=ensure_anchor(anchor_path))] + entries
 
 
 # --------------------------------------------------------------------------- #
@@ -337,7 +356,7 @@ def run_league(pool: Sequence[PoolEntry], games: int = 36, n_sims: int = 64,
                offsets: Sequence[int] = SAI_OFFSETS, anchor_every: int = 4,
                impl: Optional[str] = "cuda", search_impl: str = "cuda",
                device: str = "cuda", seed: int = 0, prior: float = 1.0,
-               cost: Optional[Sequence[Tuple[int, dict]]] = None,
+               cost=None,
                log: Optional[Callable[[str], None]] = None,
                engine_loader: Callable[[str], Callable] = None) -> dict:
     """Play the calendar, fit the ratings, return the whole record.
@@ -420,7 +439,7 @@ def run_league(pool: Sequence[PoolEntry], games: int = 36, n_sims: int = 64,
 
 def _curve_points(pool: Sequence[PoolEntry], fit: EloFit, edges: Sequence[Edge],
                   n_sims: int,
-                  cost: Optional[Sequence[Tuple[int, dict]]]) -> List[dict]:
+                  cost) -> List[dict]:
     """One record per player, in the shape `evaluation.md` §5.3 fixes."""
     stamp = time.time()
     opponents: Dict[str, List[str]] = {}
@@ -436,9 +455,15 @@ def _curve_points(pool: Sequence[PoolEntry], fit: EloFit, edges: Sequence[Edge],
     for entry in pool:
         name = entry.name
         n = played.get(name, 0)
-        at = {} if cost is None else series_at(cost, entry.step)
+        # ⚠️ `cost` is a dict of run -> series for a joint league, but a *bare* series
+        # is the older single-run contract and several callers still pass one. Taking
+        # only the dict would have made the cost axis silently null for them, which is
+        # a column of `None` rather than an exception -- so both are accepted here.
+        series = cost.get(entry.run) if isinstance(cost, dict) else cost
+        at = {} if not series else series_at(series, entry.step)
         out.append({
             "checkpoint_id": name,
+            "run": entry.run,
             "step": entry.step,
             "euros_spent": at.get("euros"),
             "training_seconds": at.get("training_seconds"),
@@ -462,7 +487,13 @@ def _curve_points(pool: Sequence[PoolEntry], fit: EloFit, edges: Sequence[Edge],
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="the D2 league, docs/reference/evaluation.md §5.4")
-    p.add_argument("--run", required=True, help="the training run whose checkpoints are rated")
+    p.add_argument("--run", required=True, action="append", metavar="RUN",
+                   help="the training run whose checkpoints are rated. Repeatable: "
+                        "several runs go into ONE Bradley-Terry fit, interleaved by "
+                        "step so they actually play each other. Two runs rated "
+                        "separately share only the anchor, which pins each scale's "
+                        "zero but not its units, and the difference between them is "
+                        "then confounded with the fits")
     p.add_argument("--games", type=int, default=36,
                    help="games per pairing, even; half that many distinct openings")
     p.add_argument("--sims", type=int, default=64, help="simulations per move")
@@ -470,7 +501,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="random legal plies per opening, even so White is to move")
     p.add_argument("--max-plies", type=int, default=512)
     p.add_argument("--limit", type=int, default=32,
-                   help="rate at most this many players, evenly spaced by step")
+                   help="rate at most this many players **per run**, evenly spaced by step")
     p.add_argument("--anchor-every", type=int, default=4,
                    help="the anchor also plays every Nth checkpoint; 0 for bare SAI")
     p.add_argument("--checkpoints", default="checkpoints")
@@ -483,22 +514,37 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--prior", type=float, default=1.0,
                    help="drawn games against a phantom at Elo 0, per player")
-    p.add_argument("--out", default=None, help="logs/league-<run>.json by default")
+    p.add_argument("--out", default=None,
+                   help="logs/league-<run>.json, or league-joint-<a>+<b>.json for several")
     return p
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = build_parser().parse_args(argv)
-    out_path = args.out or os.path.join("logs", f"league-{args.run}.json")
+    runs = list(dict.fromkeys(args.run))
+    stem = runs[0] if len(runs) == 1 else "joint-" + "+".join(runs)
+    out_path = args.out or os.path.join("logs", f"league-{stem}.json")
     log = _Log(os.path.splitext(out_path)[0] + ".log")
 
-    log(f"league  run={args.run}  {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    log(f"league  run={'+'.join(runs)}  {time.strftime('%Y-%m-%d %H:%M:%S')}")
     log(f"  tail -f {os.path.splitext(out_path)[0] + '.log'}")
-    pool = build_pool(args.run, checkpoint_dir=args.checkpoints,
+    pool = build_pool(runs, checkpoint_dir=args.checkpoints,
                       anchor_path=args.anchor, limit=args.limit)
-    cost = training_series(args.train_log or os.path.join("logs", f"{args.run}.jsonl"))
-    if not cost:
-        log("  ⚠️ no training log found; the curve will have a null cost axis")
+    if len(runs) > 1:
+        log(f"  ⚠️ {len(runs)} runs in ONE fit, interleaved by step so the calendar's "
+            f"offsets cross between them. Ratings from this report are comparable "
+            f"across runs; ratings from two separate leagues are not.")
+    # ⚠️ One series per run. `--train-log` names a single file and so only makes sense
+    # for a single run; with several, each is joined from logs/<run>.jsonl.
+    cost = {}
+    for run in runs:
+        path = args.train_log if (args.train_log and len(runs) == 1) \
+            else os.path.join("logs", f"{run}.jsonl")
+        series = training_series(path)
+        if not series:
+            log(f"  ⚠️ no training log at {path}; {run}'s cost axis will be null")
+        else:
+            cost[run] = series
 
     report = run_league(
         pool, games=args.games, n_sims=args.sims, opening_plies=args.opening_plies,

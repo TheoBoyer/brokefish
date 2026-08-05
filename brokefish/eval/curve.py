@@ -22,12 +22,12 @@ import argparse
 import json
 import math
 import os
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 SCALE_NOTE = ("Elo is on the self-anchored scale of evaluation.md §5.1: 0 is the frozen "
               "random-init network, not a published rating.")
 
-COLUMNS = ("checkpoint_id", "step", "euros_spent", "training_seconds", "games_played",
+COLUMNS = ("checkpoint_id", "run", "step", "euros_spent", "training_seconds", "games_played",
            "elo", "ci95", "se", "se_raw", "n_sims", "draw_rate", "fit_version")
 
 
@@ -92,7 +92,34 @@ def cost_axis(report: dict) -> Optional[str]:
     return None
 
 
-def slope_per_decade(report: dict) -> Optional[float]:
+def row_run(r: dict) -> str:
+    """Which training run a curve point belongs to.
+
+    `league.py` writes a `run` field, but reports from before 2026-08-05 do not have
+    one, so it falls back to the `<run>@<step>` naming that `build_pool` has always
+    used. The anchor belongs to no run and comes back as `""`.
+    """
+    if r.get("run"):
+        return r["run"]
+    cid = r.get("checkpoint_id", "")
+    return cid.split("@")[0] if "@" in cid else ""
+
+
+def group_by_run(report: dict) -> List[Tuple[str, List[dict]]]:
+    """`(run, rows)` in first-appearance order; the anchor is dropped.
+
+    ⚠️ The anchor is in every run's graph and is pinned at Elo 0, so folding it into
+    one run's least squares would drag that run's intercept and nobody else's.
+    """
+    out: dict = {}
+    for r in curve_rows(report):
+        run = row_run(r)
+        if run:
+            out.setdefault(run, []).append(r)
+    return list(out.items())
+
+
+def slope_per_decade(report: dict, rows: Optional[Sequence[dict]] = None) -> Optional[float]:
     """Elo gained per 10× of training compute — Jones' law, `CLAUDE.md`'s Gate 2.
 
     Least squares on `(log10 cost, Elo)` over the points that have both, on
@@ -102,7 +129,10 @@ def slope_per_decade(report: dict) -> Optional[float]:
     key = cost_axis(report)
     if key is None:
         return None
-    pts = [(r[key], r["elo"]) for r in curve_rows(report)
+    # ⚠️ One run at a time. A joint report holds several runs on one scale, and a
+    # single least squares over all of them fits the *envelope* of two trajectories,
+    # which is not any run's slope and is not what Gate 2 asks for.
+    pts = [(r[key], r["elo"]) for r in (curve_rows(report) if rows is None else rows)
            if r.get(key) and r.get("elo") is not None and r[key] > 0]
     if len(pts) < 2:
         return None
@@ -124,19 +154,27 @@ def plot(report: dict, path: str) -> Optional[str]:
     except Exception:
         return None
 
-    rows = [r for r in curve_rows(report) if r.get("elo") is not None]
-    if not rows:
+    groups = [(run, [r for r in rs if r.get("elo") is not None])
+              for run, rs in group_by_run(report)]
+    groups = [(run, rs) for run, rs in groups if rs]
+    if not groups:
         return None
     key = cost_axis(report)
     label = {"euros_spent": "training euros",
              "training_seconds": "training seconds (self-play + gradient)",
              None: "optimiser steps"}[key]
-    xs = [(r.get(key) if key else None) or r["step"] for r in rows]
-    ys = [r["elo"] for r in rows]
-    es = [r.get("ci95") or 0.0 for r in rows]
 
     fig, ax = plt.subplots(figsize=(7, 4.5), dpi=140)
-    ax.errorbar(xs, ys, yerr=es, marker="o", ms=3, lw=1, capsize=2)
+    for run, rows in groups:
+        xs = [(r.get(key) if key else None) or r["step"] for r in rows]
+        ys = [r["elo"] for r in rows]
+        es = [r.get("ci95") or 0.0 for r in rows]
+        sl = slope_per_decade(report, rows)
+        tag = run if sl is None else f"{run}  ({sl:+.0f} Elo/decade)"
+        ax.errorbar(xs, ys, yerr=es, marker="o", ms=3, lw=1, capsize=2,
+                    label=tag if len(groups) > 1 else None)
+    if len(groups) > 1:
+        ax.legend(fontsize=7)
     ax.axhline(0.0, lw=0.8, ls="--", color="grey")
     ax.set_xlabel(label)
     ax.set_ylabel("Elo (self-anchored, 0 = random init)")
@@ -158,13 +196,21 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     report = load_report(args.report)
     print(format_curve(report))
-    slope, axis = slope_per_decade(report), cost_axis(report)
+    axis = cost_axis(report)
+    groups = group_by_run(report)
     print()
-    if slope is None:
-        print("  Elo per 10x compute: —  (no cost axis with any spread in this report)")
-    else:
-        print(f"  Elo per 10x compute: {slope:+.0f}  on {axis}   "
-              f"Gate 2 wants +500 (CLAUDE.md)")
+    # ⚠️ Per run, never pooled. A joint report puts several runs on one scale, and one
+    # least squares across them fits the envelope of two trajectories rather than
+    # either one's slope -- which is the quantity Gate 2 is about.
+    for run, rows in groups:
+        slope = slope_per_decade(report, rows)
+        if slope is None:
+            print(f"  {run:<24} Elo per 10x compute: —  (no cost axis with spread)")
+        else:
+            print(f"  {run:<24} Elo per 10x compute: {slope:+.0f}  on {axis}   "
+                  f"Gate 2 wants +500 (CLAUDE.md)")
+    if len(groups) > 1:
+        print("  one Bradley-Terry fit, so these ratings are comparable across runs")
     if args.csv:
         write_csv(report, args.csv)
         print(f"  wrote {args.csv}")

@@ -66,6 +66,30 @@ def _ext():
     return _EXT
 
 
+def _fold_norm(w: torch.Tensor, b: torch.Tensor, norm):
+    """Fold a LayerNorm's affine into the GEMM that consumes it (§CODA).
+
+    `LN(x) = gamma . x_hat + beta`, so
+
+        LN(x) W^T + b = x_hat (W . gamma)^T + (b + W beta)
+
+    with `x_hat = (x - mu) / sigma`. Both are exact and both are free at run time; the
+    kernel's `layernorm<false>` then emits `x_hat` and stops there. Measured worth:
+    `encoder_kernel<true>` goes from 4056 SASS instructions to 3888.
+
+    ⚠️ **The bias uses `W` before gamma is folded in.** `beta` is added *after* the
+    elementwise gamma, so it multiplies the original matrix; doing it the other way
+    round scales beta by gamma twice and is wrong by an amount that looks like a
+    quantisation artefact. `tests/test_model.py` compares against torch and would
+    catch it, which is the only reason it is safe to say so rather than prove it here.
+
+    Returns fp32; the caller casts once, at the end.
+    """
+    g = norm.weight.detach().float()
+    e = norm.bias.detach().float()
+    return w * g[None, :], b + w @ e
+
+
 class FusedEncoder:
     """Inference-only fused forward, in CUDA C++. See the Triton twin for the
     contract; the differences are internal."""
@@ -115,21 +139,32 @@ class FusedEncoder:
             )
 
         scale = self.d_head ** -0.5
-        packed = []
+        packed, ff1_folded = [], []
         for lay in layers:
-            w_qkv = lay.self_attn.in_proj_weight.detach().clone()
-            b_qkv = lay.self_attn.in_proj_bias.detach().clone()
+            w_qkv = lay.self_attn.in_proj_weight.detach().float().clone()
+            b_qkv = lay.self_attn.in_proj_bias.detach().float().clone()
             w_qkv[: self.D] *= scale
             b_qkv[: self.D] *= scale
+            w_ff1 = lay.linear1.weight.detach().float().clone()
+            b_ff1 = lay.linear1.bias.detach().float().clone()
+            w_qkv, b_qkv = _fold_norm(w_qkv, b_qkv, lay.norm1)
+            w_ff1, b_ff1 = _fold_norm(w_ff1, b_ff1, lay.norm2)
+            ff1_folded.append(w_ff1)
+            # ⚠️ Ones and zeros, not the real affine. The kernel's `layernorm<false>`
+            # does not read these, and writing the true values back would leave a slab
+            # that is wrong for anything that does. Writing the identity means a path
+            # which still applies the affine stays *correct*, only slower.
+            one = torch.ones(self.D, dtype=torch.float, device=w_qkv.device)
+            zero = torch.zeros(self.D, dtype=torch.float, device=w_qkv.device)
             # Matrices go through pack_b; vectors (LayerNorm affine, biases)
             # stay in their natural order -- the kernel indexes those by column.
             packed += [
-                lay.norm1.weight.detach(), lay.norm1.bias.detach(),
+                one, zero,
                 pack_b(w_qkv), b_qkv,
                 pack_b(lay.self_attn.out_proj.weight.detach()),
                 lay.self_attn.out_proj.bias.detach(),
-                lay.norm2.weight.detach(), lay.norm2.bias.detach(),
-                pack_b(lay.linear1.weight.detach()), lay.linear1.bias.detach(),
+                one, zero,
+                pack_b(w_ff1), b_ff1,
                 pack_b(lay.linear2.weight.detach()), lay.linear2.bias.detach(),
             ]
         self.weights = torch.cat([t.reshape(-1).half() for t in packed]).contiguous().cuda()
@@ -142,7 +177,7 @@ class FusedEncoder:
         self._wq8 = torch.empty(0, dtype=torch.uint8, device="cuda")
         self._sq8 = torch.empty(0, dtype=torch.float, device="cuda")
         if self.fp8:
-            self._pack_fp8(layers)
+            self._pack_fp8(layers, ff1_folded)
 
         self._empty = torch.empty(0, dtype=torch.int8, device="cuda")
         self._empty_h = torch.empty(0, dtype=torch.half, device="cuda")
@@ -155,7 +190,7 @@ class FusedEncoder:
         if net is not None:
             self._pack_tail(net)
 
-    def _pack_fp8(self, layers) -> None:
+    def _pack_fp8(self, layers, ff1_folded) -> None:
         """The FFN weights in e4m3, in `Fp8Off`/`Fp8SOff` order.
 
         ⚠️ The order here is `csrc/encoder.cu`'s `Fp8Off`: `w_ff1` then `w_ff2`, one
@@ -168,8 +203,14 @@ class FusedEncoder:
         from brokefish.nn.quant import Q_MAX, pack_b_fp8, quantise_weights_bytes
 
         blobs, scales = [], []
-        for lay in layers:
-            for w in (lay.linear1.weight.detach(), lay.linear2.weight.detach()):
+        for lay, w_ff1 in zip(layers, ff1_folded):
+            # ⚠️ `w_ff1` is the **folded** matrix, `linear1.weight * norm2.gamma`, not
+            # the module's. Quantising the unfolded one would be a different network:
+            # the kernel's LayerNorm no longer applies gamma, so it has to be in here.
+            # It is also a numerical change -- gamma rescales the input axis and so
+            # moves each 128-output block's amax -- which is why the prior-space
+            # comparison in nn/validate.py is the gate on this and not the tests.
+            for w in (w_ff1, lay.linear2.weight.detach()):
                 # ⚠️ `Q_MAX` explicitly, never the default. The activations are
                 # quantised to `fp8::kQMax` inside the kernel and the two have to be
                 # the same number or the fp16 accumulator overflows.

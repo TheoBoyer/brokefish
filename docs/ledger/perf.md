@@ -80,6 +80,28 @@ which. Stable to 0.1 point between 512 and 4096 CTAs. The instrumented kernel is
 to 1.06x slower than the shipped one and `PROF=false` is byte-identical SASS, verified
 with `cuobjdump`.
 
+### What binds it, measured with `ncu` rather than argued
+
+`/usr/local/cuda-12/bin/ncu` on `encoder_kernel<true>`, 512 CTAs, fp8:
+
+| metric | value |
+|---|---|
+| `gpu__dram_throughput` | **0.50 %** |
+| `lts__t_sector_hit_rate` | 99.81 % |
+| `lts__throughput` | 48.69 % |
+| `l1tex__throughput` | 63.85 % |
+| `sm__throughput` | **65.31 %** |
+| `smsp__inst_executed` | 248,705,024 = **60,720 per warp** |
+
+⚠️ **Nothing is saturated: this kernel is latency-bound at 16 warps/SM.** The 12.6 MB
+weight slab is entirely L2-resident (DRAM idle at 0.5 %, L2 hit rate 99.8 %) and L2 runs
+at half peak, so weight traffic is not the constraint either. Deleting work of any kind
+therefore returns *less than proportionally*, which is what three separate attempts
+measured: 11.3 % of elapsed cycles removed for 0.0 %, and 4.1 % of static instructions
+removed for 0.8 %. Warps per SM is `65536 / (32 x registers)`, so 128 registers fixes it
+at 16; raising it needs 85 registers for 3 CTAs/SM. The next measurement is
+`ncu --set full` for the stall-reason breakdown, not another kernel edit.
+
 ⚠️ **Row 13's win is a register story, not an arithmetic one.** fp8 halves the mma
 work either way; what row 12 could not spend was registers. `__launch_bounds__(THREADS,
 2)` allows exactly 65536 / (2 × 256) = 128 of them, and row 12's `float acc[2][4][4]`

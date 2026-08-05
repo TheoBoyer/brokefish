@@ -273,6 +273,25 @@ __device__ __forceinline__ void gemm_direct(uint32_t acc[2][4][2], const half* a
 // never leaves the warp. This is why the residual stream lives in SMEM rather
 // than in registers: a register-resident stream would spread each row across
 // all eight warps and cost a CTA barrier per norm.
+/// LayerNorm over one row, warp-local.
+///
+/// `AFFINE` is a template parameter because the encoder body does not have an affine
+/// any more. §CODA (arXiv 2605.19269) observes that `gamma` scales the *input axis* of
+/// whatever GEMM consumes this, so `(gamma . x_hat + beta) W^T = x_hat (W . gamma)^T +
+/// (W beta)`: both halves fold into the next matmul's weights and bias, exactly, at
+/// pack time. `brokefish/nn/cuda_impl.py` does the folding and writes ones and zeros
+/// into the slab's affine slots, so a path that still applies it stays *correct* --
+/// the failure mode of forgetting is slow, not wrong.
+///
+/// Measured, `cuobjdump -sass` on `encoder_kernel<true>`: **4056 -> 3888 instructions**,
+/// of which FFMA 261 -> 165. That is the currency -- this kernel is issue-limited, and
+/// `docs/journal/2026-08-05-ffn-handoff-negative.md` is what happens to a change that
+/// trades instructions for elapsed cycles instead of removing them.
+///
+/// ⚠️ Only the *body* folds. `tail_epilogue`'s `norm_f` would need a bias vector added
+/// to the three heads, which have none, so it keeps `AFFINE = true` -- it runs once per
+/// board against the body's sixteen, and buying it would cost a new slab field.
+template <bool AFFINE>
 __device__ __forceinline__ void layernorm(half* dst, const half* src, const half* gamma,
                                           const half* beta, float eps, int warp, int lane) {
     // One 128-bit load each instead of eight scalar LDG.E.U16: a lane's eight
@@ -280,8 +299,11 @@ __device__ __forceinline__ void layernorm(half* dst, const half* src, const half
     // loop-invariant and 16-byte aligned (every offset in Off is a multiple of
     // 8 halves). As scalar loads they were long-latency global reads feeding
     // arithmetic that depends on them immediately.
-    uint4 graw = *reinterpret_cast<const uint4*>(gamma + lane * 8);
-    uint4 braw = *reinterpret_cast<const uint4*>(beta + lane * 8);
+    uint4 graw = {}, braw = {};
+    if constexpr (AFFINE) {
+        graw = *reinterpret_cast<const uint4*>(gamma + lane * 8);
+        braw = *reinterpret_cast<const uint4*>(beta + lane * 8);
+    }
     const half* gv = reinterpret_cast<const half*>(&graw);
     const half* bv = reinterpret_cast<const half*>(&braw);
 #pragma unroll
@@ -313,9 +335,13 @@ __device__ __forceinline__ void layernorm(half* dst, const half* src, const half
         float rstd = rsqrtf(var + eps);
         half out[8];
 #pragma unroll
-        for (int j = 0; j < 8; ++j)
-            out[j] = __float2half((__half2float(v[j]) - mean) * rstd * __half2float(gv[j])
-                                  + __half2float(bv[j]));
+        for (int j = 0; j < 8; ++j) {
+            const float xn = (__half2float(v[j]) - mean) * rstd;
+            if constexpr (AFFINE)
+                out[j] = __float2half(xn * __half2float(gv[j]) + __half2float(bv[j]));
+            else
+                out[j] = __float2half(xn);
+        }
         *reinterpret_cast<uint4*>(dst + a_idx(row, lane * 8)) = *reinterpret_cast<uint4*>(out);
     }
 }
@@ -582,7 +608,8 @@ __device__ __noinline__ void tail_epilogue(half* bufA, half* bufB, half* scratch
     // 512 B is what bought the second CTA per SM -- so a head GEMM reading it
     // through ldmatrix would collide eight ways. The norm lands the stream in
     // bufB, which is padded, and both problems go away at once.
-    layernorm(bufB, bufA, tail + TailOff::lnf_w, tail + TailOff::lnf_b, eps, warp, lane);
+    layernorm<true>(bufB, bufA, tail + TailOff::lnf_w, tail + TailOff::lnf_b, eps,
+                    warp, lane);
     __syncthreads();
     if (!policy) return;
 
@@ -801,7 +828,9 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
         const uint8_t* Wq = FP8 ? wq8 + (size_t)layer * Fp8Off::stride : nullptr;
         const float* Sq = FP8 ? sq8 + (size_t)layer * Fp8SOff::stride : nullptr;
 
-        layernorm(bufB, bufA, W + Off::ln1_w, W + Off::ln1_b, eps, warp, lane);
+        // The affine slots hold ones and zeros: gamma lives in w_qkv's input axis and
+        // beta in b_qkv, folded there by `FusedEncoder._fold_norm`.
+        layernorm<false>(bufB, bufA, W + Off::ln1_w, W + Off::ln1_b, eps, warp, lane);
 
         if (debug_stage == 1) { __syncthreads(); goto dump; }
         // Cross-warp handoff. layernorm writes bufB by row (warp w owns rows
@@ -860,7 +889,7 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
         residual_rows(bufA, scratch, warp, lane);
 
         if (debug_stage == 2) goto dump;
-        layernorm(bufB, bufA, W + Off::ln2_w, W + Off::ln2_b, eps, warp, lane);
+        layernorm<false>(bufB, bufA, W + Off::ln2_w, W + Off::ln2_b, eps, warp, lane);
         if (debug_stage == 3) { __syncthreads(); goto dump; }
         __syncthreads();
         tm.mark(prof::kRes1Ln2);

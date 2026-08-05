@@ -26,6 +26,7 @@
 #include <torch/extension.h>
 #include <c10/cuda/CUDAException.h>
 
+#include "fp8_gemm.cuh"
 #include "mma.cuh"
 
 
@@ -60,6 +61,39 @@ constexpr int SMEM_HALVES = SM_A + SM_B + SM_S;
 static_assert(SMEM_HALVES * sizeof(half) <= 50176,
               "over 50,176 B the block stops fitting twice on an sm89 SM, which "
               "costs more than any use of the extra memory has been worth");
+
+// §fp8. A parallel weight slab for the FFN only, in e4m3, plus its 128x128 block
+// scales. docs/journal/2026-08-04-fp8-encoder.md measured 1.70x on the ff1 shape and
+// 0.66 % max prior-space error for FFN-only quantisation; the other two matmuls stay
+// fp16 because that is where three quarters of the error came from.
+struct Fp8Off {                                  // bytes, per layer
+    static constexpr int w_ff1 = 0;              // [DFF][D], packed B-fragment order
+    static constexpr int w_ff2 = w_ff1 + DFF * Dm;
+    static constexpr int stride = w_ff2 + Dm * DFF;
+};
+struct Fp8SOff {                                 // floats, per layer
+    static constexpr int s_ff1 = 0;              // [DFF/128][D/128]
+    static constexpr int s_ff2 = s_ff1 + (DFF / 128) * (Dm / 128);
+    static constexpr int stride = s_ff2 + (Dm / 128) * (DFF / 128);
+};
+
+// The quantised activations are written **over** the fp16 row that produced them, so
+// they cost no shared memory -- which they had to, because SMEM_HALVES is already at
+// the static_assert. Reusing the fp16 row pitch is also better for banks than a packed
+// 260 would be: 528 / 4 = 132 words, and 132 mod 32 = 4, so the eight lanes sharing a
+// `t` land on eight distinct banks. The per-row tile scales go in the row padding that
+// AROW already carries.
+namespace fp8cfg {
+constexpr int kAPitch = AROW * (int)sizeof(half);            // 528 B
+constexpr int kScaleOff = Dm * (int)sizeof(half);            // 512 B, into the padding
+constexpr int kScaleStride = kAPitch / (int)sizeof(float);   // 132 floats
+constexpr int kTilesD = Dm / fp8::kTileK;                    // 2
+static_assert(kAPitch - kScaleOff >= kTilesD * (int)sizeof(float),
+              "the row padding cannot hold this row's tile scales");
+static_assert(kAPitch % sizeof(float) == 0 && kScaleOff % sizeof(float) == 0,
+              "the scales must land 4-byte aligned inside the row");
+static_assert(HCHUNK == Dm, "the ff2 activation chunk reuses ff1's row geometry");
+}  // namespace fp8cfg
 
 // Weight buffer offsets, in halves, within one layer's slab.
 struct Off {
@@ -589,8 +623,25 @@ __device__ __noinline__ void tail_epilogue(half* bufA, half* bufB, half* scratch
 
 // --------------------------------------------------------------------------
 
+// `FP8` is a template parameter and not a runtime flag on purpose. Under
+// `__launch_bounds__(THREADS, 2)` ptxas must fit 128 registers, and a runtime branch
+// would make it allocate for the union of both paths and spill the fp16 one -- which
+// is the path every existing measurement was taken on.
+//
+// ⚠️ **Buying the fp8 path more registers is a measured loss.** It carries a second
+// accumulator -- `float acc[2][4][4]` running across k-tiles on top of the fp16 mma
+// fragment -- so it wants 32 registers where fp16 wants 16, and at 2 CTAs/SM ptxas
+// holds it to 128 and pays in local memory: 960 B of spill loads against fp16's 64.
+// `__launch_bounds__(THREADS, FP8 ? 1 : 2)` removes every spill (200 registers, 0 B)
+// and makes the kernel **slower**: 0.978x against fp16 where the spilling version is
+// 1.154x. Two CTAs per SM is only 16 warps and it is already the whole of the latency
+// hiding; halving it costs more than the spill traffic ever did. 2 CTAs/SM needs
+// 65536 / (2 * 256) = 128 registers exactly, so 128 is not a tuning knob -- the way
+// out is to *need* fewer registers, i.e. to drop the fp32 running accumulator.
+template <bool FP8>
 __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
     half* __restrict__ y, const half* __restrict__ weights,
+    const uint8_t* __restrict__ wq8, const float* __restrict__ sq8,
     const int8_t* __restrict__ alive_ptr,
     // B2. Every pointer below may be null, and the null-ness is the mode switch:
     // `boards` non-null runs the embedding prologue instead of reading
@@ -649,6 +700,8 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
 
     for (int layer = 0; layer < n_layers; ++layer) {
         const half* W = weights + (size_t)layer * Off::stride;
+        const uint8_t* Wq = FP8 ? wq8 + (size_t)layer * Fp8Off::stride : nullptr;
+        const float* Sq = FP8 ? sq8 + (size_t)layer * Fp8SOff::stride : nullptr;
 
         layernorm(bufB, bufA, W + Off::ln1_w, W + Off::ln1_b, eps, warp, lane);
 
@@ -707,12 +760,67 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
         __syncthreads();
 
         uint32_t ff[2][4][2];
-        zero_frags(ff);
+        float ffq[2][4][4];
+        if constexpr (FP8) {
+#pragma unroll
+            for (int m = 0; m < 2; ++m)
+#pragma unroll
+                for (int p = 0; p < 4; ++p)
+#pragma unroll
+                    for (int q = 0; q < 4; ++q) ffq[m][p][q] = 0.0f;
+            // Quantise the normed input **in place**, once for all four chunks. Tile t
+            // writes bytes [128t, 128t+128) of a row while reading halves
+            // [128t, 128t+128) = bytes [256t, 256t+256), so an ascending tile order
+            // never overwrites a source it has not already read; the `__shfl` inside
+            // quantise_tile orders the eight lanes of a row, and rows are disjoint
+            // across warps.
+            uint8_t* aq = reinterpret_cast<uint8_t*>(bufB);
+            float* as = reinterpret_cast<float*>(aq + fp8cfg::kScaleOff);
+            const int r0 = warp * (T / NWARPS);
+            // ⚠️ `__syncwarp` between tiles, and no unrolling across them. Tile 1
+            // writes bytes [128, 256) of a row that tile 0 is still reading as halves
+            // [0, 128) = bytes [0, 256). Program order per lane makes that safe and
+            // nothing else does: the two views have different pointer types so the
+            // compiler may reorder them, and the eight lanes of a row need not be in
+            // step under independent thread scheduling.
+#pragma unroll 1
+            for (int t = 0; t < fp8cfg::kTilesD; ++t) {
+                fp8::quantise_tile(aq + (size_t)r0 * fp8cfg::kAPitch + t * fp8::kTileK,
+                                   fp8cfg::kAPitch,
+                                   as + (size_t)r0 * fp8cfg::kScaleStride + t,
+                                   fp8cfg::kScaleStride,
+                                   bufB + (size_t)r0 * AROW + t * fp8::kTileK, AROW,
+                                   T / NWARPS, lane);
+                __syncwarp();
+            }
+            __syncthreads();
+        } else {
+            zero_frags(ff);
+        }
         for (int c = 0; c < DFF / HCHUNK; ++c) {
             uint32_t hacc[2][4][2];
-            zero_frags(hacc);
             // ff1 is [1024][256]: chunk c starts at n-tile 32c.
-            gemm_direct<NK, NK>(hacc, bufB, AROW, W + Off::w_ff1, c * 32 + warp * 4, 0, lane);
+            if constexpr (FP8) {
+                float h[2][4][4];
+#pragma unroll
+                for (int m = 0; m < 2; ++m)
+#pragma unroll
+                    for (int p = 0; p < 4; ++p)
+#pragma unroll
+                        for (int q = 0; q < 4; ++q) h[m][p][q] = 0.0f;
+                fp8::gemm_fp8<NK, NK>(
+                    h, reinterpret_cast<const uint8_t*>(bufB), fp8cfg::kAPitch,
+                    reinterpret_cast<const float*>(
+                        reinterpret_cast<const uint8_t*>(bufB) + fp8cfg::kScaleOff),
+                    fp8cfg::kScaleStride,
+                    reinterpret_cast<const uint2*>(Wq + Fp8Off::w_ff1),
+                    Sq + Fp8SOff::s_ff1, fp8cfg::kTilesD,
+                    c * 32 + warp * 4, 0, lane);
+                fp8::frags_from_f32(hacc, h);
+            } else {
+                zero_frags(hacc);
+                gemm_direct<NK, NK>(hacc, bufB, AROW, W + Off::w_ff1, c * 32 + warp * 4, 0, lane);
+            }
             add_bias(hacc, W + Off::b_ff1 + c * HCHUNK, warp * DH, lane);
             const __half2 zero2 = __floats2half2_rn(0.f, 0.f);
 #pragma unroll
@@ -727,8 +835,39 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
             // ff2 is [256][1024]: chunk c is the k-slice [256c, 256c+256), i.e.
             // k-groups 8c..8c+7 of a matrix whose packed row pitch is 32.
             __syncthreads();
-            gemm_direct<8, DFF / 32>(ff, hid, HROW, W + Off::w_ff2, warp * 4, c * 8, lane);
+            if constexpr (FP8) {
+                // Same in-place quantisation, on this chunk of the hidden. Its input
+                // is post-ReLU and therefore non-negative, so its partial sums get no
+                // sign cancellation -- this is where `q_max = 16`'s 8x accumulator
+                // headroom is doing real work rather than being slack.
+                uint8_t* hq = reinterpret_cast<uint8_t*>(hid);
+                float* hs = reinterpret_cast<float*>(hq + fp8cfg::kScaleOff);
+                const int r0 = warp * (T / NWARPS);
+#pragma unroll 1
+                for (int t = 0; t < fp8cfg::kTilesD; ++t) {
+                    fp8::quantise_tile(hq + (size_t)r0 * fp8cfg::kAPitch + t * fp8::kTileK,
+                                       fp8cfg::kAPitch,
+                                       hs + (size_t)r0 * fp8cfg::kScaleStride + t,
+                                       fp8cfg::kScaleStride,
+                                       hid + (size_t)r0 * HROW + t * fp8::kTileK, HROW,
+                                       T / NWARPS, lane);
+                    __syncwarp();
+                }
+                __syncthreads();
+                // ⚠️ The weight is addressed globally from `k32_0 = 8c`; the activation
+                // buffer holds only this chunk and is addressed from zero. gemm_fp8
+                // keeps the two indices apart -- csrc/tests/tfp8.cu's fifth check is
+                // exactly this call shape, and two bugs lived in the difference.
+                fp8::gemm_fp8<HCHUNK / 32, DFF / 32>(
+                    ffq, hq, fp8cfg::kAPitch, hs, fp8cfg::kScaleStride,
+                    reinterpret_cast<const uint2*>(Wq + Fp8Off::w_ff2),
+                    Sq + Fp8SOff::s_ff2, DFF / fp8::kTileK,
+                    warp * 4, c * (HCHUNK / 32), lane);
+            } else {
+                gemm_direct<8, DFF / 32>(ff, hid, HROW, W + Off::w_ff2, warp * 4, c * 8, lane);
+            }
         }
+        if constexpr (FP8) fp8::frags_from_f32(ff, ffq);
         add_bias(ff, W + Off::b_ff2, warp * DH, lane);
         // bufB is dead: the first barrier of the last FFN chunk is already past
         // every warp's read of it, so the staged sum needs no barrier of its own
@@ -772,16 +911,29 @@ T* ptr_or_null(const torch::Tensor& t) {
     return t.numel() ? reinterpret_cast<T*>(t.data_ptr()) : nullptr;
 }
 
-void launch(int n_boards, half* y, const half* weights, const int8_t* alive,
+void launch(int n_boards, half* y, const half* weights, const uint8_t* wq8,
+            const float* sq8, const int8_t* alive,
             const uint16_t* boards, const int16_t* control, const uint8_t* rep,
             const half* emb, const half* tail, half* policy, half* promo, float* value,
             int n_layers, float eps, int debug_stage) {
     size_t smem = brokefish::SMEM_HALVES * sizeof(half);
-    cudaFuncSetAttribute(brokefish::encoder_kernel,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-    brokefish::encoder_kernel<<<n_boards, brokefish::THREADS, smem>>>(
-        y, weights, alive, boards, control, rep, emb, tail, policy, promo, value,
-        n_layers, eps, debug_stage);
+    // ⚠️ Both instantiations, selected here. `wq8 && sq8` is the switch and it is
+    // all-or-nothing: half a slab would read the fp16 weights through an fp8 layout,
+    // which stays in range and produces plausible numbers.
+    const bool fp8 = (wq8 != nullptr) && (sq8 != nullptr);
+    if (fp8) {
+        cudaFuncSetAttribute(brokefish::encoder_kernel<true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        brokefish::encoder_kernel<true><<<n_boards, brokefish::THREADS, smem>>>(
+            y, weights, wq8, sq8, alive, boards, control, rep, emb, tail, policy,
+            promo, value, n_layers, eps, debug_stage);
+    } else {
+        cudaFuncSetAttribute(brokefish::encoder_kernel<false>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        brokefish::encoder_kernel<false><<<n_boards, brokefish::THREADS, smem>>>(
+            y, weights, nullptr, nullptr, alive, boards, control, rep, emb, tail,
+            policy, promo, value, n_layers, eps, debug_stage);
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -797,7 +949,10 @@ void encoder_forward(torch::Tensor y, torch::Tensor weights, torch::Tensor alive
     TORCH_CHECK(y.dim() == 3 && y.size(1) == brokefish::T && y.size(2) == brokefish::Dm,
                 "y must be [boards, 32, 256] fp16 contiguous");
     TORCH_CHECK(weights.is_cuda() && weights.scalar_type() == torch::kHalf);
+    // No fp8 here on purpose: this entry point is the A/B control against Triton and
+    // the eleven tests of tests/test_model.py, so it stays the fp16 kernel exactly.
     launch((int)y.size(0), ptr_or_null<half>(y), ptr_or_null<const half>(weights),
+           nullptr, nullptr,
            ptr_or_null<const int8_t>(alive), nullptr, nullptr, nullptr, nullptr, nullptr,
            nullptr, nullptr, nullptr, (int)n_layers, (float)eps, (int)debug_stage);
 }
@@ -809,7 +964,8 @@ void encoder_forward(torch::Tensor y, torch::Tensor weights, torch::Tensor alive
 void model_forward(torch::Tensor boards, torch::Tensor control, torch::Tensor rep,
                    torch::Tensor weights, torch::Tensor emb, torch::Tensor tail,
                    torch::Tensor policy, torch::Tensor promo, torch::Tensor value,
-                   torch::Tensor y, int64_t n_layers, double eps, int64_t debug_stage) {
+                   torch::Tensor y, int64_t n_layers, double eps, int64_t debug_stage,
+                   torch::Tensor wq8, torch::Tensor sq8) {
     TORCH_CHECK(boards.is_cuda() && boards.scalar_type() == torch::kShort
                 && boards.is_contiguous() && boards.dim() == 2
                 && boards.size(1) == brokefish::T,
@@ -847,7 +1003,28 @@ void model_forward(torch::Tensor boards, torch::Tensor control, torch::Tensor re
                     && y.numel() == n * brokefish::T * brokefish::Dm,
                     "y must be [n, 32, 256] fp16 contiguous");
 
-    launch((int)n, ptr_or_null<half>(y), ptr_or_null<const half>(weights), nullptr,
+    // §fp8. Empty tensors mean the fp16 path, matching every other optional argument
+    // here. Both or neither: a slab without its scales would be read as fp16 weights
+    // through an fp8 layout, in range and wrong.
+    TORCH_CHECK(wq8.numel() == 0 || (wq8.is_cuda() && wq8.scalar_type() == torch::kByte
+                                     && wq8.is_contiguous()),
+                "wq8 must be empty or contiguous uint8 on CUDA");
+    TORCH_CHECK(sq8.numel() == 0 || (sq8.is_cuda() && sq8.scalar_type() == torch::kFloat
+                                     && sq8.is_contiguous()),
+                "sq8 must be empty or contiguous float32 on CUDA");
+    TORCH_CHECK((wq8.numel() == 0) == (sq8.numel() == 0),
+                "pass both the fp8 weight slab and its scales, or neither");
+    if (wq8.numel()) {
+        TORCH_CHECK(wq8.numel() == n_layers * (int64_t)brokefish::Fp8Off::stride,
+                    "wq8 must be [n_layers * ", brokefish::Fp8Off::stride, "] bytes, got ",
+                    wq8.numel());
+        TORCH_CHECK(sq8.numel() == n_layers * (int64_t)brokefish::Fp8SOff::stride,
+                    "sq8 must be [n_layers * ", brokefish::Fp8SOff::stride, "] floats, got ",
+                    sq8.numel());
+    }
+
+    launch((int)n, ptr_or_null<half>(y), ptr_or_null<const half>(weights),
+           ptr_or_null<const uint8_t>(wq8), ptr_or_null<const float>(sq8), nullptr,
            ptr_or_null<const uint16_t>(boards), ptr_or_null<const int16_t>(control),
            ptr_or_null<const uint8_t>(rep), ptr_or_null<const half>(emb),
            ptr_or_null<const half>(tail), ptr_or_null<half>(policy),
@@ -856,6 +1033,7 @@ void model_forward(torch::Tensor boards, torch::Tensor control, torch::Tensor re
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("fp8_q_max", []() { return (double)brokefish::fp8::kQMax; });
     m.def("encoder_forward", &encoder_forward, "fused encoder forward");
     m.def("model_forward", &model_forward, "boards in, policy/promo/value out");
 }

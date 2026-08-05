@@ -82,7 +82,7 @@ class FusedEncoder:
     EMB_TABLES = ("emb_square", "emb_type_special", "emb_color_turn",
                   "emb_clock", "emb_rep")
 
-    def __init__(self, source, acc_dtype: str = "fp16"):
+    def __init__(self, source, acc_dtype: str = "fp16", fp8: bool = False):
         net = source if isinstance(source, BrokefishNet) else None
         encoder = net.encoder if net is not None else source
         layers = encoder.layers
@@ -134,6 +134,16 @@ class FusedEncoder:
             ]
         self.weights = torch.cat([t.reshape(-1).half() for t in packed]).contiguous().cuda()
 
+        # §fp8. Built only when asked, because it is 512 KB per layer of extra device
+        # memory and every measurement before 2026-08-04 was taken without it.
+        # `docs/journal/2026-08-04-fp8-encoder.md`: the FFN's two matmuls in e4m3,
+        # 1.70x on the tile, 0.66 % max prior-space error measured in emulation.
+        self.fp8 = bool(fp8)
+        self._wq8 = torch.empty(0, dtype=torch.uint8, device="cuda")
+        self._sq8 = torch.empty(0, dtype=torch.float, device="cuda")
+        if self.fp8:
+            self._pack_fp8(layers)
+
         self._empty = torch.empty(0, dtype=torch.int8, device="cuda")
         self._empty_h = torch.empty(0, dtype=torch.half, device="cuda")
         self._empty_f = torch.empty(0, dtype=torch.float, device="cuda")
@@ -144,6 +154,30 @@ class FusedEncoder:
         self.net = net
         if net is not None:
             self._pack_tail(net)
+
+    def _pack_fp8(self, layers) -> None:
+        """The FFN weights in e4m3, in `Fp8Off`/`Fp8SOff` order.
+
+        ⚠️ The order here is `csrc/encoder.cu`'s `Fp8Off`: `w_ff1` then `w_ff2`, one
+        slab per layer, and the scales likewise. A permutation is silent -- every byte
+        is in range and the numbers stay plausible -- which is why
+        `csrc/tests/tfp8.cu` packs independently in C++ and
+        `tests/test_quant.py::test_the_packed_layout_decodes_back` re-derives the index
+        rather than re-running `pack_b_fp8`.
+        """
+        from brokefish.nn.quant import Q_MAX, pack_b_fp8, quantise_weights_bytes
+
+        blobs, scales = [], []
+        for lay in layers:
+            for w in (lay.linear1.weight.detach(), lay.linear2.weight.detach()):
+                # ⚠️ `Q_MAX` explicitly, never the default. The activations are
+                # quantised to `fp8::kQMax` inside the kernel and the two have to be
+                # the same number or the fp16 accumulator overflows.
+                qb, sc = quantise_weights_bytes(w.float(), Q_MAX)
+                blobs.append(pack_b_fp8(qb).reshape(-1))
+                scales.append(sc.reshape(-1))
+        self._wq8 = torch.cat(blobs).contiguous().cuda()
+        self._sq8 = torch.cat(scales).float().contiguous().cuda()
 
     # -- B2 weight slabs ---------------------------------------------------
 
@@ -242,7 +276,7 @@ class FusedEncoder:
             boards.contiguous(), control.contiguous(), rep.contiguous(),
             self.weights, self.emb, self.tail,
             self.policy_out, self.promo_out, self.value_out, self._empty_h,
-            self.n_layers, self.eps, 0)
+            self.n_layers, self.eps, 0, self._wq8, self._sq8)
         return self.policy_out, self.promo_out, self.value_out
 
     def forward_stage(self, boards, control, rep, stage: int):
@@ -261,5 +295,5 @@ class FusedEncoder:
             boards.contiguous(), control.contiguous(), rep.contiguous(),
             self.weights, self.emb, self.tail,
             self._empty_h, self._empty_h, self._empty_f, self.state,
-            self.n_layers, self.eps, stage)
+            self.n_layers, self.eps, stage, self._wq8, self._sq8)
         return self.state

@@ -90,6 +90,13 @@ class TrainConfig:
     # **56.1 %** of the time. It touches **0.89 %** of positions, so expect `loss` and
     # `kl` not to move; what should move is the mate rate and the game length.
     terminal_collapse: bool = False
+    # §fp8. The FFN's two matmuls in e4m3 during **self-play only** -- the gradient
+    # step runs the fp32 master weights through torch, so this cannot destabilise the
+    # optimiser and its whole effect is slightly noisier data. Measured on
+    # `t7h-n128-collapse@2006`: **1.15x** encoder throughput, **1.05 %** max
+    # prior-space error, 1.31 % of top-1 priors moved.
+    # `docs/journal/2026-08-04-fp8-encoder.md`. Off, like every other new lever.
+    fp8: bool = False
 
     # -- the buffer, §5
     window_games: int = 500_000
@@ -331,7 +338,7 @@ class Trainer:
 
         self.env = ENVIRONMENTS[cfg.impl]
         self.weight_gen = 0
-        self.packed = PackedWeights.pack(self.net, self.weight_gen, impl=cfg.encoder)
+        self.packed = PackedWeights.pack(self.net, self.weight_gen, impl=cfg.encoder, fp8=cfg.fp8)
 
         self.search = search_impl("cuda" if cfg.impl == "cuda" else "torch")(
             SearchConfig(n=cfg.n_sims, B=cfg.batch_games, E=cfg.e_cap,
@@ -594,7 +601,7 @@ class Trainer:
         self.seconds["gradient"] += dt
 
         self.weight_gen += 1
-        self.packed = PackedWeights.pack(self.net, self.weight_gen, impl=self.cfg.encoder)
+        self.packed = PackedWeights.pack(self.net, self.weight_gen, impl=self.cfg.encoder, fp8=self.cfg.fp8)
         last.update({"steps": steps, "seconds": dt,
                      "positions_per_s": steps * self.cfg.batch / max(dt, 1e-9)})
         return last
@@ -620,7 +627,7 @@ class Trainer:
             with torch.no_grad():
                 for p in self.net.parameters():
                     p.add_(torch.randn_like(p) * 0.02)
-            packed = PackedWeights.pack(self.net, self.weight_gen + 1, impl=self.cfg.encoder)
+            packed = PackedWeights.pack(self.net, self.weight_gen + 1, impl=self.cfg.encoder, fp8=self.cfg.fp8)
             after = packed.encoder.forward_full(boards, control, rep)[0].float().clone()
             with torch.no_grad():
                 ref = self.net(boards, control, rep)[0].float()
@@ -628,17 +635,36 @@ class Trainer:
             self.net.load_state_dict(saved)
         moved = float((after - before).abs().max())
         agree = float((after - ref).abs().max())
+        scale = float(ref.abs().max())
         if moved == 0.0:
             raise AssertionError(
                 "train.md §12 check 9: the fused encoder's output did not change after "
                 "a weight update. Self-play is running a stale snapshot (§8.1)")
+        # ⚠️ **Explicitly, because `nan > tol` is False.** Without this a fused encoder
+        # producing NaN passes check 9 in silence and the run generates garbage for
+        # hours. That is not hypothetical: the fp8 FFN produced NaN on 116 boards of
+        # 128 during its integration, from a `q_max` that disagreed across two
+        # languages, and every isolated component tested clean.
+        if not (math.isfinite(moved) and math.isfinite(agree)):
+            raise AssertionError(
+                f"train.md §12 check 9: the fused encoder produced a non-finite output "
+                f"(moved={moved}, agree={agree}). fp16 has no saturating mode, so this "
+                f"is an overflow somewhere in the stack rather than a precision loss")
+        # §fp8 is a *deliberately* lower-precision path, so it is held to a bar scaled
+        # to the logits rather than to fp16's absolute one. Measured at initialisation
+        # on 2026-08-04: fp16 disagrees by 0.19 % of the logit maximum and fp8 by
+        # 3.28 %, so 8 % leaves fp8 a 2.4x margin while still catching a stale snapshot
+        # or a wrong weight slab, both of which are order-one errors. The fp16 bar is
+        # untouched: it is the one every existing run was started under.
+        if self.cfg.fp8:
+            tol = max(tol, 0.08 * scale)
         if agree > tol:
             raise AssertionError(
                 f"train.md §12 check 9: the rebuilt fused encoder disagrees with the "
                 f"updated torch model by {agree:.4g} (tolerance {tol}). test_b2.py holds "
                 f"the two paths together at a fixed weight set; this is the same check "
                 f"after an update, which is the one it does not cover")
-        return {"moved": moved, "agree": agree}
+        return {"moved": moved, "agree": agree, "tol": tol}
 
     # -- §9 ------------------------------------------------------------------ #
 
@@ -701,7 +727,7 @@ class Trainer:
             getattr(self.search, name).copy_(tensor)
         if hasattr(self.search, "_refresh_tree"):
             self.search._refresh_tree()
-        self.packed = PackedWeights.pack(self.net, self.weight_gen, impl=self.cfg.encoder)
+        self.packed = PackedWeights.pack(self.net, self.weight_gen, impl=self.cfg.encoder, fp8=self.cfg.fp8)
 
         got = weight_fingerprint(self.net)
         if got != blob["fingerprint"]:
@@ -837,6 +863,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="§6's reuse factor: how many times each generated position is "
                         "trained on. 0.815 is AZ's 65.2-per-game at an assumed 80-ply "
                         "game. Pass 65.2/mean_plies to reproduce the old per-game rule")
+    p.add_argument("--fp8", action="store_true",
+                   help="self-play the FFN in e4m3 (inference only; the gradient step "
+                        "is unchanged). ~1.15x encoder throughput for ~1 % prior error")
     p.add_argument("--terminal-collapse", action="store_true",
                    help="§6.6a: send a node's simulations to its proved-winning edges "
                         "and store the target as a point mass on them. Off by default "
@@ -931,7 +960,7 @@ def config_from_args(args) -> TrainConfig:
         betas=tuple(args.betas), warmup_steps=args.warmup,
         decay=args.decay, lr_min=args.lr_min,
         tau_plies=args.tau_plies, eps=args.eps, alpha=args.alpha,
-        terminal_collapse=args.terminal_collapse)
+        terminal_collapse=args.terminal_collapse, fp8=args.fp8)
     if args.smoke:
         cfg.n_sims, cfg.batch_games, cfg.moves_per_phase = 32, 256, 8
         cfg.window_games, cfg.mean_plies, cfg.max_plies = 2000, 128, 160

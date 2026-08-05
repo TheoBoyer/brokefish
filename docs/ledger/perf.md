@@ -42,6 +42,33 @@ absolute number moves with the card's temperature far more than the delta does. 
 consecutive runs read ×1.214 (fp16 67.7k, fp8 82.2k) and ×1.218 (fp16 65.8k, fp8
 80.2k) — the ratio is stable to 0.3 % while the absolute moved 2.8 %.
 
+### Where the time goes, measured rather than subtracted
+
+The 79.4 / 20.6 split below is a **residual** — the whole kernel's 25.5 TFLOPS against
+32.1 for the four GEMM shapes alone. `bench/bench_phases.py` measures the split
+directly, from `clock64` deltas at barriers the kernel already has, and the two agree
+for the kernel the residual described:
+
+| group | fp16 | fp8 (ships) |
+|---|---|---|
+| matmul | **81.3 %** | **72.9 %** |
+| staging + barriers | 8.9 % | 8.7 % |
+| normalisation | 5.4 % | 6.4 % |
+| attention (2.0 % of the flops) | 3.1 % | 3.8 % |
+| fp8 quantisation | — | **6.8 %** |
+| prologue + epilogue | 1.2 % | 1.4 % |
+
+fp16 measures 81.3 % against the 79.4 % subtraction — two points apart, the direct
+number higher, which is what `shapes_ab.cu`'s hot L2 and 48 CTAs would flatter.
+
+⚠️ **The subtraction does not describe the shipping kernel.** fp8 is **72.9 %** matmul,
+because it halves the FFN's matmul time and then pays 6.8 % of quantisation the fp16
+kernel never sees. Sizing any plan for the fp8 kernel against 79.4 / 20.6 gets the
+answer wrong in both directions; `docs/journal/2026-08-05-phase-decomposition.md` shows
+which. Stable to 0.1 point between 512 and 4096 CTAs. The instrumented kernel is 1.03x
+to 1.06x slower than the shipped one and `PROF=false` is byte-identical SASS, verified
+with `cuobjdump`.
+
 ⚠️ **Row 13's win is a register story, not an arithmetic one.** fp8 halves the mma
 work either way; what row 12 could not spend was registers. `__launch_bounds__(THREADS,
 2)` allows exactly 65536 / (2 × 256) = 128 of them, and row 12's `float acc[2][4][4]`

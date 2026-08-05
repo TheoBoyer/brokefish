@@ -22,6 +22,8 @@
 // analysis; ACC32 restores the wide path.
 
 #include <cstdint>
+#include <string>
+#include <vector>
 #include <cuda_fp16.h>
 #include <torch/extension.h>
 #include <c10/cuda/CUDAException.h>
@@ -625,6 +627,100 @@ __device__ __noinline__ void tail_epilogue(half* bufA, half* bufB, half* scratch
 
 // --------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Phase accounting.
+//
+// `docs/ledger/perf.md` gets the non-matmul share of this kernel by *subtraction*:
+// the four real GEMM shapes run at 32.1 TFLOPS in isolation (csrc/shapes_ab.cu), the
+// whole kernel at 25.5, so 20.6 % of the time is something else. That is a residual,
+// not a measurement -- part of it could be the GEMMs themselves running slower in
+// situ -- and it says nothing about *which* something else. This measures directly.
+//
+// ## Why per-warp `clock64` deltas are a sound decomposition here
+//
+// Each warp's phase deltas sum to that warp's own lifetime, so the fractions are
+// exact by construction and nothing has to be assumed about overlap. Two CTAs share
+// an SM, so a phase's cycles include time the SM spent on the other CTA -- which is
+// what makes them *fractions of elapsed time* rather than of issue slots, and
+// fractions of elapsed time are what a speedup is denominated in.
+//
+// Marks sit at boundaries the kernel already has, so **no barrier is added**. Adding
+// one would serialise warps that currently overlap and inflate the total it is
+// supposed to be dividing. Where a mark precedes an existing `__syncthreads()`, the
+// barrier wait lands in the *following* phase, which is why the phases are named for
+// what follows the barrier and not for what precedes it.
+//
+// ⚠️ Warps are symmetric everywhere except `tail_epilogue`, where warps 0-2 do the
+// three heads and 3-7 idle. Slot `kNumPhases + p` therefore records **warp 0 alone**,
+// which works in every phase; comparing the two columns is how that asymmetry is read
+// off rather than guessed at.
+namespace prof {
+
+enum Phase {
+    kPrologue = 0,  // entry, embedding gather or activation load, first barrier
+    kLn1,           // LayerNorm 1 and the cross-warp handoff barrier
+    kQkvGemm,       // three [32,256]x[256,256]
+    kQkvBias,       // three add_bias over the fragments
+    kAttention,     // V transpose, scores, softmax, AV -- warp-local, no barrier
+    kAttnStore,     // store_frags(o) between two barriers
+    kProjGemm,      // out_proj [32,256]x[256,256]
+    kProjEpi,       // its bias and the staged store
+    kRes1Ln2,       // residual add and LayerNorm 2
+    kQuantA,        // quantise_row over the normed input          (fp8 only)
+    kFf1Gemm,       // linear1, x4 chunks
+    kFf1Epi,        // its bias and the ReLU, x4
+    kHidStore,      // store_frags(hid), x4
+    kQuantH,        // quantise_row over the hidden chunk, x4      (fp8 only)
+    kFf2Gemm,       // linear2, x4 chunks
+    kFf2Epi,        // its bias and the staged store
+    kRes2,          // the second residual add
+    kEpilogue,      // final LayerNorm and the three heads
+    kNumPhases
+};
+// ⚠️ **Sharded by CTA, and this is not an optimisation.** A mark fires ~250 times per
+// warp per CTA, so an unsharded counter takes 8 * 250 * n_boards atomics onto 36
+// addresses -- same-address atomics serialise, and the profiler would then be
+// measuring its own contention and attributing it to whichever phase it landed in.
+// 32 shards summed on the host cuts that 32-fold and costs 9 KB of device globals.
+constexpr int kShards = 32;
+constexpr int kRows = 2;          // row 0: every warp. row 1: warp 0 alone.
+constexpr int kSlots = kShards * kRows * kNumPhases;
+
+__device__ unsigned long long g_prof[kSlots];
+
+__device__ __forceinline__ long long now() {
+    long long t;
+    // ⚠️ `volatile` **and** the memory clobber. Without them ptxas may move loads and
+    // stores across the read, which is exactly what makes a phase boundary a fiction.
+    asm volatile("mov.u64 %0, %%clock64;" : "=l"(t) :: "memory");
+    return t;
+}
+
+template <bool ON>
+struct Timer {
+    long long t;
+    unsigned long long* base;     // this CTA's shard, row 0
+    bool warp0, lane0;
+    __device__ __forceinline__ Timer(int block, int warp, int lane)
+        : t(0), base(g_prof + (size_t)(block & (kShards - 1)) * kRows * kNumPhases),
+          warp0(warp == 0), lane0(lane == 0) {
+        if constexpr (ON) t = now();
+    }
+    __device__ __forceinline__ void mark(int phase) {
+        if constexpr (ON) {
+            const long long n = now();
+            const unsigned long long d = (unsigned long long)(n - t);
+            if (lane0) {
+                atomicAdd(base + phase, d);
+                if (warp0) atomicAdd(base + kNumPhases + phase, d);
+            }
+            t = n;
+        }
+    }
+};
+
+}  // namespace prof
+
 // `FP8` is a template parameter and not a runtime flag on purpose. Under
 // `__launch_bounds__(THREADS, 2)` ptxas must fit 128 registers, and a runtime branch
 // would make it allocate for the union of both paths and spill the fp16 one -- which
@@ -640,7 +736,7 @@ __device__ __noinline__ void tail_epilogue(half* bufA, half* bufB, half* scratch
 // hiding; halving it costs more than the spill traffic ever did. 2 CTAs/SM needs
 // 65536 / (2 * 256) = 128 registers exactly, so 128 is not a tuning knob -- the way
 // out is to *need* fewer registers, i.e. to drop the fp32 running accumulator.
-template <bool FP8>
+template <bool FP8, bool PROF = false>
 __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
     half* __restrict__ y, const half* __restrict__ weights,
     const uint8_t* __restrict__ wq8, const float* __restrict__ sq8,
@@ -676,6 +772,7 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
     // Declared before the first goto: jumping over an initialised declaration in
     // the same scope does not compile, and the debug stages jump to `dump`.
     half* gy = y ? y + (size_t)board * T * Dm : nullptr;
+    prof::Timer<PROF> tm(board, warp, lane);
 
     // One 32-bit word says which slots hold a live piece (spec 7.3). Dead keys
     // leave the softmax as -inf; dead rows are computed and never read.
@@ -698,6 +795,7 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
         }
     }
     __syncthreads();
+    tm.mark(prof::kPrologue);
     if (debug_stage == 9) goto dump;      // the gather alone, nothing else run
 
     for (int layer = 0; layer < n_layers; ++layer) {
@@ -714,6 +812,7 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
         // gemm_full used to open with a barrier of its own, which hid this
         // dependency; gemm_direct has none, so it has to be stated.
         __syncthreads();
+        tm.mark(prof::kLn1);
 
         uint32_t q[2][4][2], k[2][4][2], v[2][4][2];
         zero_frags(q);
@@ -726,9 +825,11 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
         gemm_direct<NK, NK>(q, bufB, AROW, wq, warp * 4,      0, lane);
         gemm_direct<NK, NK>(k, bufB, AROW, wq, 32 + warp * 4, 0, lane);
         gemm_direct<NK, NK>(v, bufB, AROW, wq, 64 + warp * 4, 0, lane);
+        tm.mark(prof::kQkvGemm);
         add_bias(q, W + Off::b_qkv, warp * DH, lane);
         add_bias(k, W + Off::b_qkv + Dm, warp * DH, lane);
         add_bias(v, W + Off::b_qkv + 2 * Dm, warp * DH, lane);
+        tm.mark(prof::kQkvBias);
 
         if (debug_stage >= 5 && debug_stage <= 7) {
             __syncthreads();
@@ -740,26 +841,31 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
 
         uint32_t o[2][4][2];
         attention(o, q, k, v, vbuf, warp * DH, alive, lane);
+        tm.mark(prof::kAttention);
 
         __syncthreads();
         store_frags(bufB, AROW, o, warp * DH, lane);
         if (debug_stage == 4) { __syncthreads(); goto dump; }
         __syncthreads();
+        tm.mark(prof::kAttnStore);
 
         uint32_t proj[2][4][2];
         zero_frags(proj);
         gemm_direct<NK, NK>(proj, bufB, AROW, W + Off::w_o, warp * 4, 0, lane);
+        tm.mark(prof::kProjGemm);
         add_bias(proj, W + Off::b_o, warp * DH, lane);
         // scratch is dead here (it held the V transpose, and every warp passed
         // the barrier above), so it takes the staged projection.
         store_frags(scratch, AROW, proj, warp * DH, lane);
         __syncthreads();
+        tm.mark(prof::kProjEpi);
         residual_rows(bufA, scratch, warp, lane);
 
         if (debug_stage == 2) goto dump;
         layernorm(bufB, bufA, W + Off::ln2_w, W + Off::ln2_b, eps, warp, lane);
         if (debug_stage == 3) { __syncthreads(); goto dump; }
         __syncthreads();
+        tm.mark(prof::kRes1Ln2);
 
         uint32_t ff[2][4][2];
         zero_frags(ff);
@@ -776,6 +882,7 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
                                   fp8cfg::kScaleStride,
                                   bufB + (size_t)r0 * AROW, AROW, T / NWARPS, lane);
             __syncthreads();
+            tm.mark(prof::kQuantA);
         }
         for (int c = 0; c < DFF / HCHUNK; ++c) {
             uint32_t hacc[2][4][2];
@@ -792,6 +899,7 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
                 zero_frags(hacc);
                 gemm_direct<NK, NK>(hacc, bufB, AROW, W + Off::w_ff1, c * 32 + warp * 4, 0, lane);
             }
+            tm.mark(prof::kFf1Gemm);
             add_bias(hacc, W + Off::b_ff1 + c * HCHUNK, warp * DH, lane);
             const __half2 zero2 = __floats2half2_rn(0.f, 0.f);
 #pragma unroll
@@ -802,10 +910,12 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
                     hacc[m][n][1] = u32(__hmax2(h2(hacc[m][n][1]), zero2));
                 }
             __syncthreads();
+            tm.mark(prof::kFf1Epi);
             store_frags(hid, HROW, hacc, warp * DH, lane);
             // ff2 is [256][1024]: chunk c is the k-slice [256c, 256c+256), i.e.
             // k-groups 8c..8c+7 of a matrix whose packed row pitch is 32.
             __syncthreads();
+            tm.mark(prof::kHidStore);
             if constexpr (FP8) {
                 // Same in-place quantisation, on this chunk of the hidden. Its input
                 // is post-ReLU and therefore non-negative, so its partial sums get no
@@ -826,6 +936,7 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
                                           hid + (size_t)r0 * HROW, HROW,
                                           T / NWARPS, lane);
                 __syncthreads();
+                tm.mark(prof::kQuantH);
                 // ⚠️ The weight is addressed globally from `k32_0 = 8c`; the activation
                 // buffer holds only this chunk and is addressed from zero.
                 // gemm_fp8_row keeps the two indices apart -- csrc/tests/tfp8.cu's
@@ -838,6 +949,7 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
             } else {
                 gemm_direct<8, DFF / 32>(ff, hid, HROW, W + Off::w_ff2, warp * 4, c * 8, lane);
             }
+            tm.mark(prof::kFf2Gemm);
         }
         add_bias(ff, W + Off::b_ff2, warp * DH, lane);
         // bufB is dead: the first barrier of the last FFN chunk is already past
@@ -845,13 +957,16 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
         // and the layer keeps its 14.
         store_frags(bufB, AROW, ff, warp * DH, lane);
         __syncthreads();
+        tm.mark(prof::kFf2Epi);
         residual_rows(bufA, bufB, warp, lane);
+        tm.mark(prof::kRes2);
     }
 
     // --- B2 epilogue: the final LayerNorm, then the three heads -------------
     if (policy || debug_stage == 8)
         tail_epilogue(bufA, bufB, scratch, tail, control, policy, promo, value, eps,
                       board, warp, lane, tid);
+    tm.mark(prof::kEpilogue);
     if (debug_stage == 8) goto dump;
     if (policy) return;
 
@@ -882,6 +997,25 @@ T* ptr_or_null(const torch::Tensor& t) {
     return t.numel() ? reinterpret_cast<T*>(t.data_ptr()) : nullptr;
 }
 
+// ⚠️ Off by default and **compile-time** off, like `FP8` and for the same reason: a
+// runtime branch would make ptxas allocate registers for the union of both paths and
+// spill the one every number in perf.md was measured on. `PROF=false` is the shipped
+// kernel; `csrc/tests/README.md` records the ptxas report that proves it.
+bool g_profile = false;
+
+template <bool FP8, bool PROF>
+void launch_one(int n_boards, size_t smem, half* y, const half* weights,
+                const uint8_t* wq8, const float* sq8, const int8_t* alive,
+                const uint16_t* boards, const int16_t* control, const uint8_t* rep,
+                const half* emb, const half* tail, half* policy, half* promo,
+                float* value, int n_layers, float eps, int debug_stage) {
+    cudaFuncSetAttribute(brokefish::encoder_kernel<FP8, PROF>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    brokefish::encoder_kernel<FP8, PROF><<<n_boards, brokefish::THREADS, smem>>>(
+        y, weights, FP8 ? wq8 : nullptr, FP8 ? sq8 : nullptr, alive, boards, control,
+        rep, emb, tail, policy, promo, value, n_layers, eps, debug_stage);
+}
+
 void launch(int n_boards, half* y, const half* weights, const uint8_t* wq8,
             const float* sq8, const int8_t* alive,
             const uint16_t* boards, const int16_t* control, const uint8_t* rep,
@@ -892,19 +1026,15 @@ void launch(int n_boards, half* y, const half* weights, const uint8_t* wq8,
     // all-or-nothing: half a slab would read the fp16 weights through an fp8 layout,
     // which stays in range and produces plausible numbers.
     const bool fp8 = (wq8 != nullptr) && (sq8 != nullptr);
+#define BROKEFISH_LAUNCH(F, P)                                                       \
+    launch_one<F, P>(n_boards, smem, y, weights, wq8, sq8, alive, boards, control,    \
+                     rep, emb, tail, policy, promo, value, n_layers, eps, debug_stage)
     if (fp8) {
-        cudaFuncSetAttribute(brokefish::encoder_kernel<true>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-        brokefish::encoder_kernel<true><<<n_boards, brokefish::THREADS, smem>>>(
-            y, weights, wq8, sq8, alive, boards, control, rep, emb, tail, policy,
-            promo, value, n_layers, eps, debug_stage);
+        if (g_profile) BROKEFISH_LAUNCH(true, true); else BROKEFISH_LAUNCH(true, false);
     } else {
-        cudaFuncSetAttribute(brokefish::encoder_kernel<false>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-        brokefish::encoder_kernel<false><<<n_boards, brokefish::THREADS, smem>>>(
-            y, weights, nullptr, nullptr, alive, boards, control, rep, emb, tail,
-            policy, promo, value, n_layers, eps, debug_stage);
+        if (g_profile) BROKEFISH_LAUNCH(false, true); else BROKEFISH_LAUNCH(false, false);
     }
+#undef BROKEFISH_LAUNCH
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -1003,8 +1133,44 @@ void model_forward(torch::Tensor boards, torch::Tensor control, torch::Tensor re
            (int)n_layers, (float)eps, (int)debug_stage);
 }
 
+// ---------------------------------------------------------------------------
+// The profiling hook. Three calls, no state anywhere else: turn it on, run the
+// kernel however you already run it, read the counters back.
+//
+// The returned tensor is `[2][kNumPhases]` of **cycles**, summed over every CTA:
+// row 0 over all eight warps, row 1 over warp 0 alone. Cycles and not seconds on
+// purpose -- this card's clock falls from 2055 to 1230-1290 MHz under a sustained
+// load, so a wall-clock denominator would drift while the decomposition did not.
+void set_profile(bool on) { g_profile = on; }
+
+void reset_profile() {
+    const std::vector<unsigned long long> zero(brokefish::prof::kSlots, 0ull);
+    C10_CUDA_CHECK(cudaMemcpyToSymbol(brokefish::prof::g_prof, zero.data(),
+                                      zero.size() * sizeof(unsigned long long)));
+}
+
+torch::Tensor read_profile() {
+    auto raw = torch::empty({(int64_t)brokefish::prof::kShards,
+                             (int64_t)brokefish::prof::kRows,
+                             (int64_t)brokefish::prof::kNumPhases},
+                            torch::dtype(torch::kInt64));
+    C10_CUDA_CHECK(cudaMemcpyFromSymbol(raw.data_ptr<int64_t>(), brokefish::prof::g_prof,
+                                        brokefish::prof::kSlots
+                                        * sizeof(unsigned long long)));
+    return raw.sum(0);          // [rows, phases]; the shards exist only to spread atomics
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fp8_q_max", []() { return (double)brokefish::fp8::kQMax; });
+    m.def("set_profile", &set_profile, "compile-time-gated phase accounting on/off");
+    m.def("reset_profile", &reset_profile, "zero the cycle counters");
+    m.def("read_profile", &read_profile, "[2][kNumPhases] cycles: all warps, warp 0");
+    m.def("profile_phases", []() {
+        return std::vector<std::string>{
+            "prologue", "ln1", "qkv_gemm", "qkv_bias", "attention", "attn_store",
+            "proj_gemm", "proj_epi", "res1_ln2", "quant_a", "ff1_gemm", "ff1_epi",
+            "hid_store", "quant_h", "ff2_gemm", "ff2_epi", "res2", "epilogue"};
+    }, "phase names, in slot order");
     m.def("encoder_forward", &encoder_forward, "fused encoder forward");
     m.def("model_forward", &model_forward, "boards in, policy/promo/value out");
 }

@@ -61,6 +61,17 @@ for the kernel the residual described:
 fp16 measures 81.3 % against the 79.4 % subtraction — two points apart, the direct
 number higher, which is what `shapes_ab.cu`'s hot L2 and 48 CTAs would flatter.
 
+⚠️ **These are shares of elapsed time, not marginal costs, and the difference is not
+academic.** A CTA that stalls at a barrier or on shared memory hands its SM to the
+other resident CTA, so a phase's cycles include work that is not its own and deleting
+that work frees nothing unless the SM had idle issue slots — which it does not. Fusing
+the FFN handoff removed 11.3 % of measured phase cycles and **0.0 % of runtime**
+(`docs/journal/2026-08-05-ffn-handoff-negative.md`). The currency for a speedup on this
+kernel is **issue slots**: `encoder_kernel<true>` is 4056 SASS instructions of which
+192 are `HMMA`, and an opcode histogram from `cuobjdump -sass` is what decides whether
+a candidate the table below flags is real. Use the table to find candidates, not to
+size them.
+
 ⚠️ **The subtraction does not describe the shipping kernel.** fp8 is **72.9 %** matmul,
 because it halves the FFN's matmul time and then pays 6.8 % of quantisation the fp16
 kernel never sees. Sizing any plan for the fp8 kernel against 79.4 / 20.6 gets the

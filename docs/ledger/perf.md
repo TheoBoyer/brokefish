@@ -108,6 +108,37 @@ which. Stable to 0.1 point between 512 and 4096 CTAs. The instrumented kernel is
 to 1.06x slower than the shipped one and `PROF=false` is byte-identical SASS, verified
 with `cuobjdump`.
 
+### What fp8 costs in prior space
+
+`brokefish/nn/validate.py`, 2041 non-terminal positions including the adversarial set,
+E = 96, against the **fp32 oracle**. The shipping kernel is fp8 + per-row scale + the
+CODA fold.
+
+| | random init | trained (`t7h-fp8-002206`) |
+|---|---|---|
+| **max abs Δp** | **1.93e-2** | **1.64e-2** |
+| p95 abs Δp | 2.01e-3 | 1.22e-3 |
+| max relative | 11.5 % | 11.7 % |
+| top-1 moved | 3.39 % | 1.37 % |
+| flip risk | 9.08 % | 2.90 % |
+| max abs Δvalue | 0.059 | 0.021 |
+| cuda **fp16** vs fp32, for scale | 1.46e-3 | 2.44e-3 |
+| torch fp16 vs fp32 | 4.88e-4 | 1.46e-3 |
+| fp16 store floor | — | 9.77e-4 |
+
+Measured against the fp16 *kernel* rather than fp32 it is 1.90e-2 (random) and 1.64e-2
+(trained) — the same, because fp16's own error is an order of magnitude below fp8's, so
+the choice of reference barely moves it. That is a direct measurement and not a
+subtraction: a max over ~194k edges is a tail and two tails need not share an edge.
+
+⚠️ **The random-init net is the worse case on everything except the max.** top-1 moves
+3.39 % against 1.37 % and flip risk is 9.08 % against 2.90 %, a 3x difference, because an
+untrained policy is near-uniform so the top-two gap is tiny and any perturbation flips
+the argmax. fp8's cost is therefore front-loaded onto the first generations of a run —
+which is also where the policy carries least information. The 7 h fp8 run started from
+random init and matched its control's Elo trajectory, so it did not bite; if fp8 ever
+does cost Elo, early training is where to look.
+
 ### What binds it, measured with `ncu` rather than argued
 
 `/usr/local/cuda-12/bin/ncu` on `encoder_kernel<true>`, 512 CTAs, fp8:

@@ -93,14 +93,44 @@ with `cuobjdump`.
 | `sm__throughput` | **65.31 %** |
 | `smsp__inst_executed` | 248,705,024 = **60,720 per warp** |
 
-⚠️ **Nothing is saturated: this kernel is latency-bound at 16 warps/SM.** The 12.6 MB
-weight slab is entirely L2-resident (DRAM idle at 0.5 %, L2 hit rate 99.8 %) and L2 runs
-at half peak, so weight traffic is not the constraint either. Deleting work of any kind
-therefore returns *less than proportionally*, which is what three separate attempts
-measured: 11.3 % of elapsed cycles removed for 0.0 %, and 4.1 % of static instructions
-removed for 0.8 %. Warps per SM is `65536 / (32 x registers)`, so 128 registers fixes it
-at 16; raising it needs 85 registers for 3 CTAs/SM. The next measurement is
-`ncu --set full` for the stall-reason breakdown, not another kernel edit.
+⚠️ **DRAM is idle at 0.5 % and L2 hits 99.8 %, so weight *bandwidth* is not the
+constraint.** But `--set full` names what is. Stall cycles per issued instruction, of
+13.03 total:
+
+| stall reason | cycles | share | what it is |
+|---|---|---|---|
+| `long_scoreboard` | **3.61** | **27.7 %** | global loads that miss L1 |
+| `math_pipe_throttle` | **3.01** | **23.1 %** | the tensor pipe, busy |
+| `wait` | 2.37 | 18.2 % | fixed-latency register dependencies |
+| *selected* (issuing) | 1.00 | 7.7 % | |
+| `short_scoreboard` | 0.92 | 7.1 % | shared memory |
+| `barrier` | 0.77 | 5.9 % | `__syncthreads` |
+| `not_selected` | 0.63 | 4.8 % | |
+| `mio_throttle` | 0.41 | 3.1 % | |
+
+and the two numbers that explain them:
+
+| | |
+|---|---|
+| `l1tex__t_sector_hit_rate` | **1.70 %** — 98.3 % of global load sectors miss L1 |
+| `sm__pipe_tensor_cycles_active` | **63.81 %** of peak, and it *is* `sm__throughput` |
+| `smsp__issue_active` | 29.58 % of cycles |
+| `sm__warps_active` | 32.1 % of peak = 16 of 48 warps |
+| local (spill) sectors | 1.6 % of LSU sectors — **not** a factor |
+
+**The bottleneck is the weight stream and the tensor pipe, in that order and of
+comparable size.** Every CTA marches the whole 8.4 MB fp8 weight slab through an L1 that
+holds ~28 KB, because 2 CTAs x 50,176 B of shared memory take 100,352 of the SM's 128 KB
+unified L1+SMEM — so the shared-memory budget that buys the second CTA is *also* what
+starves L1, and 98 % of weight loads pay L2 latency. Meanwhile the mma is at 64 % of
+peak, which caps the whole kernel at about **1.57x** however perfect everything else gets.
+
+⚠️ That is a complete explanation of three failed attempts in one day: removing shared
+memory work (`short_scoreboard`, 7.1 %), arithmetic (`math_pipe_throttle` is the tensor
+pipe, not the ALU — `pipe_fma` is 10.9 % and `pipe_alu` 15.3 %) or spills (1.6 % of
+sectors) touches none of the top two. Occupancy would, and `launch__occupancy_limit`
+reports **registers and shared memory both cap at 2 blocks** — so 3 CTAs/SM needs 85
+registers *and* 34 KB of shared memory, against today's 128 and 49 KB.
 
 ⚠️ **Row 13's win is a register story, not an arithmetic one.** fp8 halves the mma
 work either way; what row 12 could not spend was registers. `__launch_bounds__(THREADS,

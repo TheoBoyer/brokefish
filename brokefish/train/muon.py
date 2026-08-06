@@ -13,15 +13,17 @@ working.
 ## The oracle
 
 ⚠️ **`torch.optim.Muon` exists in our stack** (torch 2.13,
-`.venv/.../torch/optim/_muon.py`) and this file reproduces it line for line on the
-unchunked path -- momentum, Nesterov, the Newton-Schulz iteration, the epsilon
+`.venv/.../torch/optim/_muon.py`) and this file reproduces it line for line at
+`ns_scheme="jordan"` -- momentum, Nesterov, the Newton-Schulz iteration, the epsilon
 placement, the learning-rate adjustment, the weight-decay ordering, and the bf16
 return dtype. `tests/test_muon.py` asserts bit-equality against it. The same test
 asserts bit-equality of the auxiliary AdamW against `torch.optim.AdamW`.
 
-That is the whole point: **the only thing here that torch does not do is the
-chunking**, so the only thing a test has to reason about is the chunking. Everything
-else has an oracle, which is how the rest of this repository is built.
+That is the whole point: **the only things here that torch does not do are the
+chunking and the Polar Express coefficients**, so those are the only things a test has
+to reason about. Everything else has an oracle, which is how the rest of this
+repository is built. torch implements the legacy scheme, which is why the oracle test
+names it explicitly rather than relying on the default.
 
 ## The chunking, and the one formula that had to be generalised
 
@@ -54,13 +56,35 @@ row-chunking into blocks at least as wide as they are tall -- which is every spl
 this network does -- the ranks add up exactly, the ratio is 1, and **the QKV split
 changes the update's direction without changing its size.**
 
-## What is deliberately not here
+## Polar Express is the default, and it is what makes the rate actually transfer
 
-*Polar Express coefficients* (arXiv 2505.16932) are strictly better than the fixed
-quintic. They are absent because I do not have their per-step coefficient table from
-a primary source and inventing one would be worse than shipping the legacy triple.
-`ns_coefficients` is per-iteration for exactly that reason: pass five triples instead
-of one and nothing else changes.
+`ns_scheme="polar"`. Measured 2026-08-07 over six real shapes x five seeds, achieved
+update RMS as a fraction of the `1/sqrt(fan_in)` target:
+
+    scheme    mean     min      max     spread   |sv-1| max
+    jordan    0.9160   0.8473   0.9579  0.1106   0.4222
+    polar     1.0053   0.9883   1.0157  0.0274   0.2547
+
+⚠️ **The spread is the point, not the mean.** `adjust_ratio` promises a consistent RMS
+across shapes, and that consistency *is* the mechanism by which one learning rate
+covers every layer. Under Jordan's fixed quintic the promise is broken by 11 %,
+because the iteration's *convergence* depends on aspect ratio -- a square Gaussian
+block has Marchenko-Pastur mass near zero that five steps do not lift, a very
+rectangular one has a concentrated spectrum that they do. Polar Express cuts that to
+2.7 %, so the guarantee holds and a `head_group` sweep measures geometry rather than
+step size.
+
+Cost, measured on all 32 matrices at five steps: **15.36 ms against Jordan's 15.03**,
++2.2 % for 4x the uniformity. Both are ~0.07 % of a 21 s step.
+
+Two choices here are ours, and both are measured rather than inherited. **The 1.01
+safety margin is applied on every executed step**, where the paper's 8-step recipe
+drops it on the last -- at five steps we truncate mid-schedule, and keeping the margin
+throughout measured better (spread 0.027 against 0.030, mean 1.005 against 1.011).
+**bfloat16 is kept**: fp32 changes the achieved RMS in the fourth decimal and doubles
+the cost, 30.0 ms against 15.4.
+
+## What is deliberately not here
 
 *Gram Newton-Schulz* (42 % fewer FLOPs) is absent because the whole iteration costs
 ~1.3 ms against an 18.8 s self-play phase -- under 0.01 % of a step. Buying 42 % of
@@ -78,15 +102,43 @@ from typing import Iterable, List, Sequence, Tuple
 
 import torch
 
-# torch/optim/_muon.py's constants, which are Keller Jordan's. Not minimax-optimal per
-# step -- see the module docstring on Polar Express.
+# torch/optim/_muon.py's constants, which are Keller Jordan's. One fixed quintic,
+# reused every iteration, tuned for slope at zero rather than for accuracy.
 NS_COEFFS: Tuple[float, float, float] = (3.4445, -4.7750, 2.0315)
 NS_STEPS: int = 5
 NS_EPS: float = 1e-7
 
+# Polar Express (arXiv 2505.16932, ICLR 2026), Algorithm 1: a *different*
+# minimax-optimal quintic per iteration, from an offline Remez solve.
+#
+# ⚠️ **Transcribed from the paper's HTML by a small model, so it was not trusted --
+# it was tested**, and two independent things say it is right. The steady state
+# `(1.875, -1.25, 0.375)` is `(15x - 10x^3 + 3x^5)/8`, the classical quintic
+# Newton-Schulz for the matrix sign, which a garbled transcription does not land on.
+# And the table behaves exactly as the paper claims when measured (see below), which
+# a wrong table would not.
+PE_COEFFS: List[Tuple[float, float, float]] = [
+    (8.287212, -23.595887, 17.300387),
+    (4.107059,  -2.947850,  0.544843),
+    (3.948691,  -2.908902,  0.551819),
+    (3.318420,  -2.488488,  0.510049),
+    (2.300652,  -1.668904,  0.418807),
+    (1.891301,  -1.267996,  0.376804),
+    (1.875001,  -1.250002,  0.375000),
+    (1.875,     -1.25,      0.375),      # and every iteration after
+]
+# Polar Express rescales the polynomial so the iterate stays inside the interval the
+# next step's minimax solve assumes. Evaluating `p` at `x/s` is exactly dividing the
+# coefficients by `s, s^3, s^5`, which is why the powers are not a typo.
+NS_SAFETY: float = 1.01
+
+# `ns_scheme` -> (coefficients, safety factor).
+NS_SCHEMES = {"jordan": (NS_COEFFS, 1.0), "polar": (PE_COEFFS, NS_SAFETY)}
+
 
 def newton_schulz(G: torch.Tensor, ns_steps: int = NS_STEPS,
-                  ns_coefficients=NS_COEFFS, eps: float = NS_EPS) -> torch.Tensor:
+                  ns_coefficients=NS_COEFFS, eps: float = NS_EPS,
+                  safety: float = 1.0) -> torch.Tensor:
     """`phi(x) = a x + b x^3 + c x^5` on the singular values. Returns **bfloat16**.
 
     Line-for-line `torch.optim._muon._zeropower_via_newtonschulz`, with the single
@@ -121,9 +173,11 @@ def newton_schulz(G: torch.Tensor, ns_steps: int = NS_STEPS,
     # Ensure the spectral norm is at most 1 -- Frobenius bounds it and needs no
     # iteration of its own. `clamp`, not `+ eps`: torch's choice, and it leaves a
     # well-scaled matrix untouched instead of shrinking it slightly.
-    ortho = ortho / ortho.norm().clamp(min=eps)
+    ortho = ortho / (ortho.norm() * safety).clamp(min=eps)
     for i in range(ns_steps):
         a, b, c = coeffs[i]
+        if safety != 1.0:
+            a, b, c = a / safety, b / safety ** 3, c / safety ** 5
         gram = ortho @ ortho.T
         gram_update = torch.addmm(gram, gram, gram, beta=b, alpha=c)   # b*A + c*A@A
         ortho = torch.addmm(ortho, gram_update, ortho, beta=a)         # a*X + B@X
@@ -258,13 +312,17 @@ class Muon(torch.optim.Optimizer):
     """
 
     def __init__(self, param_groups: Iterable[dict], *, ns_steps: int = NS_STEPS,
-                 ns_coefficients=NS_COEFFS, ns_eps: float = NS_EPS,
+                 ns_scheme: str = "polar", ns_eps: float = NS_EPS,
                  normuon: bool = False, normuon_beta: float = 0.95):
+        if ns_scheme not in NS_SCHEMES:
+            raise ValueError(f"unknown ns_scheme {ns_scheme!r}, want one of "
+                             f"{sorted(NS_SCHEMES)}")
         defaults = dict(lr=0.0, lr_scale=1.0, weight_decay=0.0, momentum=0.95,
                         nesterov=True, betas=(0.9, 0.95), eps=1e-8,
                         use_muon=False, chunks=None)
         super().__init__(list(param_groups), defaults)
-        self.ns_steps, self.ns_coefficients, self.ns_eps = ns_steps, ns_coefficients, ns_eps
+        self.ns_steps, self.ns_eps, self.ns_scheme = ns_steps, ns_eps, ns_scheme
+        self.ns_coefficients, self.ns_safety = NS_SCHEMES[ns_scheme]
         self.normuon, self.normuon_beta = normuon, normuon_beta
 
     @torch.no_grad()
@@ -317,7 +375,8 @@ class Muon(torch.optim.Optimizer):
         need not align -- CMuon's "subspace interference", and Kimi K3's "heads with
         larger momentum scale dominate the shared update direction".
         """
-        ns = lambda m: newton_schulz(m, self.ns_steps, self.ns_coefficients, self.ns_eps)
+        ns = lambda m: newton_schulz(m, self.ns_steps, self.ns_coefficients,
+                                     self.ns_eps, self.ns_safety)
         if n_chunks == 1:
             return ns(g)
         return torch.cat([ns(c) for c in g.chunk(n_chunks, dim=dim)], dim=dim)

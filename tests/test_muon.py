@@ -21,7 +21,8 @@ import pytest
 import torch
 
 from brokefish.train.muon import (Muon, adjust_ratio, chunk_spec, is_muon_param,
-                                  muon_param_groups, newton_schulz, NS_COEFFS, NS_STEPS)
+                                  muon_param_groups, newton_schulz, NS_COEFFS,
+                                  NS_SAFETY, NS_STEPS, PE_COEFFS)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -55,8 +56,12 @@ def test_unchunked_muon_is_bit_exact_against_torch(shape):
     """
     ours, theirs = _pair(shape)
     lr, wd, mom = 0.02, 0.01, 0.95
+    # ⚠️ `ns_scheme="jordan"`. torch implements the fixed quintic; our default is
+    # Polar Express, which is deliberately *not* torch's algorithm. Naming it here
+    # keeps the oracle honest instead of silently drifting from it.
     mine = Muon([{"params": [ours], "use_muon": True, "chunks": [(0, 1)], "lr": lr,
-                  "weight_decay": wd, "momentum": mom, "nesterov": True}])
+                  "weight_decay": wd, "momentum": mom, "nesterov": True}],
+                ns_scheme="jordan")
     ref = torch.optim.Muon([theirs], lr=lr, weight_decay=wd, momentum=mom,
                            nesterov=True)
     torch.manual_seed(7)
@@ -156,7 +161,8 @@ def test_qkv_chunking_is_exactly_three_independent_orthogonalisations():
     """Not "close to" -- the concatenation must equal the three separate results."""
     torch.manual_seed(0)
     g = torch.randn(768, 256, device=DEVICE)
-    opt = Muon([{"params": [torch.zeros(1, device=DEVICE)], "use_muon": False}])
+    opt = Muon([{"params": [torch.zeros(1, device=DEVICE)], "use_muon": False}],
+               ns_scheme="jordan")
     got = opt._orthogonalise(g, dim=0, n_chunks=3)
     want = torch.cat([newton_schulz(g[i * 256:(i + 1) * 256]) for i in range(3)], dim=0)
     assert torch.equal(got, want)
@@ -237,33 +243,68 @@ def test_adjust_ratio_puts_the_update_rms_at_one_over_sqrt_fanin(dim, n_chunks, 
         1.0 / math.sqrt(shape[1]), rel=1e-4)
 
 
-@pytest.mark.parametrize("dim,n_chunks,shape", CHUNKINGS)
-def test_newton_schulz_leaves_a_known_aspect_ratio_dependent_shortfall(dim, n_chunks, shape):
-    """⚠️ Measured, and recorded because it is a real ~10 % effect that is NOT a bug here.
+def _achieved_rms(scheme, dim, n_chunks, shape, seed):
+    torch.manual_seed(seed)
+    g = torch.randn(*shape, device=DEVICE)
+    opt = Muon([{"params": [torch.zeros(1, device=DEVICE)], "use_muon": False}],
+               ns_scheme=scheme)
+    u = opt._orthogonalise(g, dim, n_chunks).float()
+    u = u * adjust_ratio(shape[0], shape[1], dim, n_chunks)
+    return u.square().mean().sqrt().item() * math.sqrt(shape[1])
 
-    With the real iteration in the loop the achieved RMS is `0.85 - 0.96` of target,
-    and where it lands depends on the *block's* aspect ratio, because a square Gaussian
-    block has Marchenko-Pastur mass near zero that five steps do not lift while a very
-    rectangular one has a concentrated spectrum that they do.
 
-    Measured 2026-08-07, `x sqrt(fan_in)`: (768,256) unchunked 0.956, split 3-ways
-    0.904, per-head 24-ways 0.864; (256,256) unchunked 0.904, per-head 8-ways 0.861;
-    (1024,256) 0.957; (256,1024) 0.956; (64,256) 0.852.
+def test_polar_express_is_why_the_learning_rate_actually_transfers():
+    """⚠️ The test that says which Newton-Schulz scheme belongs in a run.
 
-    So **the QKV split costs about 5 % of effective step size** on `in_proj` and
-    per-head another 4 %. That is inherent to Newton-Schulz and is present in every
-    implementation that splits QKV, torch's and Jordan's included -- it is not
-    something `adjust_ratio` can or should correct, since correcting it would mean
-    rescaling by a quantity that depends on the gradient's spectrum. It is recorded
-    so that a `head_group` sweep is read with it in mind.
+    `adjust_ratio` promises a consistent update RMS across shapes, and that consistency
+    *is* the mechanism by which one learning rate covers every layer. The arithmetic is
+    exact (test above), so whether the promise is kept depends entirely on how well the
+    iteration converges -- and Jordan's fixed quintic converges differently depending on
+    the block's aspect ratio. A square Gaussian block has Marchenko-Pastur mass near
+    zero that five steps do not lift; a very rectangular one has a concentrated spectrum
+    that they do.
+
+    Measured 2026-08-07 over the shapes and chunkings this network actually uses:
+    Jordan's spread is **11 %**, Polar Express's is **2.7 %**. So the legacy quintic
+    breaks learning-rate transfer across our own layers by an order more than the
+    per-shape corrections are worth, and Polar Express repairs it, for +2.2 % on an
+    iteration that is 0.07 % of a step.
+    """
+    got = {}
+    for scheme in ("jordan", "polar"):
+        vals = [_achieved_rms(scheme, d, n, s, seed)
+                for d, n, s in CHUNKINGS for seed in range(3)]
+        got[scheme] = (min(vals), max(vals), max(vals) - min(vals))
+
+    assert got["jordan"][2] > 0.08, got            # the legacy scheme really is spread
+    assert got["polar"][2] < 0.04, got             # and Polar Express really is tight
+    assert got["polar"][2] < got["jordan"][2] / 2, got
+    # Polar also lands *on* the target rather than under it.
+    assert 0.97 < got["polar"][0] and got["polar"][1] < 1.03, got
+    assert got["jordan"][0] < 0.92, got
+
+
+@pytest.mark.parametrize("shape", [(256, 256), (768, 256), (256, 32)])
+def test_polar_express_flattens_the_spectrum_better_than_the_fixed_quintic(shape):
+    """The claim the coefficient table makes, checked rather than believed.
+
+    The table was transcribed from the paper's HTML by a small model. It is trusted
+    only because its steady state is the closed form `(15x - 10x^3 + 3x^5)/8` and
+    because it behaves here exactly as the paper says it should -- a garbled table
+    would fail this.
     """
     torch.manual_seed(0)
     g = torch.randn(*shape, device=DEVICE)
-    opt = Muon([{"params": [torch.zeros(1, device=DEVICE)], "use_muon": False}])
-    u = opt._orthogonalise(g, dim, n_chunks).float()
-    u = u * adjust_ratio(shape[0], shape[1], dim, n_chunks)
-    got = u.square().mean().sqrt().item() * math.sqrt(shape[1])
-    assert 0.84 < got < 0.97, got
+    j = torch.linalg.svdvals(newton_schulz(g, 5, NS_COEFFS, safety=1.0).float())
+    p = torch.linalg.svdvals(newton_schulz(g, 5, PE_COEFFS, safety=NS_SAFETY).float())
+    assert (p.max() / p.min()) < (j.max() / j.min())
+    assert p.min() > j.min()
+
+
+def test_polar_express_steady_state_is_the_matrix_sign_closed_form():
+    """`(15x - 10x^3 + 3x^5)/8`. Cheap, and it is what makes the table credible."""
+    assert PE_COEFFS[-1] == (15 / 8, -10 / 8, 3 / 8)
+    assert PE_COEFFS[-2] == pytest.approx(PE_COEFFS[-1], abs=1e-5)
 
 
 # -- the wiring -------------------------------------------------------------- #

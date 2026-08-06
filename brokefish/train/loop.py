@@ -175,6 +175,12 @@ class TrainConfig:
     # constant. 8 for the first run: one thing at a time.
     muon_head_group: int = 8
     muon_ns_steps: int = 5
+    # "polar" = Polar Express's per-iteration minimax coefficients, "jordan" = the
+    # fixed quintic torch and the reference implementation use. Polar is the default
+    # because it is what makes the learning rate actually transfer across our layer
+    # shapes: measured, the achieved update RMS spread is 2.7 % against Jordan's
+    # 11.1 %, for +2.2 % on an iteration that is 0.07 % of a step.
+    muon_ns_scheme: str = "polar"
     normuon: bool = False                      # see `muon.Muon` -- reconstructed, off
     lr_schedule: Tuple[Tuple[float, float], ...] = LR_SCHEDULE
     total_steps: int = 159_000
@@ -334,7 +340,8 @@ def build_optimizer(net: torch.nn.Module, cfg: TrainConfig) -> torch.optim.Optim
                 net, lr=cfg.lr_schedule[0][1], aux_lr=cfg.aux_lr, wd=cfg.adam_wd,
                 qkv_split=cfg.muon_qkv_split, head_group=cfg.muon_head_group,
                 betas=cfg.betas, momentum=cfg.muon_momentum),
-            ns_steps=cfg.muon_ns_steps, normuon=cfg.normuon)
+            ns_steps=cfg.muon_ns_steps, ns_scheme=cfg.muon_ns_scheme,
+            normuon=cfg.normuon)
     if cfg.optimizer != "adamw":
         raise ValueError(
             f"unknown optimizer {cfg.optimizer!r}, want 'sgd', 'adamw' or 'muon'")
@@ -937,6 +944,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="muon only: orthogonalise the fused (768,256) QKV as one "
                         "tensor. Jordan's post reports this is worse; it is here as "
                         "an ablation, not as an option")
+    p.add_argument("--ns-scheme", default=TrainConfig.muon_ns_scheme,
+                   choices=("polar", "jordan"),
+                   help="muon only: Newton-Schulz coefficients. polar = Polar Express "
+                        "per-iteration minimax (default), jordan = the fixed quintic "
+                        "torch.optim.Muon uses")
     p.add_argument("--normuon", action="store_true",
                    help="muon only: per-neuron second moment. ⚠️ reconstructed from a "
                         "search summary, not the paper -- see train/muon.py")
@@ -1021,6 +1033,7 @@ def config_from_args(args) -> TrainConfig:
         optimizer=args.optimizer, adam_wd=args.adam_wd, grad_clip=args.grad_clip,
         aux_lr=args.aux_lr, muon_head_group=args.head_group,
         muon_qkv_split=not args.no_qkv_split, normuon=args.normuon,
+        muon_ns_scheme=args.ns_scheme,
         betas=tuple(args.betas), warmup_steps=args.warmup,
         decay=args.decay, lr_min=args.lr_min,
         tau_plies=args.tau_plies, eps=args.eps, alpha=args.alpha,
@@ -1076,7 +1089,7 @@ def main() -> None:
             f"  muon on {n_muon:,} params ({100 * n_muon / total:.1f} %), aux adamw on "
             f"{total - n_muon:,} at lr x {cfg.aux_lr / cfg.lr_schedule[0][1]:.4g}; "
             f"qkv_split={cfg.muon_qkv_split} head_group={cfg.muon_head_group} "
-            f"ns_steps={cfg.muon_ns_steps} normuon={cfg.normuon}")
+            f"ns_steps={cfg.muon_ns_steps}({cfg.muon_ns_scheme}) normuon={cfg.normuon}")
     logger.note(f"  lr at step  {shape}")
     try:
         trainer.run_loop(generations=args.generations, max_steps=args.max_steps,

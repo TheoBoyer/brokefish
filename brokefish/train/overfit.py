@@ -119,6 +119,8 @@ def main() -> None:
     p.add_argument("--head-group", type=int, default=TrainConfig.muon_head_group,
                    choices=(1, 2, 4, 8), help="muon only, see loop.py")
     p.add_argument("--no-qkv-split", action="store_true", help="muon only, see loop.py")
+    p.add_argument("--ns-scheme", default=TrainConfig.muon_ns_scheme,
+                   choices=("polar", "jordan"), help="muon only, see loop.py")
     p.add_argument("--grad-clip", type=float, default=0.0)
     p.add_argument("--adam-wd", type=float, default=TrainConfig.adam_wd)
     p.add_argument("--impl", default="cuda", choices=("cuda", "torch"),
@@ -138,7 +140,7 @@ def main() -> None:
         impl=args.impl, encoder=args.encoder,
         optimizer=args.optimizer, aux_lr=args.aux_lr, adam_wd=args.adam_wd,
         grad_clip=args.grad_clip, muon_head_group=args.head_group,
-        muon_qkv_split=not args.no_qkv_split,
+        muon_qkv_split=not args.no_qkv_split, muon_ns_scheme=args.ns_scheme,
         # The label check is the point of running this at all (§12 check 3): a
         # permuted target would memorise the batch just as happily.
         strict_labels=True, collect_search_stats=False, deterministic=True)

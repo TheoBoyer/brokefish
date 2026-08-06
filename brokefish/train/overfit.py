@@ -44,7 +44,7 @@ from dataclasses import asdict
 import torch
 
 from .log import Logger
-from .loop import Trainer, TrainConfig
+from .loop import build_optimizer, Trainer, TrainConfig
 
 
 def harvest(trainer: Trainer, positions: int, max_moves: int, log) -> "object":
@@ -112,6 +112,15 @@ def main() -> None:
     p.add_argument("--max-plies", type=int, default=200)
     p.add_argument("--max-moves", type=int, default=400)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--optimizer", default="sgd", choices=("sgd", "adamw", "muon"),
+                   help="§12 check 1 exercises whichever one the run will use")
+    p.add_argument("--aux-lr", type=float, default=TrainConfig.aux_lr,
+                   help="muon only, see loop.py")
+    p.add_argument("--head-group", type=int, default=TrainConfig.muon_head_group,
+                   choices=(1, 2, 4, 8), help="muon only, see loop.py")
+    p.add_argument("--no-qkv-split", action="store_true", help="muon only, see loop.py")
+    p.add_argument("--grad-clip", type=float, default=0.0)
+    p.add_argument("--adam-wd", type=float, default=TrainConfig.adam_wd)
     p.add_argument("--impl", default="cuda", choices=("cuda", "torch"),
                    help="the engine and the search")
     p.add_argument("--encoder", default="cuda", choices=("cuda", "triton"),
@@ -127,6 +136,9 @@ def main() -> None:
         buffer_in_memory=True, window_games=100_000, mean_plies=args.max_plies,
         total_steps=1, lr_schedule=((0.0, args.lr),), seed=args.seed,
         impl=args.impl, encoder=args.encoder,
+        optimizer=args.optimizer, aux_lr=args.aux_lr, adam_wd=args.adam_wd,
+        grad_clip=args.grad_clip, muon_head_group=args.head_group,
+        muon_qkv_split=not args.no_qkv_split,
         # The label check is the point of running this at all (§12 check 3): a
         # permuted target would memorise the batch just as happily.
         strict_labels=True, collect_search_stats=False, deterministic=True)
@@ -151,14 +163,19 @@ def main() -> None:
         f"mean policy_len {float(batch.policy_len.float().mean()):.1f}")
 
     init = copy.deepcopy(trainer.net.state_dict())
-    opt_init = copy.deepcopy(trainer.opt.state_dict())
     rates = [float(x) for x in args.sweep.split(",")] if args.sweep else [args.lr]
     results = []
     for lr in rates:
         # Every rate starts from the same initialisation and the same batch, so the
         # comparison is of the rate and of nothing else.
         trainer.net.load_state_dict(init)
-        trainer.opt.load_state_dict(opt_init)
+        # ⚠️ Rebuild rather than restore a saved fresh state dict. The two were
+        # equivalent for SGD and AdamW -- `opt_init` was captured before any step --
+        # but Muon derives its auxiliary group's `lr_scale` from the schedule's peak
+        # at construction, so a swept rate has to be visible to the constructor or
+        # every arm of the sweep would run the auxiliary group at the first arm's rate.
+        trainer.cfg.lr_schedule = ((0.0, lr),)
+        trainer.opt = build_optimizer(trainer.net, trainer.cfg)
         log(f"\n  lr = {lr}")
         results.append(overfit(trainer, batch, args.steps, lr, log, logger,
                                tag=f"lr={lr} " if len(rates) > 1 else ""))

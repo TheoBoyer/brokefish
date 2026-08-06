@@ -530,6 +530,94 @@ sparser than the `n = 800` ones a real run produces. The verdict on `lr` is prov
 until check 1 is run at §12's own size, and the row in [the fidelity audit](../journal/2026-07-30-fidelity.md)
 §4.2(a) stays open until it is.
 
+### 7.4 Ablation 2 — Muon, and the granularity that comes with it
+
+`--optimizer muon`, `brokefish/train/muon.py`. Off by default: the SGD baseline is the
+thing being ablated against, so it does not move.
+
+Muon replaces SGD-momentum's update with the nearest semi-orthogonal matrix to the
+momentum buffer, computed by a quintic Newton–Schulz iteration rather than an SVD. It
+applies to hidden matmul weights only. Here that is **6,291,456 of 6,383,360
+parameters — 98.6 %** — because this network has no tied embedding and its three
+readout heads are 17,664 parameters between them. The remaining 91,904 (five embedding
+tables, three heads, every bias and LayerNorm gain) run AdamW.
+
+| | value | authority |
+|---|---|---|
+| momentum | 0.95, Nesterov | `torch.optim.Muon`; Jordan's post reports Nesterov better in every case tested |
+| Newton–Schulz | 5 steps, `(3.4445, −4.7750, 2.0315)` | `torch.optim.Muon` |
+| lr adjustment | `√max(1, d_out/d_in)`, generalised to chunks | `torch.optim._muon._adjust_lr` |
+| aux group | AdamW, `betas` and `eps` as §7.1's ablation 1 | Jordan's rule for embeddings/heads |
+| chunking | Q, K, V separately; head groups optional | Jordan's post; CMuon; Kimi K3 |
+
+**`torch.optim.Muon` is the oracle and it is in our stack.** `tests/test_muon.py`
+asserts bit-equality against it on the unchunked path, and against `torch.optim.AdamW`
+(`foreach=False`) for the auxiliary group. Everything except the chunking therefore has
+an external reference, which is the only reason a hand-written optimiser belongs in
+this repository at all.
+
+⚠️ **The learning rate does not transfer from ablation 1 and must be swept.** Muon's
+update has RMS `1/√fan_in` = 1/16 here; AdamW's is `≈ lr`. So the RMS-matched
+equivalent of the control's `1e-3` is `≈ 0.016`, which is where `torch.optim.Muon`'s
+own 0.02 default sits. `aux_lr` is carried as a *ratio* to `lr` so one schedule — one
+warmup, one cosine — drives both groups.
+
+⚠️ **Q, K and V are orthogonalised separately, and this is not an option.** Jordan's
+post states it plainly: *"Muon works better for optimizing transformers if it is
+applied to their Q, K, V parameters separately, rather than together."* CMuon
+(arXiv 2608.02502) names the mechanism — one fused tensor gets one shared
+preconditioner `(Σ_j G_jᵀG_j)^{-1/2}` across blocks whose principal directions need not
+align. `nn.MultiheadAttention` hands us the fused `(768, 256)` form by default, so the
+*default* is the wrong algorithm. `--no-qkv-split` exists to measure that, not to use it.
+
+⚠️ **`in_proj` and `out_proj` chunk on opposite axes.** `in_proj_weight` is `[Q; K; V]`
+on **rows**, and within each 256-row block head `h` owns rows `32h .. 32h+32`.
+`out_proj.weight` carries its head structure on the **input** dimension: columns
+`32h .. 32h+32` are head `h`. Getting this backwards produces an optimiser that runs,
+converges, and is a different algorithm; `test_out_proj_chunks_columns_not_rows` is the
+check that bites.
+
+⚠️ **The lr adjustment had to be re-derived for chunks, and the obvious version is
+wrong.** torch's factor exists to hold the update's RMS at `1/√fan_in` whatever the
+aspect ratio — that consistency *is* what makes the rate transfer. A concatenation of
+orthogonalised blocks has Frobenius norm `√Σ_i min(r_i, c_i)`, not `√min(R, C)`, so the
+correct factor is
+
+    ratio = √( R / Σ_i min(r_i, c_i) )
+
+which reduces to `√max(1, A/B)` exactly at one chunk. Applying torch's formula *per
+chunk* instead inflates `out_proj` at `head_group = 1` by `√8`, which would make a
+granularity sweep secretly a learning-rate sweep.
+
+⚠️ **`grad_clip` means much less under Muon.** A global clip rescales every gradient by
+one factor and Newton–Schulz divides each matrix by its own norm, so the clip is very
+nearly invisible to 98.6 % of the parameters. "The clip never fires" stops being
+evidence of stability; watch the update-to-weight norm ratio instead.
+
+**A known ~10 % effect that is not a bug.** Newton–Schulz's *convergence* depends on the
+block's aspect ratio — a square Gaussian block has Marchenko–Pastur mass near zero that
+five steps do not lift, a very rectangular one has a concentrated spectrum that they do.
+Measured 2026-08-07 as achieved RMS × `√fan_in`: `(768,256)` unchunked 0.956, QKV-split
+0.904, per-head 0.864; `(256,256)` unchunked 0.904, per-head 0.861. **So the QKV split
+costs ~5 % of effective step size and per-head another ~4 %.** It is inherent to the
+iteration, present in every implementation that splits QKV, and not something the lr
+adjustment can correct without rescaling by a gradient-dependent quantity.
+
+**`head_group` is a hyperparameter, not a constant.** 8 = no head splitting, 1 =
+per-head (Kimi K3, GLM-5 "Muon Split"). arXiv 2605.08933 turns the choice into a
+gain-versus-cost inequality and finds the optimum *moves during training* — per-head
+early, coarser late — with both extremes losing somewhere. It is one integer, so it is
+a sweep, and the ladder is `{1, 2, 4, 8}`.
+
+**Not implemented, deliberately:** Polar Express coefficients (no primary-source table
+in hand; `ns_coefficients` is per-iteration so they drop in), Gram Newton–Schulz (42 %
+of an iteration that costs under 0.01 % of a step), momentum warmup. NorMuon is
+implemented, off, and flagged in its docstring as reconstructed from a search summary
+rather than the paper.
+
+The survey behind all of this is
+[`journal/2026-08-05-muon-survey.md`](../journal/2026-08-05-muon-survey.md).
+
 ---
 
 ## 8. The loop

@@ -149,6 +149,33 @@ class TrainConfig:
     # a restored intention, not a result, and it is a legitimate ablation.
     adam_wd: float = 0.01                      # decoupled, so unrelated to `l2` -- see below
     grad_clip: float = 0.0                     # 0 disables; AGZ specifies no clipping
+
+    # -- ablation 2, `train/muon.py`. Inert unless `optimizer == "muon"`.
+    #
+    # `aux_lr` is the rate for the 91,904 parameters Muon does not touch -- the five
+    # embedding tables, the three readout heads, every bias and LayerNorm gain. It is
+    # carried as a *ratio* to `lr` inside the optimiser, so one schedule drives both
+    # groups and warmup applies to each. 1e-3 is `t7h-fp8`'s tuned AdamW rate, so the
+    # residue is the same optimiser at the same rate in both arms of the ablation.
+    #
+    # ⚠️ `lr` itself does **not** transfer from the AdamW arm and must be swept. Muon's
+    # update has RMS `1/sqrt(fan_in)` = 1/16 here, against AdamW's ~`lr`, so the naive
+    # RMS-matched equivalent of `1e-3` is ~`0.016` -- which is where Jordan's 0.02
+    # default sits, and where the sweep should be centred.
+    aux_lr: float = 1e-3
+    muon_momentum: float = 0.95
+    # Q, K and V orthogonalised separately rather than as one (768, 256) tensor.
+    # ⚠️ Not an ablation arm: Jordan's post reports the split is better, and CMuon
+    # names why (one shared preconditioner across misaligned blocks). The fused form
+    # is the bug, so this defaults on.
+    muon_qkv_split: bool = True
+    # 8 = one group holding all eight heads, i.e. no head splitting. 1 = per-head,
+    # Kimi K3's and GLM-5's "Muon Split". The ladder is {1, 2, 4, 8} and arXiv
+    # 2605.08933 shows the optimum moves during training -- a hyperparameter, not a
+    # constant. 8 for the first run: one thing at a time.
+    muon_head_group: int = 8
+    muon_ns_steps: int = 5
+    normuon: bool = False                      # see `muon.Muon` -- reconstructed, off
     lr_schedule: Tuple[Tuple[float, float], ...] = LR_SCHEDULE
     total_steps: int = 159_000
     # Linear warmup, in optimiser steps. 0 is off and is the default, because AGZ
@@ -293,8 +320,24 @@ def build_optimizer(net: torch.nn.Module, cfg: TrainConfig) -> torch.optim.Optim
         return torch.optim.SGD(
             net.parameters(), lr=cfg.lr_at(0), momentum=cfg.momentum,
             weight_decay=weight_decay_for(cfg.l2))
+    if cfg.optimizer == "muon":
+        # Ablation 2. Three groups, not two: Muon takes the eight layers' hidden
+        # matmuls (98.6 % of the network), and the embeddings, the readout heads and
+        # every scalar stay on AdamW -- Jordan's rule, and it matters here because
+        # `value.weight` is (1, 256), whose nearest semi-orthogonal matrix is its own
+        # direction with the magnitude thrown away.
+        from .muon import Muon, muon_param_groups
+        return Muon(
+            muon_param_groups(
+                # The schedule's *peak*, not `lr_at(0)`: `lr_scale` is a ratio and
+                # `lr_at(0)` is the warmup's first step, `peak / warmup_steps`.
+                net, lr=cfg.lr_schedule[0][1], aux_lr=cfg.aux_lr, wd=cfg.adam_wd,
+                qkv_split=cfg.muon_qkv_split, head_group=cfg.muon_head_group,
+                betas=cfg.betas, momentum=cfg.muon_momentum),
+            ns_steps=cfg.muon_ns_steps, normuon=cfg.normuon)
     if cfg.optimizer != "adamw":
-        raise ValueError(f"unknown optimizer {cfg.optimizer!r}, want 'sgd' or 'adamw'")
+        raise ValueError(
+            f"unknown optimizer {cfg.optimizer!r}, want 'sgd', 'adamw' or 'muon'")
 
     named = [(n, p) for n, p in net.named_parameters() if p.requires_grad]
     decay = [p for _, p in named if p.ndim >= 2]
@@ -503,8 +546,12 @@ class Trainer:
         """
         cfg = self.cfg
         lr = cfg.lr_at(self.step)
+        # `lr_scale` is 1.0 for every group SGD and AdamW build, so this is the old
+        # line for them. Muon uses it to hold its auxiliary AdamW group at a different
+        # rate from the orthogonalised group while one schedule -- one warmup, one
+        # cosine -- still drives both.
         for group in self.opt.param_groups:
-            group["lr"] = lr
+            group["lr"] = lr * group.get("lr_scale", 1.0)
 
         if batch is None:
             batch = self.buffer.sample(cfg.batch, device=self.device)
@@ -879,7 +926,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--total-steps", type=int, default=TrainConfig.total_steps)
     p.add_argument("--lr", type=float, default=None,
                    help="override the whole §7.3 schedule with one constant rate")
-    p.add_argument("--optimizer", default=TrainConfig.optimizer, choices=("sgd", "adamw"),
+    p.add_argument("--aux-lr", type=float, default=TrainConfig.aux_lr,
+                   help="muon only: the rate for the 91,904 parameters Muon does not "
+                        "touch. Held as a ratio to --lr, so the schedule drives both")
+    p.add_argument("--head-group", type=int, default=TrainConfig.muon_head_group,
+                   choices=(1, 2, 4, 8),
+                   help="muon only: heads per orthogonalisation block. 8 = no head "
+                        "split, 1 = per-head (Kimi K3 / GLM-5 'Muon Split')")
+    p.add_argument("--no-qkv-split", action="store_true",
+                   help="muon only: orthogonalise the fused (768,256) QKV as one "
+                        "tensor. Jordan's post reports this is worse; it is here as "
+                        "an ablation, not as an option")
+    p.add_argument("--normuon", action="store_true",
+                   help="muon only: per-neuron second moment. ⚠️ reconstructed from a "
+                        "search summary, not the paper -- see train/muon.py")
+    p.add_argument("--optimizer", default=TrainConfig.optimizer,
+                   choices=("sgd", "adamw", "muon"),
                    help="sgd is AGZ's; adamw is ablation 1")
     p.add_argument("--adam-wd", type=float, default=TrainConfig.adam_wd,
                    help="AdamW's decoupled decay -- NOT --l2, see build_optimizer")
@@ -957,6 +1019,8 @@ def config_from_args(args) -> TrainConfig:
         puzzle_limit=args.puzzle_limit,
         buffer_snapshot_every=args.buffer_snapshot_every, audit_every=args.audit_every,
         optimizer=args.optimizer, adam_wd=args.adam_wd, grad_clip=args.grad_clip,
+        aux_lr=args.aux_lr, muon_head_group=args.head_group,
+        muon_qkv_split=not args.no_qkv_split, normuon=args.normuon,
         betas=tuple(args.betas), warmup_steps=args.warmup,
         decay=args.decay, lr_min=args.lr_min,
         tau_plies=args.tau_plies, eps=args.eps, alpha=args.alpha,
@@ -1004,6 +1068,15 @@ def main() -> None:
     shape = "  ".join(f"{s}:{cfg.lr_at(s):.2e}" for s in sorted(set(marks)))
     logger.note(f"  {cfg.optimizer}, {cfg.decay} decay over {cfg.total_steps} steps, "
                 f"warmup {cfg.warmup_steps}")
+    if cfg.optimizer == "muon":
+        n_muon = sum(p.numel() for g in trainer.opt.param_groups if g.get("use_muon")
+                     for p in g["params"])
+        total = sum(p.numel() for p in trainer.net.parameters())
+        logger.note(
+            f"  muon on {n_muon:,} params ({100 * n_muon / total:.1f} %), aux adamw on "
+            f"{total - n_muon:,} at lr x {cfg.aux_lr / cfg.lr_schedule[0][1]:.4g}; "
+            f"qkv_split={cfg.muon_qkv_split} head_group={cfg.muon_head_group} "
+            f"ns_steps={cfg.muon_ns_steps} normuon={cfg.normuon}")
     logger.note(f"  lr at step  {shape}")
     try:
         trainer.run_loop(generations=args.generations, max_steps=args.max_steps,

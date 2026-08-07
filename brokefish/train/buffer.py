@@ -21,14 +21,28 @@ asserted. The cost is host RAM for the games in flight: 4096 games at the 80-ply
 is 110 MB, and the 512-ply cap of §5.4 bounds it at 700 MB.
 
 **The value target is the game outcome, flipped by parity** (§4). ``MoveRecord.result``
-is from the *new* mover's point of view after the move was played, and the record's own
-position has the *previous* mover to move, so with ``L`` records in a finished game::
+is from the *new* mover's point of view after the move was played, so with ``L``
+consecutive records in a finished game the rule reads::
 
     z(i) = r  if (L - i) is even, else -r
 
 which is the same parity argument as ``mcts.md`` §6.5's backup flip and fails the same
-way if inverted. ⚠️ Note it depends only on distance from the *end*, which is what
-makes a game whose earlier records were lost to a resume still get correct values.
+way if inverted.
+
+⚠️ **That form assumes the recorded plies are consecutive, and under playout cap
+randomisation they are not** (`training.md` §11, KataGo §3.1: only full-search turns are
+recorded). So the rule is expressed on the quantity it was always really about — *which
+side is to move* — rather than on a position in the pending list::
+
+    z = -r * sign(control_record) * sign(control_terminal)
+
+``control_terminal`` is the control word of the position the game-ending move was played
+from, which :meth:`ReplayBuffer.append` reads off the record of that very move. The two
+forms agree exactly on a dense game (the last record *is* the terminal position, so its
+own sign gives ``-r`` and every earlier one alternates), and only the second one survives
+a game whose recorded plies are a sparse subset. It is also strictly more robust in the
+case that motivated the old wording: a game whose earlier records were lost to a resume
+still gets correct values, because nothing here counts anything.
 """
 
 from __future__ import annotations
@@ -159,18 +173,29 @@ class ReplayBuffer:
         # value parity is a function of how many records it has.
         return sum(int(a.shape[0]) for p in self._pending for a in p)
 
-    def append(self, record, done=None, result=None) -> int:
+    def append(self, record, done=None, result=None, store: bool = True) -> int:
         """One move-step: `B` rows in, and every game that just ended closed out.
 
         ``done`` and ``result`` override the record's own, which is how §5.4's
         game-length cap turns an over-long game into a completed drawn one without
         the search knowing about it. Returns the number of games closed.
+
+        ⚠️ **``store = False`` still closes games** (`training.md` §11). Playout cap
+        randomisation keeps the *positions* of a cheap turn out of the buffer, and the
+        tempting way to write that is to not call this at all on a cheap move — which
+        loses the closure of every game that *ends* on one, i.e. of most games at
+        ``p = 0.3``. Those games' earlier records would then sit in ``_pending`` while
+        the search restarts the slot, and the next game to finish there would flush them
+        under *its* result: silent, unlogged, and label noise on a third of the buffer.
+        So the two jobs this method does are separated by the flag rather than by the
+        call, and the closure path is unconditional.
         """
-        rows = self._rows_from(record)
-        b = rows.shape[0]
+        b = int(record.board.shape[0])
         self.open_games(b)
-        for i in range(b):
-            self._pending[i].append(rows[i:i + 1])
+        if store:
+            rows = self._rows_from(record)
+            for i in range(b):
+                self._pending[i].append(rows[i:i + 1])
 
         done = record.done if done is None else done
         result = record.result if result is None else result
@@ -178,8 +203,11 @@ class ReplayBuffer:
         if not finished:
             return 0
         res = result.to(torch.int32).cpu().numpy()
+        # The control word of the position the game-ending move was played from. §4's
+        # value rule needs the side to move *there*, not the length of the block.
+        ctl = record.control.to(torch.int32).cpu().numpy()
         for i in finished:
-            self._close(i, int(res[i]))
+            self._close(i, int(res[i]), int(ctl[i]))
         return len(finished)
 
     @staticmethod
@@ -201,17 +229,28 @@ class ReplayBuffer:
         out["weight_gen"] = np.uint16(record.weight_gen)
         return out
 
-    def _close(self, i: int, result: int) -> None:
-        """A game ended: write ``z`` by the §4 parity rule and commit the block."""
+    def _close(self, i: int, result: int, term_control: int) -> None:
+        """A game ended: write ``z`` by the §4 parity rule and commit the block.
+
+        ``term_control`` is the control word of the position the last move was played
+        from — ``sign`` is the side to move there (`env` §2.2), magnitude is the clock
+        and is ignored. ``result`` is from the *new* mover's point of view, i.e. from
+        the point of view of ``-sign(term_control)``.
+        """
         pending = self._pending[i]
         self._pending[i] = []
         if not pending:
             return
         block = np.concatenate(pending)
         length = block.shape[0]
-        # z(i) = r if (L - i) even else -r. Depends on distance from the end alone.
-        sign = np.where(((length - np.arange(length)) % 2) == 0, 1.0, -1.0)
-        block["value"] = np.float32(result) * sign
+        # z = -r * sign(control) * sign(term_control): +r for a record whose mover is
+        # the one `r` speaks for, -r otherwise. Identical to the old distance-from-the-
+        # end rule on a dense game, and correct on a sparse one, which is what §11 makes
+        # the recorded plies. A control word is never 0 (magnitude = clock + 1 >= 1), so
+        # neither sign can silently vanish.
+        s_rec = np.where(block["control"] > 0, 1.0, -1.0)
+        s_end = 1.0 if term_control > 0 else -1.0
+        block["value"] = -np.float32(result) * s_rec * s_end
         self._commit(block)
         self.total_games += 1
         self.total_records += length

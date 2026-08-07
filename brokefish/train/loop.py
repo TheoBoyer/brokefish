@@ -39,6 +39,7 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Optional, Tuple
 
+import numpy as np
 import torch
 
 from brokefish.env import cuda_impl as _cuda_env
@@ -97,6 +98,25 @@ class TrainConfig:
     # prior-space error, 1.31 % of top-1 priors moved.
     # `docs/journal/2026-08-04-fp8-encoder.md`. Off, like every other new lever.
     fp8: bool = False
+
+    # -- §11, playout cap randomisation (KataGo §3.1), `training.md` §11
+    #
+    # On a proportion `pcr_p` of turns the search runs the full `n_sims` cap and the
+    # position is recorded; on the rest it runs `pcr_fast_sims` with the root noise off
+    # and **nothing is recorded**. `pcr_p = 0` disables it and is the default, so a run
+    # started today reproduces every number measured before 2026-08-07.
+    #
+    # The tension it relieves is KataGo's: the value target is one noisy binary result
+    # per *game*, so value training wants many cheap games, while the policy target
+    # wants a search deep enough to actually deviate from the prior. Uniform `n` has to
+    # pick one. ⚠️ Only the *positions* of a cheap turn are dropped — the turn is still
+    # played, and the games it produces are exactly the extra value data.
+    #
+    # ⚠️ `n_sims` must be the **full** cap, not the mean: it sizes the node pool
+    # (`n_max = n + 1`) and the path arrays. The realised mean is logged per generation
+    # as `self_play/sims_mean` rather than assumed, because it is the cost axis.
+    pcr_p: float = 0.0
+    pcr_fast_sims: int = 64
 
     # -- the buffer, §5
     window_games: int = 500_000
@@ -382,6 +402,24 @@ class Trainer:
             # what says so, and the fix is to export the variable in the shell.
             torch.use_deterministic_algorithms(True, warn_only=True)
 
+        # §11. Checked here rather than at the first cheap move, because the failure it
+        # catches -- a fast cap above the full one -- would otherwise surface as a tree
+        # overrun somewhere inside generation 1.
+        if cfg.pcr_p:
+            if not 0.0 < cfg.pcr_p <= 1.0:
+                raise ValueError(f"pcr_p = {cfg.pcr_p} is not in (0, 1]")
+            if not 1 <= cfg.pcr_fast_sims <= cfg.n_sims:
+                raise ValueError(
+                    f"pcr_fast_sims = {cfg.pcr_fast_sims} must sit in "
+                    f"[1, n_sims = {cfg.n_sims}]: n_sims is the FULL cap under §11 and "
+                    f"it is what sizes the node pool")
+            if round(cfg.pcr_p * cfg.moves_per_phase) < 1:
+                raise ValueError(
+                    f"pcr_p = {cfg.pcr_p} over moves_per_phase = {cfg.moves_per_phase} "
+                    f"rounds to zero full turns per phase; the schedule would clamp to "
+                    f"one and the realised p would be {1 / cfg.moves_per_phase:.3g}, "
+                    f"not what was asked for")
+
         torch.manual_seed(cfg.seed)
         self.net = BrokefishNet().to(self.device)          # fp32 master weights, §8.2
         self.opt = build_optimizer(self.net, cfg)
@@ -459,20 +497,43 @@ class Trainer:
         else:
             self.search.stats.reset()
 
+        full = self._pcr_schedule(moves)
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         closed = 0
         added = 0
+        stored = 0
+        sims_total = 0
         with torch.no_grad():
-            for _ in range(moves):
+            for m in range(moves):
                 self.search.reset_finished()
-                record = self.search.self_play_move()
+                if full[m]:
+                    record = self.search.self_play_move()
+                    sims_total += cfg.n_sims
+                else:
+                    record = self.search.self_play_move(sims=cfg.pcr_fast_sims,
+                                                        noise=False)
+                    sims_total += cfg.pcr_fast_sims
                 done, result = self._apply_ply_cap(record)
-                closed += self.buffer.append(record, done=done, result=result)
+                # ⚠️ Called on a cheap move too, with `store=False`. Skipping the call
+                # would leave every game that ends on a cheap move — most of them —
+                # unclosed, and its records would later be flushed under a different
+                # game's result. See `ReplayBuffer.append`.
+                closed += self.buffer.append(record, done=done, result=result,
+                                             store=full[m])
                 # One row per game in flight, per move-step. This is what the §6
                 # cadence rides: the *data production rate*, which is constant, rather
                 # than the games-closed rate, which falls as games lengthen.
+                #
+                # ⚠️ **Positions generated, not positions stored**, and under §11 those
+                # differ by 1/`pcr_p`. Riding the generated count is what holds the
+                # gradient steps per generation fixed against a uniform-`n` control, so
+                # a difference in the curve is the data and not the step count; the
+                # price is that each *stored* position is trained on `1 / pcr_p` times
+                # more often, which is `buffer/reuse` in the log and is part of the
+                # intervention rather than an accident.
                 added += int(record.board.shape[0])
+                stored += int(record.board.shape[0]) if full[m] else 0
                 self.positions_generated += int(record.board.shape[0])
         torch.cuda.synchronize()
         dt = time.perf_counter() - t0
@@ -492,7 +553,38 @@ class Trainer:
         stats["moves"] = moves
         stats["games_closed"] = closed
         stats["records_added"] = added
+        # §11's three: what actually reached the buffer, how many turns paid the full
+        # cap, and the realised mean budget — the cost axis, measured rather than
+        # derived from `pcr_p`.
+        stats["records_stored"] = stored
+        stats["full_moves"] = int(sum(full))
+        stats["sims_mean"] = sims_total / max(moves, 1)
         return stats
+
+    def _pcr_schedule(self, moves: int) -> list:
+        """Which of this phase's ``moves`` turns get the full cap (§11).
+
+        **Stratified, not i.i.d.**: exactly ``round(pcr_p * moves)`` of the phase's turns
+        are full, with their positions drawn without replacement. Bernoulli draws would
+        give the same turns in expectation but a per-generation cost that wanders by
+        ±11 % at ``moves = 10``, and the cost is this run's x-axis. Redrawn every
+        generation, so a game — whose ply offset within the phase is fixed by whenever
+        its slot last reset — does not get a fixed residue class of its plies recorded
+        for its whole life.
+
+        Seeded from ``(seed, generation)`` rather than from a carried generator, so §9's
+        bit-exact resume gets this for free instead of through another piece of
+        checkpoint state that can go stale.
+        """
+        cfg = self.cfg
+        if cfg.pcr_p <= 0.0:
+            return [True] * moves
+        k = max(1, min(moves, int(round(cfg.pcr_p * moves))))
+        rng = np.random.default_rng((cfg.seed, self.generation))
+        out = [False] * moves
+        for i in rng.choice(moves, size=k, replace=False):
+            out[int(i)] = True
+        return out
 
     def _apply_ply_cap(self, record):
         """§5.4: 512 plies, scored as a draw, counted as a completed game.
@@ -802,8 +894,8 @@ class Trainer:
                 f"  ⚠️ no buffer snapshot at {meta}: the replay buffer restarts EMPTY "
                 f"and {dropped} pending records were discarded. The games in flight "
                 f"continue from the checkpoint and their remaining records are still "
-                f"correctly valued, since §4's parity depends only on distance from "
-                f"the end of the game.")
+                f"correctly valued, since §4's rule reads the side to move off each "
+                f"record and counts nothing.")
 
     # -- the loop ------------------------------------------------------------ #
 
@@ -866,10 +958,14 @@ class Trainer:
             def num(key: str, fmt: str = "9.4f") -> str:
                 return f"{grad[key]:{fmt}}" if key in grad else "—".rjust(int(fmt.split('.')[0]))
 
+            # §11's realised cap, on the console rather than only in the JSONL: it is
+            # the cost axis, and a schedule that quietly stopped varying would look
+            # like a training result rather than a bug.
+            pcr = f"  sims {play['sims_mean']:5.1f}" if cfg.pcr_p else ""
             self.log.note(
                 f"  gen {self.generation:5d}  step {self.step:7d}  "
                 f"games {self.games_completed:8d}  buf {buf.games:7d}g/"
-                f"{buf.records:10d}r  loss {num('total')}  kl {num('kl')}  "
+                f"{buf.records:10d}r{pcr}  loss {num('total')}  kl {num('kl')}  "
                 f"v {num('value')}  lr {cfg.lr_at(self.step):.4g}  "
                 f"{play['seconds']:.1f}s play / {grad.get('seconds', 0.0):.1f}s grad  "
                 f"€{euros['training']:.2f}")
@@ -925,6 +1021,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "and store the target as a point mass on them. Off by default "
                         "-- it changes both the move played and the training target, "
                         "so a run with it is not comparable to one without")
+    p.add_argument("--pcr-p", type=float, default=TrainConfig.pcr_p,
+                   help="§11 playout cap randomisation: the proportion of turns given "
+                        "the full --sims cap and recorded for training. The rest run "
+                        "--pcr-fast-sims with no root noise and are not recorded. 0 is "
+                        "off. ⚠️ --sims is then the FULL cap, not the mean; "
+                        "⚠️ --window-games is in games and only ~pcr_p of each game's "
+                        "plies reach the buffer, so raise it or the window shrinks by "
+                        "1/pcr_p without saying so")
+    p.add_argument("--pcr-fast-sims", type=int, default=TrainConfig.pcr_fast_sims,
+                   help="§11: the cheap cap, used on 1 - pcr_p of turns")
     p.add_argument("--window-games", type=int, default=TrainConfig.window_games)
     p.add_argument("--mean-plies", type=int, default=TrainConfig.mean_plies)
     p.add_argument("--max-plies", type=int, default=TrainConfig.max_plies)
@@ -1037,7 +1143,8 @@ def config_from_args(args) -> TrainConfig:
         betas=tuple(args.betas), warmup_steps=args.warmup,
         decay=args.decay, lr_min=args.lr_min,
         tau_plies=args.tau_plies, eps=args.eps, alpha=args.alpha,
-        terminal_collapse=args.terminal_collapse, fp8=args.fp8)
+        terminal_collapse=args.terminal_collapse, fp8=args.fp8,
+        pcr_p=args.pcr_p, pcr_fast_sims=args.pcr_fast_sims)
     if args.smoke:
         cfg.n_sims, cfg.batch_games, cfg.moves_per_phase = 32, 256, 8
         cfg.window_games, cfg.mean_plies, cfg.max_plies = 2000, 128, 160

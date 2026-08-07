@@ -250,7 +250,7 @@ class Search(_ref.Search):
 
     # -- §6.1 --------------------------------------------------------------- #
 
-    def root_init(self) -> None:
+    def root_init(self, noise: bool = True) -> None:
         if self.check_invariants and bool(self.game_done.any()):
             raise AssertionError("invariant 8: a finished game was searched; "
                                  "call reset_finished() first")
@@ -266,7 +266,8 @@ class Search(_ref.Search):
             mask, _ = self.env.movegen(self.game_board, self.game_control)
             self._root_code, self._root_result = self._root_terminal_scan(mask)
         _ext().expand(self._tree, policy, promo, value, *self._tables, self._ctr)
-        self._add_exploration_noise()
+        if noise:
+            self._add_exploration_noise()
         # §6.1a. Inherited from the reference unchanged: it writes `edge_N` and
         # `edge_Q` in place, and those are the very tensors `self._tree` hands the
         # kernels, so the descent sees the seeded values without a kernel change.

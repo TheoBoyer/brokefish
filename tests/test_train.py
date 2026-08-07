@@ -122,13 +122,21 @@ def fake_record(board, control, rep, labels, probs, played, ply, done, result,
 
 
 def one_game(length: int, result: int, seed: int = 0):
-    """One game of `length` plies as a stream of single-row records."""
+    """One game of `length` plies as a stream of single-row records.
+
+    ⚠️ **The control word alternates**, which it did not before 2026-08-07. The board
+    is left at the initial position — nothing here reads it — but ``sign(control)`` is
+    the side to move and §4's value rule reads it off every record, so a fixture that
+    kept White to move for the whole game would have made the rule and its inverse
+    agree and this file's check 6 worth nothing.
+    """
     boards, control = env.initial_boards(1, device=DEVICE)
     rows = []
     for t in range(length):
         done = torch.tensor([t == length - 1], device=DEVICE)
+        turn = control.clone() * (1 if t % 2 == 0 else -1)
         rows.append(fake_record(
-            boards.clone(), control.clone(),
+            boards.clone(), turn,
             torch.zeros(1, dtype=torch.uint8, device=DEVICE),
             torch.full((1, 4), t + 1, dtype=torch.int16, device=DEVICE),
             torch.full((1, 4), 0.25, dtype=torch.float16, device=DEVICE),
@@ -913,7 +921,8 @@ def test_the_index_lets_another_process_read_the_buffer(tmp_path):
         block["board"] = rng.integers(0, 4096, size=(length, 32), dtype=np.int64)
         block["control"] = 1 - 2 * (np.arange(length) % 2)
         buf._pending[0] = [block[i:i + 1] for i in range(length)]
-        buf._close(0, result=(1 if g == 0 else 0))
+        buf._close(0, result=(1 if g == 0 else 0),
+                  term_control=int(block['control'][-1]))
     buf.save_index(idx)
 
     view = BufferView(dat, idx)
@@ -939,7 +948,7 @@ def test_the_view_sees_new_games_only_after_a_refresh(tmp_path):
         block = np.zeros(length, dtype=RECORD)
         block["control"] = 1
         buf._pending[0] = [block[i:i + 1] for i in range(length)]
-        buf._close(0, result=0)
+        buf._close(0, result=0, term_control=1)
 
     add(4)
     buf.save_index(idx)
@@ -968,7 +977,7 @@ def test_a_wrapped_game_is_reassembled(tmp_path):
         block["root_value"] = np.float32(g + 1)      # a per-game marker
         marks.append(g + 1)
         buf._pending[0] = [block[i:i + 1] for i in range(length)]
-        buf._close(0, result=0)
+        buf._close(0, result=0, term_control=1)
     buf.save_index(idx)
     view = BufferView(dat, idx)
     assert view.tail < view.head or view.n_records < view.capacity or True
@@ -990,3 +999,167 @@ def test_the_index_is_written_atomically(tmp_path):
     buf.save_index(idx)
     assert os.path.exists(idx)
     assert not os.path.exists(idx + ".tmp"), "the temp file must be renamed, not left"
+
+
+# --------------------------------------------------------------------------- #
+# §11, playout cap randomisation
+# --------------------------------------------------------------------------- #
+
+def _sparse_game(plies: int, stored: list, result: int):
+    """A game of `plies` where only the plies in `stored` are recorded.
+
+    Returns the buffer after the game closed. `stored` need not contain the last
+    ply — that is the case §11 exists to make safe.
+    """
+    buf = ReplayBuffer(window_games=8, mean_plies=32, seed=0)
+    rows = one_game(plies, result=result)
+    for t, r in enumerate(rows):
+        buf.append(r, store=(t in stored))
+    return buf
+
+
+@pytest.mark.parametrize("plies,stored,result", [
+    (8, [0, 3, 6], 1),          # the game ends on a ply nobody recorded
+    (8, [1, 4, 7], -1),         # ... and one where the last ply is recorded
+    (9, [0, 1, 2], 1),          # three consecutive, all far from the end
+    (7, [5], -1),               # a single record
+])
+def test_the_value_target_is_right_when_the_recorded_plies_are_sparse(
+        plies, stored, result):
+    """§12 check 6 under §11, which is where the old rule silently broke.
+
+    `z(i) = r if (L - i) even else -r` counts *positions in the pending block*, so
+    with a sparse subset it reads the wrong side to move for every record whose
+    distance from the end is not its index's distance — i.e. for almost all of them.
+    The rule now reads `control`, so this is exact rather than approximately right.
+    """
+    buf = _sparse_game(plies, stored, result)
+    assert buf.n_records == len(stored), "closure did not happen or stored too much"
+    got = np.array(buf.data[:len(stored)]["value"])
+    # `one_game` puts White (control > 0) to move on even plies, and the game ends
+    # after the move played from ply `plies - 1`, so `result` speaks for the side to
+    # move at ply `plies` -- White iff `plies` is even.
+    winner_is_white = (plies % 2 == 0)
+    want = np.array([result if ((t % 2 == 0) == winner_is_white) else -result
+                     for t in stored], dtype=np.float32)
+    assert np.array_equal(got, want), f"{got} != {want} for plies at {stored}"
+
+
+def test_the_sparse_rule_agrees_with_the_dense_one_on_a_dense_game():
+    """The new rule is not a new rule where the old one applied. Both directions:
+    a dense game must give the published parity, at odd and even length."""
+    for length in (3, 4, 5, 6):
+        for result in (1, -1):
+            buf = _sparse_game(length, list(range(length)), result)
+            got = np.array(buf.data[:length]["value"])
+            want = np.array([result if (length - i) % 2 == 0 else -result
+                             for i in range(length)], dtype=np.float32)
+            assert np.array_equal(got, want), (length, result, got, want)
+
+
+def test_the_old_dense_rule_would_be_caught_on_a_sparse_game():
+    """The test above is only worth what its ability to fail is worth.
+
+    `z(i) = r if (L - i) even else -r` over a *block* of 3 records taken from plies
+    0, 3 and 6 of an 8-ply game gives `[-r, r, -r]`, and the truth is `[r, -r, r]`:
+    every sign inverted, i.e. a third of the buffer teaching the network to play to
+    lose. Nothing would have raised.
+    """
+    plies, stored, result = 8, [0, 3, 6], 1
+    buf = _sparse_game(plies, stored, result)
+    got = np.array(buf.data[:len(stored)]["value"])
+    dense = np.array([result if (len(stored) - i) % 2 == 0 else -result
+                      for i in range(len(stored))], dtype=np.float32)
+    assert np.array_equal(got, -dense), (got, dense)
+
+
+def test_a_game_that_ends_on_an_unrecorded_ply_still_closes():
+    """⚠️ The trap §11 is built around, asserted directly.
+
+    The natural way to write "do not record cheap turns" is to not call `append` on
+    them. Then a game that *ends* on a cheap turn is never closed: its earlier
+    records stay in `_pending`, the search resets the slot, and the next game to
+    finish there flushes them under its own result. Silent, and at `p = 0.3` it is
+    70 % of games. So `store=False` must still close, and the slot must be empty
+    afterwards.
+    """
+    buf = ReplayBuffer(window_games=8, mean_plies=32, seed=0)
+    rows = one_game(5, result=1)                 # ends on ply 4
+    for t, r in enumerate(rows):
+        buf.append(r, store=(t < 3))             # plies 0-2 recorded, 3 and 4 not
+    assert buf.n_records == 3, "the game did not close on an unrecorded ply"
+    assert buf.pending_records == 0, "records were left in flight to poison a later game"
+    assert buf.n_games == 1
+
+    # And the next game in the same slot inherits none of them.
+    for t, r in enumerate(one_game(4, result=-1)):
+        buf.append(r, store=(t == 0))
+    assert buf.n_games == 2 and buf.n_records == 4
+    first, second = np.array(buf.data[:3]["value"]), np.array(buf.data[3:4]["value"])
+    assert np.array_equal(first, np.array([-1, 1, -1], dtype=np.float32)), first
+    assert np.array_equal(second, np.array([-1], dtype=np.float32)), second
+
+
+def test_the_schedule_gives_exactly_the_asked_for_proportion_and_moves_around():
+    """§11's schedule: stratified, not Bernoulli, and redrawn every generation.
+
+    Exact per phase because the realised cap is this run's cost axis, and a Bernoulli
+    draw over 10 moves wanders by +-11 % of it. Redrawn because a game's ply offset
+    inside the phase is fixed for its whole life, so a *constant* pattern would record
+    one residue class of each game's plies and nothing else.
+    """
+    obj = object.__new__(Trainer)
+    obj.cfg = TrainConfig(pcr_p=0.3, moves_per_phase=10, seed=0)
+
+    seen = set()
+    by_position = [0] * 10
+    for gen in range(400):
+        obj.generation = gen
+        full = Trainer._pcr_schedule(obj, 10)
+        assert sum(full) == 3, f"generation {gen} ran {sum(full)} full turns"
+        seen.add(tuple(full))
+        for i, f in enumerate(full):
+            by_position[i] += int(f)
+    assert len(seen) > 20, f"only {len(seen)} distinct patterns in 400 generations"
+    # Every position in the phase gets the full cap about equally often: 400 * 3 / 10.
+    assert min(by_position) > 80 and max(by_position) < 160, by_position
+
+    # Deterministic given (seed, generation), which is what §9's resume rides.
+    obj.generation = 7
+    assert Trainer._pcr_schedule(obj, 10) == Trainer._pcr_schedule(obj, 10)
+
+
+def test_pcr_off_is_the_pre_2026_08_07_path():
+    obj = object.__new__(Trainer)
+    obj.cfg = TrainConfig(pcr_p=0.0, moves_per_phase=4)
+    obj.generation = 0
+    assert Trainer._pcr_schedule(obj, 4) == [True] * 4
+
+
+@pytest.mark.parametrize("kw,match", [
+    (dict(pcr_p=1.5), "pcr_p"),
+    (dict(pcr_p=0.3, pcr_fast_sims=0), "pcr_fast_sims"),
+    (dict(pcr_p=0.3, pcr_fast_sims=99), "pcr_fast_sims"),   # above n_sims = 8
+    (dict(pcr_p=0.02, pcr_fast_sims=2), "rounds to zero"),
+])
+def test_a_misconfigured_cap_is_refused_at_construction(tmp_path, kw, match):
+    """Not at the first cheap move, deep inside generation 1."""
+    with pytest.raises(ValueError, match=match):
+        _smoke_trainer(tmp_path, "bad", **kw)
+
+
+@pytest.mark.slow
+def test_a_pcr_phase_stores_only_the_full_turns(tmp_path):
+    """End to end: the counters say what was played and what was kept."""
+    trainer = _smoke_trainer(tmp_path, "pcr", n_sims=8, pcr_p=0.5,
+                             pcr_fast_sims=2, moves_per_phase=4)
+    play = trainer.self_play_phase()
+    assert play["full_moves"] == 2
+    assert play["records_added"] == 4 * trainer.cfg.batch_games
+    assert play["records_stored"] == 2 * trainer.cfg.batch_games
+    # The cost axis, measured: (2 * 8 + 2 * 2) / 4.
+    assert play["sims_mean"] == pytest.approx(5.0)
+    # ⚠️ The cadence rides `records_added`, so the gradient step count per generation
+    # is the same as a uniform run's -- which is what makes the two comparable.
+    assert Trainer.steps_owed(trainer, play["records_added"]) >= 0
+    trainer.log.close()

@@ -305,10 +305,40 @@ class Search:
 
     # -- one move ----------------------------------------------------------- #
 
-    def self_play_move(self) -> MoveRecord:
-        """§6 end to end: `root_init`, `n` simulations, `select_and_advance`."""
-        self.root_init()
-        for s in range(self.config.n):
+    def self_play_move(self, sims: Optional[int] = None,
+                       noise: bool = True) -> MoveRecord:
+        """§6 end to end: `root_init`, `n` simulations, `select_and_advance`.
+
+        ``sims`` overrides the budget for this move alone, which is §11's playout cap
+        randomisation seen from the outside. ⚠️ **Filling :attr:`budget` is not enough
+        on its own** — the loop below has to read the same number, or every game runs
+        `config.n` simulations with the descent merely idling past its budget, which
+        costs the full price and looks in every counter like it worked.
+
+        The whole batch gets one budget, deliberately. `simulate` hands *all* `B` staged
+        leaves to the encoder however few of them are active, so a batch holding mixed
+        budgets pays the maximum rather than the mean; a homogeneous batch is what makes
+        the average cap an actual saving. Measured 2026-08-07: encoder throughput per
+        board is flat from 4096 boards down to 128, so nothing is bought by narrowing
+        the batch instead.
+
+        ``noise = False`` skips §6.1's Dirichlet mixture, which is what a fast search
+        wants (KataGo §3.1: "for fast searches, we also disable Dirichlet noise and
+        other explorative settings, maximizing strength") — those turns are played, not
+        recorded, so exploration on them buys nothing and costs move quality.
+
+        ⚠️ ``config.n`` still sizes the node pool and the path arrays, so it must stay at
+        the *largest* budget a run will ask for; ``sims`` may only go down.
+        """
+        k = self.config.n if sims is None else int(sims)
+        if not 1 <= k <= self.config.n:
+            raise ValueError(
+                f"sims = {k} is outside [1, config.n = {self.config.n}]. The tree is "
+                f"allocated for n_max = {self.config.n_max} nodes and d_max = "
+                f"{self.config.d_max}, so a larger budget would overrun both")
+        self.budget.fill_(k)
+        self.root_init(noise=noise)
+        for s in range(k):
             self.simulate(s)
         return self.select_and_advance()
 
@@ -325,7 +355,7 @@ class Search:
 
     # -- §6.1 --------------------------------------------------------------- #
 
-    def root_init(self) -> None:
+    def root_init(self, noise: bool = True) -> None:
         b = self._b
         if self.check_invariants and bool(self.game_done.any()):
             raise AssertionError("invariant 8: a finished game was searched; "
@@ -359,7 +389,8 @@ class Search:
 
         root = torch.zeros_like(b)
         self._expand(root, mask, torch.ones_like(self.game_done), policy, promo, value)
-        self._add_exploration_noise()
+        if noise:
+            self._add_exploration_noise()
         self._seed_terminal_edges()
 
     def _root_terminal_scan(self, mask: torch.Tensor) -> torch.Tensor:

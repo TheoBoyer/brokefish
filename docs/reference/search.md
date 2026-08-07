@@ -1045,8 +1045,25 @@ no array in §4.2.
 Two structural hooks, both free in v0 and awkward to retrofit:
 
 **The simulation loop reads `budget[b]`** rather than a constant `n`, with `descent`
-returning immediately for a game whose budget is exhausted. In v0 every entry is
-`n`. This is what playout cap randomisation needs, and it is five lines.
+returning immediately for a game whose budget is exhausted. In v0 every entry is `n`.
+This is what playout cap randomisation needs.
+
+⚠️ **"and it is five lines" was wrong, and the way it was wrong is the interesting
+part** (corrected 2026-08-07, when it was built — `training.md` §15). The hook gives
+*correctness* for a heterogeneous budget and none of the *saving*: `simulate` hands all
+`B` staged leaves to the encoder every iteration whether they are active or not, so a
+batch holding mixed budgets pays the largest budget in it. Filling `budget` and leaving
+the loop at `range(n)` produces a perfectly correct tree of 64 simulations at the price
+of `n`, and every counter in §15 says it worked. Two further lines were needed —
+`self_play_move` fills `budget` and iterates the same number — and one design decision:
+**the budget is tied across the batch**, since sorting the budgets so the active set is
+a contiguous prefix buys nothing either (encoder throughput per board is flat from 4096
+boards down to 128, measured 2026-08-07). `sims` may only go *down* from `config.n`,
+which sizes the node pool and the path arrays.
+
+**The fast search also drops the §6.1 root noise**, which is a `root_init(noise=False)`
+argument rather than a seam: KataGo disables Dirichlet on turns nobody records, to
+maximise strength on a move that is played for real.
 
 **The record schema carries `weight_gen` and a reserved value field** so that a
 bootstrapped or mixed value target does not force a buffer migration.

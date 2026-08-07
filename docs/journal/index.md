@@ -13,6 +13,7 @@ entry records what was true when it was written. Neither is a bug.
 
 | date | entry | what it settles |
 |---|---|---|
+| 2026-08-07 | [E1.1 from checkpoints that already existed](2026-08-07-e11-sims-256.md) | `sims = 256` is worth **+275 ± 67 Elo at equal positions** and 1.75× on the clock — measured against the only run it can be compared to without also moving the root sweep and node collapse |
 | 2026-08-07 | [Muon on the curve](2026-08-07-muon-curve.md) | the first Elo measurement of an optimiser here: **+143 ± 26 Elo at step 1905, ~1.4× less wall clock to the same rating**, against an AdamW whose rate was never re-screened; and a weight norm that triples |
 | 2026-07-31 | [Building D2: the league](2026-07-31-d2-league.md) | why the league has no opening book, the lockstep trick that made it 1× the encoder instead of 2×, and the self-match identity that made it testable on a CPU |
 | 2026-07-31 | [The collapse of `c2-8h`](2026-07-31-value-collapse.md) | the first long training run fell into an absorbing state: a first-play-urgency constant that did not ride the `[0,1]` remap made low-prior moves unreachable at any budget |

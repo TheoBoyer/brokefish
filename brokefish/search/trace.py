@@ -126,10 +126,10 @@ class TracingSearch(Search):
 
     # -- capture ------------------------------------------------------------ #
 
-    def root_init(self) -> None:
+    def root_init(self, noise: bool = True) -> None:
         self._reset_trace()
         self._last_expand = None
-        super().root_init()
+        super().root_init(noise=noise)
         # `root_init` keeps only the clamped feature the network reads, and §4.2
         # wants the count itself, so it is asked for a second time. Over the ring
         # alone, since no tree exists yet (`mcts.md` §7).

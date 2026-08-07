@@ -252,6 +252,24 @@ z(t) = r  if (T - t) is even, else -r
 with `z = 0` for every draw regardless of parity. This is the same parity argument as
 `search.md` §6.5's backup flip and fails the same way if inverted.
 
+⚠️ **That form assumes the recorded plies are consecutive, and under §15 they are
+not.** Playout cap randomisation records only the full-search turns, so `t` indexes a
+*sparse subset* of the game and the distance from the end of the pending block is no
+longer the distance from the end of the game. The rule is therefore stated on the
+quantity it was always about — which side is to move — and reads the control word, whose
+sign is the side to move (`env.md` §2.2):
+
+```
+z = -r * sign(control_record) * sign(control_T)
+```
+
+`control_T` is the control word of the position the last move was played from. The two
+forms are **identical on a dense game** — the last record *is* ply `T`, so its own sign
+gives `-r` and every earlier one alternates — and only the second survives a sparse one.
+It is also strictly more robust in the case §9 already relied on: a game whose earlier
+records were lost to a resume still gets correct values, because nothing counts anything.
+`tests/test_train.py` checks both forms agree densely and that the sparse one is exact.
+
 **The ablation seam stays open at zero cost.** `search.md` §10 already reserves
 `weight_gen` plus one `f32` for a bootstrapped target. C2 writes the search's root
 value into that field and trains on nothing but `z`. Two bytes of a 330 B record buys
@@ -922,8 +940,88 @@ aside.
 | **checkpoint frequency `K`** | AGZ used every 1,000 steps; ours has no evaluator to feed, so it is a resume-granularity choice |
 | **the unmasked policy softmax** | §3.3's alternative: denominator over all 2048 logits, no movegen at training time. Coherent with a masked search by conditioning, and cheaper. Not the default because AZ masks and because it spends gradient on permanently illegal moves |
 | **the bootstrapped value ablation** | KataGo's mix. The field is written and unused from generation 0, so it costs nothing to defer |
-| **playout cap randomisation** | `search.md` §11 seam; changes the cadence of §6, since positions would no longer cost the same |
+| ~~**playout cap randomisation**~~ | closed 2026-08-07 — see §15 |
 | **simulations per move** | §13. `n = 800` for the hill-climbing run, reduced afterwards by the `search.md` §11 seams and C4's sweep. Not a C2 parameter either way |
+
+---
+
+## 15. Playout cap randomisation
+
+**Off by default** (`pcr_p = 0`), so a run started today reproduces every number
+measured before 2026-08-07. The authority is KataGo §3.1 (arXiv 1902.10565), read
+directly rather than from memory.
+
+**The tension.** The value target is one noisy binary result per *entire game*, so
+value training wants many cheap games. The policy target is `N / n` over a tree, and
+unless `n` is large the search does not deviate much from the prior, so the policy
+does not readily improve. Uniform `n` has to pick one. E1.1 measured the policy side
+of that on this project: doubling `128 → 256` was worth **+275 ± 67 Elo at equal
+positions** (`journal/2026-08-07-e11-sims-256.md`), which is what makes the expensive
+tier worth spending on a fraction of turns.
+
+**The rule.** On a proportion `p` of turns the search runs the full cap `N` and the
+position is recorded; on the other `1 - p` it runs a fast cap `n < N` with the §6.1
+Dirichlet noise **off**, and **nothing is recorded**. KataGo, verbatim:
+
+> On a small proportion p of turns, we perform a full search, stopping when the tree
+> reaches a cap of N nodes, and for all other turns we perform a fast search with a
+> much smaller cap of n < N. **Only turns with a full search are recorded for
+> training.** For fast searches, we also disable Dirichlet noise and other explorative
+> settings, maximizing strength.
+
+⚠️ **The cheap turns are not recorded for the value target either.** They are still
+*played*, and the extra games that produces is the whole value gain — more independent
+outcomes, not more rows per outcome. KataGo's main run used `p = 0.25` and
+`(N, n) = (600, 100)`, annealed to `(1000, 200)`; their ablation puts it at **1.37×**.
+
+**One budget for the whole batch, per move.** `search.md` §11's hook is per *game*, and
+the per-game gating is real and tested — but `simulate` hands all `B` staged leaves to
+the encoder every iteration whether or not they are active, so a batch holding mixed
+budgets costs the **maximum**, not the mean. Measured 2026-08-07: encoder throughput per
+board is flat from 4096 boards down to 128 (97.2 %), so narrowing the batch to the
+active set buys nothing either. A homogeneous batch is what makes an average cap an
+actual saving, and `Search.self_play_move(sims=...)` therefore owns `budget` and the
+iteration count together.
+
+⚠️ **`n_sims` is the FULL cap, never the mean.** It sizes the node pool
+(`n_max = n + 1`) and the path arrays, so a fast cap may only go *down*; the loop
+refuses a `pcr_fast_sims` above it at construction. The realised mean is logged per
+generation as `self_play/sims_mean` — measured, because it is the cost axis.
+
+**The schedule is stratified, not Bernoulli**: exactly `round(p × moves_per_phase)`
+turns per phase, positions drawn without replacement, redrawn every generation and
+seeded from `(seed, generation)` so §9's bit-exact resume gets it for free. Bernoulli
+draws give the same turns in expectation but a per-generation cost wandering by ±11 %
+at `moves_per_phase = 10`, and that cost is the x-axis. Redrawing matters because a
+game's ply offset within the phase is fixed for its whole life, so a constant pattern
+would record one residue class of each game's plies and nothing else.
+
+**Two things it changes that are easy to miss.**
+
+⚠️ **The window is denominated in games and only `p` of each game's plies reach it.**
+At `p = 0.3`, `window_games = 20 000` holds ~760 k records where a uniform run held
+~2.5 M — a 3.3× smaller and far more correlated window. This is the failure KataGo
+itself hit: their Fixed-600 ablation needed *"the window size doubled, as an informal
+test without doubling showed major overfitting due to lack of data."* **Raise
+`--window-games` by `1/p`**, and lower `--mean-plies` by the same factor, since the ring
+is sized in records and only the recorded ones are written.
+
+⚠️ **§6's cadence rides positions *generated*, not stored**, which is deliberate: it
+holds the gradient steps per generation equal to a uniform-`n` control's, so a
+difference in the curve is the data and not the step count. The price is that each
+stored position is trained on `1/p` times more often — reuse `0.815 → 2.72` at
+`p = 0.3` — which is part of the intervention and is watched through
+`gradient/staleness`.
+
+**The trap in the buffer, which is silent.** `ReplayBuffer.append` does two unrelated
+jobs: it accumulates the move's rows, and it *closes* every game that just finished.
+The natural way to write "do not record cheap turns" is to not call it on them — which
+loses the closure of every game that **ends** on a cheap turn, i.e. ~`1 - p` of all
+games. Those games' earlier records stay in `_pending`, the search resets the slot, and
+the next game to finish there flushes them under **its** result: no exception, no
+counter, and label noise on most of the buffer. So the two jobs are separated by a
+`store` flag rather than by the call, and the closure path is unconditional. §4's value
+rule was rewritten in the same change, for the same reason.
 
 ---
 

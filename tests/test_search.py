@@ -569,14 +569,41 @@ def test_a_finished_game_is_not_searched():
 # --------------------------------------------------------------------------- #
 
 def test_per_game_budget():
-    """The simulation loop reads `budget[b]`, which playout cap randomisation needs."""
+    """The descent reads `budget[b]` per game, which is §11's structural hook.
+
+    ⚠️ **Driven by hand rather than through `self_play_move`** (changed 2026-08-07).
+    `self_play_move` now owns the budget: it fills the whole batch with one value and
+    runs exactly that many iterations, because anything else pays for the maximum. The
+    per-game gating below it is still real and still tested — it is what makes a
+    heterogeneous budget *correct* — it is simply not what the entry point offers, and
+    §11's own note says why: `simulate` hands all `B` staged leaves to the encoder every
+    iteration, so a mixed batch costs the largest budget in it and buys nothing.
+    """
     s = make(n=32, B=3)
     s.budget[0] = 5
     s.budget[1] = 12
     with torch.no_grad():
-        s.self_play_move()
+        s.root_init()
+        for i in range(s.config.n):
+            s.simulate(i)
     assert s.node_count.tolist() == [6, 13, 33]
     check_invariants(s)
+
+
+def test_self_play_move_owns_the_budget():
+    """The other half: the entry point does not inherit a stale per-game budget.
+
+    A move run at `sims = 64` leaves `budget` at 64, and the next full move must not
+    quietly search 64 nodes at the price of `config.n` — which is the exact shape of
+    the bug §11's hook invites.
+    """
+    s = make(n=32, B=3, tau_plies=0)
+    with torch.no_grad():
+        s.self_play_move(sims=8)
+        assert s.budget.tolist() == [8, 8, 8]
+        s.self_play_move()
+    assert s.budget.tolist() == [32, 32, 32]
+    assert s.node_count.tolist() == [33, 33, 33]
 
 
 # --------------------------------------------------------------------------- #
@@ -1348,3 +1375,93 @@ def test_the_collapse_leaves_the_visit_invariant_alone():
         total = torch.where(valid, s.edge_N[:, 0].long(), torch.zeros_like(valid.long()))
         assert bool((total.sum(-1) == (s.budget + s.seeded).long()).all())
         s.select_and_advance()
+
+
+# --------------------------------------------------------------------------- #
+# §11, playout cap randomisation: `self_play_move(sims=...)`
+# --------------------------------------------------------------------------- #
+
+def test_a_reduced_budget_actually_runs_that_many_simulations():
+    """§11. The trap this exists for: `budget` alone changes nothing.
+
+    `simulate` skips the descent for a game whose budget is spent, so filling
+    `budget` with 64 and still looping `config.n` times produces a *correct* tree of
+    64 simulations at the price of `config.n` — the encoder is handed all `B` staged
+    leaves every iteration whether they are active or not. Every counter would say it
+    worked. So this asserts the two things a saving is made of: the tree holds 64
+    simulations' worth of nodes, and the pool sized for `config.n` is not touched.
+    """
+    s = make(n=256, B=2, tau_plies=0)
+    with torch.no_grad():
+        s.self_play_move(sims=64)
+    # Invariant 6 is `root visits == budget + seeded`, and `budget` is now 64.
+    assert int(s.budget[0]) == 64
+    # One root plus at most one node per simulation (§4.1), so 65 is the bound and
+    # 257 -- what `config.n` allocates -- is what a budget-ignoring loop would reach.
+    assert int(s.node_count.max()) <= 65, int(s.node_count.max())
+    assert int(s.node_count.max()) > 1, "no node was expanded at all"
+
+
+def test_the_full_budget_is_still_the_default():
+    """`sims=None` is the pre-§11 path, unchanged."""
+    s = make(n=24, B=2, tau_plies=0)
+    with torch.no_grad():
+        s.self_play_move()
+    assert int(s.budget[0]) == 24
+    assert int(s.node_count.max()) <= 25
+
+
+def test_a_budget_above_the_allocation_is_refused():
+    """`config.n` sizes the node pool and the path arrays; `sims` may only go down."""
+    s = make(n=16, B=2)
+    with torch.no_grad():
+        with pytest.raises(ValueError, match="config.n"):
+            s.self_play_move(sims=17)
+        with pytest.raises(ValueError):
+            s.self_play_move(sims=0)
+
+
+def test_a_fast_search_carries_no_root_noise():
+    """§11 / KataGo §3.1: "for fast searches, we also disable Dirichlet noise".
+
+    Checked as an equality against the network's own priors rather than as a
+    distance, because `eps = 0.25` on a wide root is a small perturbation and a
+    tolerance test would pass on a noise that was merely applied twice as weakly.
+    """
+    s = make(n=8, B=2, eps=0.25, tau_plies=0)
+    with torch.no_grad():
+        s.root_init(noise=False)
+        quiet = s.edge_prior[:, 0].clone()
+        s.root_init(noise=True)
+        noisy = s.edge_prior[:, 0].clone()
+
+        # What the network says, taken through the same expansion path.
+        ne = s.node_nedges[:, 0].long()
+        valid = torch.arange(s.config.E, device=s.device)[None, :] < ne[:, None]
+        assert bool(valid.any()), "no edges at the root"
+        # The quiet priors sum to 1 per row over the valid edges: the softmax
+        # survived intact rather than the noise being replaced by nothing.
+        assert abs(float(quiet[valid].float().sum()) - 2.0) < 2e-2, \
+            float(quiet[valid].float().sum())
+        assert not torch.equal(quiet, noisy), "eps = 0.25 moved nothing; noise is dead"
+
+
+def test_two_fast_searches_from_the_same_position_agree_exactly():
+    """The consequence that makes the check above worth having.
+
+    With no root noise the search is a deterministic function of the position and
+    the weights, so two fast searches over the same board must produce the same
+    tree. With noise they must not. This is the property a fast search is *for*:
+    KataGo turns the exploration off to maximise strength on a turn nobody records.
+    """
+    s = make(n=32, B=2, eps=0.25, tau_plies=0)
+    with torch.no_grad():
+        s.root_init(noise=False)
+        for i in range(32):
+            s.simulate(i)
+        a = s.edge_N[:, 0].clone()
+        s.root_init(noise=False)
+        for i in range(32):
+            s.simulate(i)
+        b = s.edge_N[:, 0].clone()
+    assert torch.equal(a, b), "a noiseless search is not reproducible"

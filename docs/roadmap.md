@@ -240,7 +240,7 @@ clear their own cost factor.
 | | what | source | cost |
 |---|---|---|---|
 | **E1.1** | **paid** — **`sims = 256`.** Two points on this curve both moved hard; this is the third. ⚠️ It costs 2× per position, so on the real axis it must reach the landmark **under 1.80 h** — i.e. under ~1.41 M positions against n=128's 2.69 M, a **1.9× sample-efficiency gain merely to break even**. The previous doubling gave 2.7×. If this one gives under 1.9× the lever has saturated and the track's weight moves to E1.2/E1.4/E1.5 | ours, E0 | one run |
-| **E1.2** | **paid, but cheaply** — **Playout cap randomisation.** Large `N` on a fraction `p` of turns for policy targets, cheap `n` elsewhere for value targets | KataGo §3.1; their ablation: *"clearly outperforms a wide variety of possible fixed values of playouts"* over N ∈ {100,150,200,250,600}. Its stated purpose **is** this tension | medium; `Search.budget` is already the per-game tensor and [`search.md`](reference/search.md) §11 prices it |
+| **E1.2** | **paid, but cheaply** — **Playout cap randomisation.** Large `N` on a proportion `p` of turns, a small `n` on the rest. ⚠️ **Corrected 2026-08-07 against the primary text**: *"Only turns with a full search are recorded for training"* — the cheap turns are **not** recorded, for value or for anything else. The value target gains **indirectly**, because the same compute plays more games and the outcome is *"one noisy binary result per entire game"*. An earlier draft of this row said the cheap turns feed the value target; they do not. Their main run: `p = 0.25`, `(N, n) = (600, 100)`, annealed to `(1000, 200)` after two days, **Dirichlet noise and every explorative setting disabled on the fast searches** | KataGo §3.1; ablation Table 2: removing it costs **1.37×**, over fixed N ∈ {100,150,200,250,600} | medium; `Search.budget` is already the per-game tensor and [`search.md`](reference/search.md) §11 prices it. ⚠️ §11's "five lines" is correctness only — the encoder evaluates all `B` staged leaves every simulation, so a batch holding mixed budgets **costs the maximum, not the mean** |
 | **E1.3** | **free** — **Forced playouts + policy target pruning.** `n_forced(c) = (k·P(c)·ΣN(c'))^½`, k=2, PUCT set to ∞ until met; then subtract those playouts from the *target* unless the move proved good | KataGo §3.2, ablated as NoForcedTP. ⚠️ Their motivation is our FPU bug stated in general form: *"even if a Dirichlet noise move was good, its initial evaluation might be negative, preventing further search"* | medium |
 | **E1.4** | **free** — **Auxiliary policy target** — predict the **opponent's next** policy, `w_opp = 0.15` | KataGo §4.1: *"modest but clear benefit… nearly costless… deserves attention"*. **Fully game-agnostic**, unlike ownership and score | low |
 | **E1.5** | **free** — **Moves-left head** | lc0 ships one with its own loss weight; it is the chess analogue of E1.4 on the value side | low |
@@ -286,11 +286,19 @@ efficiency costs, which is why they follow E1 rather than lead it.
   (15,192) → (20,256) — safe rather than a re-tune at every step. They belong together.
   A smaller net early also has a real sample-efficiency argument: fewer parameters to
   fit per position.
-- **Muon.** Orthogonalised momentum on the matrix parameters, AdamW on the rest. The
-  split is apt here: the trunk-gradient decomposition measured the matrix and vector
-  parameters behaving completely differently (the value head is 45× denser per
-  parameter). ⚠️ Unproven in self-play RL; cheap to try, and `bench/`'s interleaved
-  A/B protocol is what would settle it.
+- ~~**Muon.**~~ ✅ **Measured 2026-08-07 and it belongs in E1, not here** — it is *free*
+  per position (Newton-Schulz is under 0.01 % of a step), so it never needed a cost
+  factor to beat. `t7h-muon` against an AdamW control at 128 sims: **+143 ± 26 Elo at
+  step 1905** in one joint league, **~1.4× less wall clock to any fixed rating** between
+  Elo 200 and 400, KL rising in both.
+  [The entry](journal/2026-08-07-muon-curve.md) has the protocol and four caveats, of
+  which two matter for what comes next: **the AdamW rate was never re-screened** under
+  the same 780 s guard that chose muon's `2.0e-2`, so this is +1.4× against the baseline
+  we have been running rather than against a tuned one; and **`weight_norm` goes
+  108.6 → 369.3** where the control's goes 108.6 → 117.2, since a fixed-RMS update makes
+  `adam_wd` on the aux group irrelevant to the matrices. ⚠️ **Decide what bounds the
+  norm before a 24 h muon run.** The run died at 5.65 h of 7 h on a full disk, so nothing
+  is known about the cosine tail.
 
 ### E4. Looped transformer and HRM-adjacent recurrence
 
@@ -318,6 +326,8 @@ none of them can be compared.
 |---|---|
 | **the objective is Elo/h, not Elo per sample** | the same measurement reads 3.0× on samples and 1.6× on the clock. An intervention that buys quality with FLOPs per position must beat its own cost factor |
 | **simulations per target is a first-order lever** | 2.7-3.0× fewer positions and **1.6× less wall clock** to the same landmark, n=64 → n=128, with positions-per-generation held constant at 10 240 |
+| **the optimiser is a free 1.4× on the clock** | Muon + Polar Express on the 98.6 % of parameters that are matrices: **+143 ± 26 Elo at step 1905**, ~1.4× less wall clock to any rating from 200 to 400, at zero cost per position. Against an untuned AdamW rate, and with the weight norm tripling — [2026-08-07](journal/2026-08-07-muon-curve.md) |
+| **a behavioural landmark overstates a rate gain** | the 25 %-decisive crossing reads **3.5×** for muon where the Elo curve reads **1.4×**, because the landmark fires at Elo ≈ 30, inside the transient. E0's 2.7–3.0× on `n = 64 → n = 128` is the same measurement and carries the same optimism until it is re-read against an Elo curve. ⚠️ The landmark also has an early false crossing at ~generation 20 in every run; take the **last** up-crossing |
 | **the repetition problem was a symptom, not a cause** | threefold fell **82.8 % → 4.6 %** of terminations over `t12h-n128` with no change to the inputs. E2's representation gap is real but it was not what capped the previous runs — the search simply stopped needing a draw |
 | **game length and the ply cap are settled at n=128** | mean plateaus at ~180 plies, the cap fires on **0.50 %** and is flat. `--max-plies 512` is comfortable; `--mean-plies 250` is the right buffer sizing, since `window_games` binds first |
 | **the gradient is well behaved at n=128** | `grad_norm` settles at ~0.33 and stays, saturation 0.0000 throughout, `--grad-clip 5.0` fires 16.7 % in the transient and 0 % after. Contrast `t4h-n64`: monotone collapse to 0.19, and a 1.0 clip firing on 99 % of the first 300 steps — an implicit lr schedule rather than a safety net. ⚠️ `weight_norm` drifts +5 % at `adam_wd = 0.01`, flat at 0.1; watch over 24 h |

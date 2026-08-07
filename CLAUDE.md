@@ -87,6 +87,7 @@ is the plan and the open decisions, and `docs/journal/` is how each row was reac
 | D0, D1 | notation, rule suites, layer 0, puzzles | layer 0 = 31.7 s per checkpoint |
 | D2 | the league and the curve, `eval/{match,elo,league,curve}.py` | 56 checks; three curves measured |
 | E0 | **sims per target is a first-order lever**, `docs/roadmap.md` Track E | n=128 reaches the landmark on **2.7-3.0× fewer positions**; slope 25 → 332 Elo/decade |
+| E-muon | **the optimiser is free Elo/h**, `docs/journal/2026-08-07-muon-curve.md` | Muon+Polar: **+143 ± 26 Elo at step 1905**, **~1.4× less wall clock** to any rating 200-400. ⚠️ vs an unscreened AdamW rate; `weight_norm` 109 → 369 |
 | — | the debugger, the AGZ oracle, `docs/journal/2026-07-30-fidelity.md` | trees agree exactly at n=512 |
 
 Four traps belonging to no single component, each with its story in `docs/ledger/state.md`:

@@ -13,6 +13,7 @@ entry records what was true when it was written. Neither is a bug.
 
 | date | entry | what it settles |
 |---|---|---|
+| 2026-08-08 | [PCR, and a scale that can hold a second axis](2026-08-08-pcr-and-the-rebased-scale.md) | playout cap randomisation is **+36 ± 70 Elo at equal wall clock** and 3.7-6.0× on positions, of which 3.24× is the record rate coming back out; and the rebased league measures the other axis for the first time — **search is worth −9 Elo/doubling to an untrained net and +155 to a trained one**, and Gate 2's slope is +408/+703/+793 per decade at n = 16/64/256 |
 | 2026-08-07 | [E1.1 from checkpoints that already existed](2026-08-07-e11-sims-256.md) | `sims = 256` is worth **+275 ± 67 Elo at equal positions** and 1.75× on the clock — measured against the only run it can be compared to without also moving the root sweep and node collapse |
 | 2026-08-07 | [Muon on the curve](2026-08-07-muon-curve.md) | the first Elo measurement of an optimiser here: **+143 ± 26 Elo at step 1905, ~1.4× less wall clock to the same rating**, against an AdamW whose rate was never re-screened; and a weight norm that triples |
 | 2026-07-31 | [Building D2: the league](2026-07-31-d2-league.md) | why the league has no opening book, the lockstep trick that made it 1× the encoder instead of 2×, and the self-match identity that made it testable on a CPU |

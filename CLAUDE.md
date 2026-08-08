@@ -49,6 +49,10 @@ distillation through a one-bit channel and looks like good practice.
   **Cleared 2026-07-30: 56 996 useful evals/s at n=800, B=4096** (`bench_search.py`,
   `logs/gate1a.log`, `docs/ledger/perf.md`). **Gate 2 (science)**: beat AlphaGateau
   (~2100 Elo) with an Elo slope matching Jones' law (+500 Elo per 10× compute).
+  ⚠️ **The slope depends on the evaluation budget** (measured 2026-08-08: +408/+703/+793
+  per decade at n = 16/64/256), so a Gate 2 claim without its `n` is not a claim. And
+  the *level* half is unmeasurable today — `evaluation.md` §6 calibration has never run,
+  so nothing maps self-anchored Elo to a published scale.
 
 ## Layout
 ```
@@ -88,6 +92,8 @@ is the plan and the open decisions, and `docs/journal/` is how each row was reac
 | D2 | the league and the curve, `eval/{match,elo,league,curve}.py` | 56 checks; three curves measured |
 | E0 | **sims per target is a first-order lever**, `docs/roadmap.md` Track E | n=128 reaches the landmark on **2.7-3.0× fewer positions**; slope 25 → 332 Elo/decade |
 | E-muon | **the optimiser is free Elo/h**, `docs/journal/2026-08-07-muon-curve.md` | Muon+Polar: **+143 ± 26 Elo at step 1905**, **~1.4× less wall clock** to any rating 200-400. ⚠️ vs an unscreened AdamW rate; `weight_norm` 109 → 369 |
+| E1.2 | **PCR works, modestly**, `docs/journal/2026-08-08-pcr-and-the-rebased-scale.md` | `t12h-pcr`: **+36 ± 70 Elo at equal wall clock**, 3.7-6.0× on positions — ⚠️ of which 3.24× is just the record rate; net **1.14-1.85×** |
+| E-search | **the evaluation budget is an axis, not a constant** — league rebased on random play, `evaluation.md` §5.1a | search is **−9 Elo/doubling untrained, +155 trained**; ⚠️ Gate 2's slope is **+408/+703/+793 per decade at n = 16/64/256** |
 | — | the debugger, the AGZ oracle, `docs/journal/2026-07-30-fidelity.md` | trees agree exactly at n=512 |
 
 Four traps belonging to no single component, each with its story in `docs/ledger/state.md`:

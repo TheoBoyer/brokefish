@@ -240,7 +240,7 @@ clear their own cost factor.
 | | what | source | cost |
 |---|---|---|---|
 | **E1.1** | ✅ **Answered 2026-08-07 from `t24h-n256`, which had already run** — [the entry](journal/2026-08-07-e11-sims-256.md). Against `t12h-n128`, its only unconfounded partner (same search generation, 3.7 % apart in steps): **+275 ± 67 Elo at equal positions**, −311 head to head, and the landmark at **0.79 M positions / 1.02 h against 2.68 M / 1.79 h** — **3.4× samples, 1.75× wall clock**, clearing the break-even bar below. ⚠️ Both nets predate the root terminal sweep *and* node collapse, which is what makes them comparable and probably also what makes the gap this large: §6.1a and §6.6a buy a low-sim search part of what more sims buys. On current code the gain can only be smaller, by an unmeasured amount. The original plan follows. **`sims = 256`.** Two points on this curve both moved hard; this is the third. ⚠️ It costs 2× per position, so on the real axis it must reach the landmark **under 1.80 h** — i.e. under ~1.41 M positions against n=128's 2.69 M, a **1.9× sample-efficiency gain merely to break even**. The previous doubling gave 2.7×. If this one gives under 1.9× the lever has saturated and the track's weight moves to E1.2/E1.4/E1.5 | ours, E0 | one run |
-| **E1.2** | **paid, but cheaply** — **Playout cap randomisation.** Large `N` on a proportion `p` of turns, a small `n` on the rest. ⚠️ **Corrected 2026-08-07 against the primary text**: *"Only turns with a full search are recorded for training"* — the cheap turns are **not** recorded, for value or for anything else. The value target gains **indirectly**, because the same compute plays more games and the outcome is *"one noisy binary result per entire game"*. An earlier draft of this row said the cheap turns feed the value target; they do not. Their main run: `p = 0.25`, `(N, n) = (600, 100)`, annealed to `(1000, 200)` after two days, **Dirichlet noise and every explorative setting disabled on the fast searches** | KataGo §3.1; ablation Table 2: removing it costs **1.37×**, over fixed N ∈ {100,150,200,250,600} | 🔨 **Built 2026-08-07**, `training.md` §15, off by default (`--pcr-p 0`). ⚠️ §11's "five lines" was correctness only — the encoder evaluates all `B` staged leaves every simulation, so a batch holding mixed budgets **costs the maximum, not the mean**, and per-board throughput is flat from 4096 boards down to 128, so sorting the batch buys nothing either. The budget is therefore **tied across the batch, per move**. Three further things it turned out to need, none of them in the seam: `self_play_move` must own the iteration count as well as `budget`; §4's value rule had to stop counting positions in the pending block and read the side to move instead, since the recorded plies are now sparse; and `buffer.append` must still **close** games on an unrecorded turn, or the ~70 % of games that end on one leak their records into the next game's result — silent. First run: `t12h-pcr`, p = 0.3, (N, n) = (256, 64), mean 121.6 sims/move measured |
+| **E1.2** | ✅ **Measured 2026-08-08**, [the entry](journal/2026-08-08-pcr-and-the-rebased-scale.md). `t12h-pcr`, `p = 0.3`, `(N, n) = (256, 64)`, mean 121.6 sims/move: **+36 ± 70 Elo at equal wall clock** against its uniform-`n=128` control, sign positive at all 10 matched steps, and **3.7-6.0× fewer positions to a rating**. ⚠️ Of that, **3.24× is the record rate coming straight back out** — the net advantage is **1.14-1.85×, declining with rating**. ⚠️ KataGo's 'more games are played' half is absent at our operating point, and that is our cost-matching choice (`0.475 N` against their `0.375 N`), not the method. A `p`/`(N,n)` sweep is the open ablation. The original entry follows. **paid, but cheaply** — **Playout cap randomisation.** Large `N` on a proportion `p` of turns, a small `n` on the rest. ⚠️ **Corrected 2026-08-07 against the primary text**: *"Only turns with a full search are recorded for training"* — the cheap turns are **not** recorded, for value or for anything else. The value target gains **indirectly**, because the same compute plays more games and the outcome is *"one noisy binary result per entire game"*. An earlier draft of this row said the cheap turns feed the value target; they do not. Their main run: `p = 0.25`, `(N, n) = (600, 100)`, annealed to `(1000, 200)` after two days, **Dirichlet noise and every explorative setting disabled on the fast searches** | KataGo §3.1; ablation Table 2: removing it costs **1.37×**, over fixed N ∈ {100,150,200,250,600} | 🔨 **Built 2026-08-07**, `training.md` §15, off by default (`--pcr-p 0`). ⚠️ §11's "five lines" was correctness only — the encoder evaluates all `B` staged leaves every simulation, so a batch holding mixed budgets **costs the maximum, not the mean**, and per-board throughput is flat from 4096 boards down to 128, so sorting the batch buys nothing either. The budget is therefore **tied across the batch, per move**. Three further things it turned out to need, none of them in the seam: `self_play_move` must own the iteration count as well as `budget`; §4's value rule had to stop counting positions in the pending block and read the side to move instead, since the recorded plies are now sparse; and `buffer.append` must still **close** games on an unrecorded turn, or the ~70 % of games that end on one leak their records into the next game's result — silent. First run: `t12h-pcr`, p = 0.3, (N, n) = (256, 64), mean 121.6 sims/move measured |
 | **E1.3** | **free** — **Forced playouts + policy target pruning.** `n_forced(c) = (k·P(c)·ΣN(c'))^½`, k=2, PUCT set to ∞ until met; then subtract those playouts from the *target* unless the move proved good | KataGo §3.2, ablated as NoForcedTP. ⚠️ Their motivation is our FPU bug stated in general form: *"even if a Dirichlet noise move was good, its initial evaluation might be negative, preventing further search"* | medium |
 | **E1.4** | **free** — **Auxiliary policy target** — predict the **opponent's next** policy, `w_opp = 0.15` | KataGo §4.1: *"modest but clear benefit… nearly costless… deserves attention"*. **Fully game-agnostic**, unlike ownership and score | low |
 | **E1.5** | **free** — **Moves-left head** | lc0 ships one with its own loss weight; it is the chess analogue of E1.4 on the value side | low |
@@ -267,6 +267,32 @@ of the data.
 Cheapest faithful step: total move count as one embedding table (parallel to
 `emb_clock`), plus the last move as two 64-row per-board tables. The full `T = 8` is
 256 tokens and a real architecture change.
+
+### E-search. The other axis, measured 2026-08-08
+
+Not a Track E row when it was written, because the league had no way to express it: the
+evaluation budget was a league-wide constant and therefore a hidden term in the scale.
+`evaluation.md` §5.1a made a player a `(network, budget)` pair, and the first grid says:
+
+| network | Elo per doubling of search |
+|---|---:|
+| untrained | **−9** |
+| `t12h-pcr@101` | +13 |
+| `@1202` | +125 |
+| `@2206` → `@4213` | **+152 to +156** |
+
+**Search is worth nothing until the network can use it**, then ~+155 Elo/doubling, and it
+plateaus by step ~2200. Past that point **quadrupling the search beats any amount of
+training the 12 h run reached** at `n = 64`, which tops out at +1050 against +1323 at
+`n = 256`.
+
+⚠️ **Gate 2's slope is a function of the evaluation budget**: **+408 / +703 / +793** Elo
+per decade at `n = 16 / 64 / 256`. It clears +500 at 64 and 256 and **fails at 16**. Every
+Gate 2 claim now has to carry its `n`, and D5's preregistration already requires it.
+
+⚠️ **`roadmap` E2's premise needs re-measuring before it is acted on.** Its case rests on
+*"threefold is 45-85 % of how our games end"*; in `t12h-pcr` that ended at **5.7 %** with
+the decisive rate at 82.5 %.
 
 ### E3. The exchange rate — compute per sample, not samples
 

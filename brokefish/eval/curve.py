@@ -281,7 +281,12 @@ def plot(report: dict, path: str) -> Optional[str]:
         ax.errorbar(xs, ys, yerr=es, marker="o" if dense else "s", ms=3,
                     lw=1.4 if dense else 1.0, ls="-" if dense else "--",
                     capsize=2, label=tag)
-    ax.set_xscale("log")
+    # ⚠️ **Linear**, which is what every plot in this repository has used. A log x was
+    # tried on 2026-08-08 and reverted: the run spans 1 146 s to 41 587 s, i.e. 1.6
+    # decades, so a log axis gives half the plot width to the first tenth of the run —
+    # the noisy, uninteresting part — and compresses the part anybody is reading it
+    # for. The Elo-per-decade slope does not need the axis to be logarithmic; it is
+    # fitted on `log10(cost)` regardless and printed in the legend.
     ax.axhline(0.0, lw=0.8, ls="--", color="grey")
     ax.set_xlabel(label)
     ax.set_ylabel("Elo (self-anchored, 0 = uniformly random legal play)")

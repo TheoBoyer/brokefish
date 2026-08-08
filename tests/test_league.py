@@ -1092,3 +1092,82 @@ def _pool_with(tmp_path, steps, sims, ladder=(), grid=(), grid_points=0):
     return league_mod.build_pool(
         ["r"], checkpoint_dir=str(tmp_path), anchor_path=str(tmp_path / "anchor.pt"),
         limit=None, sims=sims, ladder=ladder, grid=grid, grid_points=grid_points)
+
+
+# --------------------------------------------------------------------------- #
+# §5.1a — presenting three quantities without lying about two of them
+# --------------------------------------------------------------------------- #
+
+def _budget_report():
+    """One run at three budgets, plus the untrained ladder.
+
+    ⚠️ **The grid is on a *subset* of the checkpoints**, which is the real shape: the
+    reference budget is rated at every checkpoint and the others at a handful. That
+    asymmetry is exactly what makes a pooled fit wrong, and a fixture with the grid
+    everywhere is symmetric enough that pooling accidentally gives the right answer.
+    """
+    def row(cid, step, sims, secs, elo, run=""):
+        return {"checkpoint_id": cid, "run": run, "step": step, "n_sims": sims,
+                "training_seconds": secs, "euros_spent": 0.0, "elo": elo,
+                "ci95": 10.0, "games_played": 36, "draw_rate": 0.2}
+    curve = [row("random", 0, 0, 0.0, 0.0)]
+    curve += [row(f"init:n{k}", 0, k, 0.0, 40.0) for k in (1, 16, 64)]
+    for step, secs, base in ((100, 1e3, 100.0), (1000, 1e4, 400.0), (10000, 1e5, 700.0)):
+        budgets = ((16, -80.0), (64, 0.0), (256, 120.0)) if step > 100 else ((64, 0.0),)
+        for k, bump in budgets:
+            curve.append(row(f"r@{step}:n{k}", step, k, secs, base + bump, run="r"))
+    return {"config": {"n_sims": 64, "budgets": [0, 1, 16, 64, 256]}, "curve": curve,
+            "fit": {"anchor": "random"}}
+
+
+class TestTheCurvePresentsBothAxes:
+
+    def test_a_series_is_a_run_at_one_budget(self):
+        """⚠️ Grouping by run alone mixes budgets: the x repeats and the line zigzags."""
+        keys = {k for k, _ in curve_mod.group_by_series(_budget_report())}
+        assert keys == {("r", 16), ("r", 64), ("r", 256)}
+        for _k, rows in curve_mod.group_by_series(_budget_report()):
+            xs = [r["training_seconds"] for r in rows]
+            assert len(set(xs)) == len(xs), "a series must not repeat its x"
+
+    def test_the_training_slope_is_never_fitted_across_budgets(self):
+        """The number this protects: points at different budgets differ in *search*,
+        so a least squares through them is not Elo per decade of training at all —
+        and nothing about the result would look wrong."""
+        report = _budget_report()
+        per_series = {k: curve_mod.slope_per_decade(report, rows)
+                      for k, rows in curve_mod.group_by_series(report)}
+        # Each budget gained exactly 300 Elo over one decade of training, by construction.
+        for k, slope in per_series.items():
+            assert slope == pytest.approx(300.0), k
+        # Pooling the run's nine points instead gives a different, meaningless number.
+        pooled = curve_mod.slope_per_decade(
+            report, [r for r in report["curve"] if r["run"] == "r"])
+        assert abs(pooled - 300.0) > 1.0, \
+            "the pooled fit happens to agree here; the fixture no longer bites"
+
+    def test_the_search_axis_is_the_transpose_and_holds_the_net_fixed(self):
+        levels = dict(curve_mod.by_training_level(_budget_report()))
+        assert set(levels) == {("init", 0), ("r", 1000), ("r", 10000)}
+        for (_run, _step), rows in levels.items():
+            assert len({r["checkpoint_id"].split(":")[0] for r in rows}) == 1, \
+                "a search-value series must be ONE network at several budgets"
+            assert [r["n_sims"] for r in rows] == sorted(r["n_sims"] for r in rows)
+
+    def test_elo_per_doubling_of_search(self):
+        levels = dict(curve_mod.by_training_level(_budget_report()))
+        # -80 at 16, 0 at 64, +120 at 256: 200 Elo over 4 doublings on the log2 fit.
+        assert curve_mod.elo_per_doubling(levels[("r", 1000)]) == pytest.approx(50.0)
+        assert curve_mod.elo_per_doubling(levels[("init", 0)]) == pytest.approx(0.0)
+
+    def test_the_random_player_is_not_a_point_on_the_search_axis(self):
+        """`random` has no network and no budget to vary; a 0 on a log2 axis is not
+        a point, it is negative infinity."""
+        for (_run, _step), rows in curve_mod.by_training_level(_budget_report()):
+            assert all(r["n_sims"] > 0 for r in rows)
+
+    def test_the_png_is_written_with_both_panels(self, tmp_path):
+        path = curve_mod.plot(_budget_report(), str(tmp_path / "c.png"))
+        if path is None:
+            pytest.skip("matplotlib is not installed")
+        assert os.path.getsize(path) > 5000

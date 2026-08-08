@@ -125,6 +125,10 @@ def group_by_run(report: dict) -> List[Tuple[str, List[dict]]]:
 
     ⚠️ The anchor is in every run's graph and is pinned at Elo 0, so folding it into
     one run's least squares would drag that run's intercept and nobody else's.
+
+    ⚠️ **Since §5.1a this is not a plottable series.** A run now holds several search
+    budgets, and a "run" group mixes them: several points share an x and the line
+    zigzags between budgets. Use :func:`group_by_series`.
     """
     out: dict = {}
     for r in curve_rows(report):
@@ -132,6 +136,62 @@ def group_by_run(report: dict) -> List[Tuple[str, List[dict]]]:
         if run:
             out.setdefault(run, []).append(r)
     return list(out.items())
+
+
+def group_by_series(report: dict) -> List[Tuple[Tuple[str, int], List[dict]]]:
+    """`((run, sims), rows)` — the unit that is actually a curve.
+
+    §5.1a made a player a `(network, budget)` pair, so a training curve is a run **at
+    one budget**. Grouping by run alone puts three budgets on one line: the x-axis
+    repeats, the line zigzags, and — much worse — `slope_per_decade` fits a straight
+    line through points that differ in search rather than in training and reports the
+    result as Elo per decade of *compute*. That number would be wrong and would look
+    entirely normal.
+    """
+    out: dict = {}
+    for r in curve_rows(report):
+        run = row_run(r)
+        if run:
+            out.setdefault((run, r.get("n_sims")), []).append(r)
+    return list(out.items())
+
+
+def by_training_level(report: dict) -> List[Tuple[Tuple[str, int], List[dict]]]:
+    """`((run, step), rows sorted by budget)` for the checkpoints rated at 2+ budgets.
+
+    The transpose of :func:`group_by_series`, and the view that answers the question
+    the budget grid exists for: **does search get more or less valuable as the network
+    trains?** Each series is one network, held exactly fixed, at several budgets, so
+    its slope is Elo per doubling of search and nothing else.
+
+    The untrained ladder is included as the `("init", 0)` level, because "what is
+    search worth to a network that knows nothing" is the left-hand end of that curve.
+    """
+    out: dict = {}
+    for r in report.get("curve", []):
+        cid = r.get("checkpoint_id", "")
+        if r.get("elo") is None or r.get("n_sims") in (None, 0):
+            continue
+        key = (row_run(r), r.get("step", 0)) if row_run(r) else ("init", 0)
+        if key[0] == "init" and not cid.startswith("init"):
+            continue                       # `random` has no budget to vary
+        out.setdefault(key, []).append(r)
+    return [(k, sorted(v, key=lambda r: r["n_sims"]))
+            for k, v in out.items() if len(v) >= 2]
+
+
+def elo_per_doubling(rows: Sequence[dict]) -> Optional[float]:
+    """Least squares of Elo on `log2(sims)` — the value of a doubling of search."""
+    pts = [(math.log2(r["n_sims"]), r["elo"]) for r in rows
+           if r.get("n_sims") and r.get("elo") is not None]
+    if len(pts) < 2:
+        return None
+    mx = sum(x for x, _ in pts) / len(pts)
+    my = sum(y for _, y in pts) / len(pts)
+    sxx = sum((x - mx) ** 2 for x, _ in pts)
+    if sxx <= 0.0:
+        return None
+    return sum((x - mx) * (y - my) for x, y in pts) / sxx
 
 
 def slope_per_decade(report: dict, rows: Optional[Sequence[dict]] = None) -> Optional[float]:
@@ -161,7 +221,28 @@ def slope_per_decade(report: dict, rows: Optional[Sequence[dict]] = None) -> Opt
 
 
 def plot(report: dict, path: str) -> Optional[str]:
-    """A PNG of the curve, if matplotlib is here. Returns the path, or None."""
+    """A PNG of the curve, if matplotlib is here. Returns the path, or None.
+
+    **Two panels sharing the Elo axis, and the reason is not aesthetic.** Elo,
+    training cost and search budget are three quantities, and the tempting move —
+    collapse them onto one axis of "total compute" — is wrong here: training is a
+    one-off cost and simulations are a *recurring* cost paid per move by whoever runs
+    the thing, so adding them requires assuming how many games will ever be played.
+    Nothing in this project fixes that number. So they stay on separate axes.
+
+    * **Left: Elo against training cost, one line per budget.** The vertical distance
+      between two lines at the same x *is* the Elo value of the extra search, read
+      directly off the plot. Each line is one `(run, budget)` series, which is the
+      only grouping whose slope is Elo per decade of *training*.
+    * **Right: Elo against simulations, one line per training level.** Whether those
+      lines fan out or converge as training proceeds is the question the budget grid
+      exists to answer — is search worth more or less to a sharper policy? The left
+      panel cannot show it, because there the budget is the *series* and not the axis.
+
+    ⚠️ Contours of Elo over `(training, sims)` were considered and rejected: the grid
+    is a handful of checkpoints at a handful of budgets, and a contour drawn through
+    it would render interpolation as if it were measurement.
+    """
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -169,32 +250,66 @@ def plot(report: dict, path: str) -> Optional[str]:
     except Exception:
         return None
 
-    groups = [(run, [r for r in rs if r.get("elo") is not None])
-              for run, rs in group_by_run(report)]
-    groups = [(run, rs) for run, rs in groups if rs]
-    if not groups:
+    series = [((run, sims), [r for r in rs if r.get("elo") is not None])
+              for (run, sims), rs in group_by_series(report)]
+    series = [(k, rs) for k, rs in series if rs]
+    if not series:
         return None
     key = cost_axis(report)
     label = {"euros_spent": "training euros",
              "training_seconds": "training seconds (self-play + gradient)",
              None: "optimiser steps"}[key]
+    levels = by_training_level(report)
+    ncols = 2 if levels else 1
 
-    fig, ax = plt.subplots(figsize=(7, 4.5), dpi=140)
-    for run, rows in groups:
+    fig, axes = plt.subplots(1, ncols, figsize=(6.2 * ncols, 4.6), dpi=140,
+                             squeeze=False)
+    ax = axes[0][0]
+
+    # -- left: the training curve, one line per budget ---------------------- #
+    runs = sorted({run for (run, _), _ in series})
+    for (run, sims), rows in sorted(series, key=lambda kv: (kv[0][0], kv[0][1] or 0)):
         xs = [(r.get(key) if key else None) or r["step"] for r in rows]
         ys = [r["elo"] for r in rows]
         es = [r.get("ci95") or 0.0 for r in rows]
         sl = slope_per_decade(report, rows)
-        tag = run if sl is None else f"{run}  ({sl:+.0f} Elo/decade)"
-        ax.errorbar(xs, ys, yerr=es, marker="o", ms=3, lw=1, capsize=2,
-                    label=tag if len(groups) > 1 else None)
-    if len(groups) > 1:
-        ax.legend(fontsize=7)
+        name = f"{run} " if len(runs) > 1 else ""
+        tag = f"{name}n={sims}" + ("" if sl is None else f"  ({sl:+.0f} Elo/decade)")
+        # Dashed for the sparse grid budgets, solid for the reference: they carry
+        # five points against twenty-four and should not read as equally resolved.
+        dense = len(rows) > 8
+        ax.errorbar(xs, ys, yerr=es, marker="o" if dense else "s", ms=3,
+                    lw=1.4 if dense else 1.0, ls="-" if dense else "--",
+                    capsize=2, label=tag)
+    ax.set_xscale("log")
     ax.axhline(0.0, lw=0.8, ls="--", color="grey")
     ax.set_xlabel(label)
-    ax.set_ylabel("Elo (self-anchored, 0 = random init)")
-    ax.set_title(f"brokefish cost-vs-Elo, n = {report.get('config', {}).get('n_sims', '?')}")
+    ax.set_ylabel("Elo (self-anchored, 0 = uniformly random legal play)")
+    ax.set_title("training cost")
+    ax.legend(fontsize=7)
     ax.grid(alpha=0.3)
+
+    # -- right: the value of search, one line per training level ------------ #
+    if levels:
+        ax2 = axes[0][1]
+        for (run, step), rows in sorted(levels, key=lambda kv: kv[0][1]):
+            xs = [r["n_sims"] for r in rows]
+            ys = [r["elo"] for r in rows]
+            es = [r.get("ci95") or 0.0 for r in rows]
+            d = elo_per_doubling(rows)
+            tag = ("untrained" if run == "init" else f"step {step}")
+            tag += "" if d is None else f"  ({d:+.0f}/2x)"
+            ax2.errorbar(xs, ys, yerr=es, marker="o", ms=3, lw=1.2, capsize=2, label=tag)
+        ax2.set_xscale("log", base=2)
+        ax2.axhline(0.0, lw=0.8, ls="--", color="grey")
+        ax2.set_xlabel("simulations per move (inference)")
+        ax2.set_title("value of search, network held fixed")
+        ax2.legend(fontsize=7)
+        ax2.grid(alpha=0.3)
+        ax2.set_ylim(ax.get_ylim())
+
+    fig.suptitle("brokefish: Elo against training cost and against search budget, "
+                 "one Bradley-Terry fit", fontsize=9)
     fig.tight_layout()
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     fig.savefig(path)
@@ -212,19 +327,34 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     report = load_report(args.report)
     print(format_curve(report))
     axis = cost_axis(report)
-    groups = group_by_run(report)
+    groups = group_by_series(report)
     print()
-    # ⚠️ Per run, never pooled. A joint report puts several runs on one scale, and one
-    # least squares across them fits the envelope of two trajectories rather than
-    # either one's slope -- which is the quantity Gate 2 is about.
-    for run, rows in groups:
+    # ⚠️ Per run **and per budget**, never pooled. A joint report puts several runs on
+    # one scale, and one least squares across them fits the envelope of two
+    # trajectories rather than either one's slope -- which is the quantity Gate 2 is
+    # about. Since §5.1a the same is true across budgets, and worse: those points
+    # differ in *search*, so a slope through them is not Elo per decade of training at
+    # all, and nothing about the number would look wrong.
+    for (run, sims), rows in sorted(groups, key=lambda kv: (kv[0][0], kv[0][1] or 0)):
         slope = slope_per_decade(report, rows)
+        tag = f"{run} @ n={sims}"
         if slope is None:
-            print(f"  {run:<24} Elo per 10x compute: —  (no cost axis with spread)")
+            print(f"  {tag:<28} Elo per 10x training: —  (no cost axis with spread)")
         else:
-            print(f"  {run:<24} Elo per 10x compute: {slope:+.0f}  on {axis}   "
+            print(f"  {tag:<28} Elo per 10x training: {slope:+.0f}  on {axis}   "
                   f"Gate 2 wants +500 (CLAUDE.md)")
-    if len(groups) > 1:
+    levels = by_training_level(report)
+    if levels:
+        print()
+        print("  the other axis — Elo per doubling of *search*, network held fixed:")
+        for (run, step), rows in sorted(levels, key=lambda kv: kv[0][1]):
+            d = elo_per_doubling(rows)
+            budgets = "/".join(str(r["n_sims"]) for r in rows)
+            name = "untrained ladder" if run == "init" else f"{run}@{step}"
+            print(f"  {name:<28} {d:+.0f} per 2x   over n = {budgets}")
+        print("  ⚠️ inference cost is recurring and training cost is one-off; they are")
+        print("     not added here, because nothing fixes how many games get played.")
+    if len({run for (run, _), _ in groups}) > 1:
         print("  one Bradley-Terry fit, so these ratings are comparable across runs")
     if args.csv:
         write_csv(report, args.csv)

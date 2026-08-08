@@ -1171,3 +1171,34 @@ class TestTheCurvePresentsBothAxes:
         if path is None:
             pytest.skip("matplotlib is not installed")
         assert os.path.getsize(path) > 5000
+
+
+class TestRunEndpointsAlwaysMeet:
+    """⚠️ Two runs of different lengths do not finish next to each other in a
+    step-ordered calendar, so the pairing the joint league exists for can be missing."""
+
+    def test_the_two_finals_play_at_every_shared_budget(self, tmp_path):
+        for s in (100, 4000, 8000):
+            (tmp_path / f"long-{s:06d}.pt").write_bytes(b"")
+        for s in (100, 2000, 4000):
+            (tmp_path / f"short-{s:06d}.pt").write_bytes(b"")
+        (tmp_path / "anchor.pt").write_bytes(b"x")
+        pool = league_mod.build_pool(
+            ["long", "short"], checkpoint_dir=str(tmp_path),
+            anchor_path=str(tmp_path / "anchor.pt"), limit=None, sims=64,
+            ladder=(64,), grid=(256,), grid_points=3)
+        idx = {p.name: i for i, p in enumerate(pool)}
+        got = set(league_mod.endpoint_pairs(pool))
+        for k in (64, 256):
+            a, b = idx[f"long@8000:n{k}"], idx[f"short@4000:n{k}"]
+            assert (min(a, b), max(a, b)) in got, f"the two finals never meet at n={k}"
+
+    def test_the_ladder_and_the_anchor_are_not_endpoints(self, tmp_path):
+        for s in (100, 400):
+            (tmp_path / f"r-{s:06d}.pt").write_bytes(b"")
+        (tmp_path / "anchor.pt").write_bytes(b"x")
+        pool = league_mod.build_pool(
+            ["r"], checkpoint_dir=str(tmp_path), anchor_path=str(tmp_path / "anchor.pt"),
+            limit=None, sims=64, ladder=(1, 64))
+        # One run has nobody to meet, and `random`/`init` belong to no run.
+        assert league_mod.endpoint_pairs(pool) == []

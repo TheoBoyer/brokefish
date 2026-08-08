@@ -466,6 +466,37 @@ class _Log:
             self.fh.close()
 
 
+def endpoint_pairs(pool: Sequence[PoolEntry]) -> List[Tuple[int, int]]:
+    """Each run's last checkpoint against every other run's, at each shared budget.
+
+    ⚠️ **The SAI calendar orders by step, and two runs of different lengths do not
+    finish next to each other.** Rating `t24h-fp8` (8 416 steps) beside `t12h-pcr`
+    (4 213) put their final checkpoints 14 indices apart, and the largest offset is
+    12 — so the one pairing the league was commissioned to resolve, "which run ends
+    stronger", had no edge at all and would have been answered through a chain of
+    intermediates. That is precisely what §5.2 says not to do.
+
+    Adding an edge can only help: a global Bradley-Terry fit is not biased by extra
+    games, it is sharpened where they are played.
+    """
+    best: Dict[Tuple[str, int], Tuple[int, int]] = {}
+    for i, e in enumerate(pool):
+        if not e.run:
+            continue
+        key = (e.run, e.sims)
+        if key not in best or e.step > best[key][0]:
+            best[key] = (e.step, i)
+    by_budget: Dict[int, List[int]] = {}
+    for (_run, sims), (_step, i) in best.items():
+        by_budget.setdefault(sims, []).append(i)
+    out = set()
+    for idx in by_budget.values():
+        for a in range(len(idx)):
+            for b in range(a + 1, len(idx)):
+                out.add((min(idx[a], idx[b]), max(idx[a], idx[b])))
+    return sorted(out)
+
+
 @torch.no_grad()
 def run_league(pool: Sequence[PoolEntry], games: int = 36, n_sims: int = 64,
                opening_plies: int = 8, max_plies: int = 512,
@@ -501,8 +532,10 @@ def run_league(pool: Sequence[PoolEntry], games: int = 36, n_sims: int = 64,
     # Two calendars unioned: SAI's step schedule, and the same-network budget edges
     # that are the only direct read of §5.1a's axis.
     ladder_pairs = budget_ladder_pairs(pool)
+    end_pairs = endpoint_pairs(pool)
     pairs = sorted(set(sai_pairings(n, offsets=offsets, anchor_every=anchor_every,
-                                    anchor_span=anchor_span)) | set(ladder_pairs))
+                                    anchor_span=anchor_span))
+                   | set(ladder_pairs) | set(end_pairs))
     openings, opening_control = random_openings(games // 2, plies=opening_plies,
                                                 seed=seed, device=device)
     budgets = sorted({e.sims for e in pool})
@@ -513,7 +546,8 @@ def run_league(pool: Sequence[PoolEntry], games: int = 36, n_sims: int = 64,
 
     log(f"  pool     {n} players, {pool[0].name} .. {pool[-1].name}")
     log(f"  calendar {len(pairs)} pairings x {games} games = {len(pairs) * games} games"
-        f"  ({len(ladder_pairs)} of them same-network budget edges)")
+        f"  ({len(ladder_pairs)} same-network budget edges, "
+        f"{len(end_pairs)} run-endpoint edges)")
     log(f"  openings {games // 2} distinct, {opening_plies} random legal plies")
     log(f"  budgets  {budgets} sims (0 = uniformly random legal play, the zero of the "
         f"scale); reference {n_sims}; batch = {games // 2} games per half")
@@ -582,7 +616,7 @@ def run_league(pool: Sequence[PoolEntry], games: int = 36, n_sims: int = 64,
                    "opening_plies": opening_plies, "max_plies": max_plies,
                    "offsets": list(offsets), "anchor_every": anchor_every,
                    "anchor_span": anchor_span, "budgets": budgets,
-                   "budget_edges": len(ladder_pairs),
+                   "budget_edges": len(ladder_pairs), "endpoint_edges": len(end_pairs),
                    "pairing_equivalents": units,
                    "impl": impl, "search_impl": search_impl, "seed": seed,
                    "prior": prior, "pairings": len(pairs),

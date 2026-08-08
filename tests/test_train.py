@@ -1163,3 +1163,79 @@ def test_a_pcr_phase_stores_only_the_full_turns(tmp_path):
     # is the same as a uniform run's -- which is what makes the two comparable.
     assert Trainer.steps_owed(trainer, play["records_added"]) >= 0
     trainer.log.close()
+
+
+# --------------------------------------------------------------------------- #
+# §11a, the annealed cap
+# --------------------------------------------------------------------------- #
+
+class TestTheSimsSchedule:
+
+    def test_the_caps_change_at_the_stated_training_second(self):
+        cfg = TrainConfig(n_sims=512, pcr_p=0.3, pcr_fast_sims=64,
+                          sims_schedule=((0.0, 256, 64), (21600.0, 512, 128)))
+        assert cfg.caps_at(0.0) == (256, 64)
+        assert cfg.caps_at(21599.9) == (256, 64)
+        assert cfg.caps_at(21600.0) == (512, 128)
+        assert cfg.caps_at(10 ** 9) == (512, 128)
+
+    def test_an_empty_schedule_is_the_fixed_cap(self):
+        cfg = TrainConfig(n_sims=256, pcr_fast_sims=64)
+        assert cfg.caps_at(0.0) == (256, 64) == cfg.caps_at(10 ** 6)
+
+    @pytest.mark.parametrize("spec,want", [
+        ("0:256/64", ((0.0, 256, 64),)),
+        ("0:256/64,21600:512/128", ((0.0, 256, 64), (21600.0, 512, 128))),
+        (None, ()),
+        ("", ()),
+    ])
+    def test_the_spec_parses(self, spec, want):
+        from brokefish.train.loop import parse_sims_schedule
+        assert parse_sims_schedule(spec) == want
+
+    @pytest.mark.parametrize("spec,match", [
+        ("256/64", "SECONDS:N/n"),
+        ("0:256", "SECONDS:N/n"),
+        ("0:x/64", "SECONDS:N/n"),
+        ("600:256/64", "must start at 0"),
+    ])
+    def test_a_mistyped_schedule_raises_rather_than_becoming_no_schedule(self, spec, match):
+        """⚠️ A spec that silently degrades to 'fixed cap' is a 12 h run that answers
+        the wrong question and looks completely normal while doing it."""
+        from brokefish.train.loop import parse_sims_schedule
+        with pytest.raises(ValueError, match=match):
+            parse_sims_schedule(spec)
+
+    def test_n_sims_is_raised_to_the_largest_stage(self):
+        """`n_sims` allocates the node pool for the whole run, so a schedule that
+        anneals past it would overrun the tree six hours in."""
+        from brokefish.train.loop import build_parser, config_from_args
+        args = build_parser().parse_args(
+            ["--run", "x", "--sims", "256", "--pcr-p", "0.3",
+             "--sims-schedule", "0:256/64,21600:512/128"])
+        cfg = config_from_args(args)
+        assert cfg.n_sims == 512 and cfg.pcr_fast_sims == 64
+
+    @pytest.mark.parametrize("sched,match", [
+        (((0.0, 256, 64), (100.0, 512, 600)), "n <= N"),
+        (((0.0, 256, 64), (100.0, 999, 128)), "n_sims"),
+        (((0.0, 256, 64), (100.0, 512, 128), (50.0, 256, 64)), "increasing order"),
+    ])
+    def test_a_bad_schedule_is_refused_at_construction(self, tmp_path, sched, match):
+        with pytest.raises(ValueError, match=match):
+            _smoke_trainer(tmp_path, "sched", n_sims=512, pcr_p=0.5, pcr_fast_sims=8,
+                           moves_per_phase=4, sims_schedule=sched)
+
+    @pytest.mark.slow
+    def test_a_phase_uses_the_scheduled_caps_and_logs_them(self, tmp_path):
+        trainer = _smoke_trainer(tmp_path, "sched2", n_sims=16, pcr_p=0.5,
+                                 pcr_fast_sims=2, moves_per_phase=4,
+                                 sims_schedule=((0.0, 4, 2), (1e-9, 16, 8)))
+        play = trainer.self_play_phase()
+        # `training_seconds` is 0 before the first phase, so stage 0 is what ran.
+        assert (play["full_sims"], play["fast_sims"]) == (4, 2)
+        assert play["sims_mean"] == pytest.approx(3.0)
+        play = trainer.self_play_phase()          # now past 1e-9 seconds
+        assert (play["full_sims"], play["fast_sims"]) == (16, 8)
+        assert play["sims_mean"] == pytest.approx(12.0)
+        trainer.log.close()

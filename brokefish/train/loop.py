@@ -117,6 +117,22 @@ class TrainConfig:
     # as `self_play/sims_mean` rather than assumed, because it is the cost axis.
     pcr_p: float = 0.0
     pcr_fast_sims: int = 64
+    # §11a. `(training_seconds, N, n)` in increasing order of the first field, the
+    # caps in force from that point on. Empty means the fixed `n_sims` /
+    # `pcr_fast_sims` above, which is every run before 2026-08-08.
+    #
+    # KataGo §3.1 anneals: *"we chose p = 0.25 and (N, n) = (600, 100) initially,
+    # annealing up to (1000, 200) after the first two days of training."* The
+    # independent argument is ours and is newer than the paper: measured
+    # 2026-08-08 over two runs, the Elo value of a doubling of search **grows with
+    # the network** -- +15 per 2x at step 101, +112 at 1405, +186 at 8416 -- so a
+    # cap that is right at the start is too small later, on both runs.
+    #
+    # ⚠️ Keyed on **training seconds** (`train.md` §10: self-play plus gradient),
+    # not on wall clock and not on steps. Wall clock would include the puzzle probe,
+    # which §10 deliberately keeps off the axis; steps would make the switch point
+    # move whenever the cadence did, and the thing being scheduled is a *cost*.
+    sims_schedule: Tuple[Tuple[float, int, int], ...] = ()
 
     # -- the buffer, §5
     window_games: int = 500_000
@@ -257,6 +273,24 @@ class TrainConfig:
         """§9: a resume under changed parameters fails loudly instead of hybridising."""
         blob = json.dumps(asdict(self), sort_keys=True, default=str).encode()
         return hashlib.blake2b(blob, digest_size=8).hexdigest()
+
+    def caps_at(self, training_seconds: float) -> Tuple[int, int]:
+        """`(N, n)` in force after this many training seconds — §11a's schedule.
+
+        ⚠️ **`n_sims` is the largest `N` the schedule will ever ask for**, because it
+        sizes the node pool (`n_max = N + 1`) and the path arrays for the *whole* run;
+        `self_play_move(sims=k)` may only go down from it. So a run that anneals
+        256 → 512 allocates for 512 from generation 1 and spends the first half not
+        using half of it. `config_from_args` raises `n_sims` to the schedule's maximum
+        rather than leaving that arithmetic to the caller.
+        """
+        full, fast = self.n_sims, self.pcr_fast_sims
+        for at, n_full, n_fast in self.sims_schedule:
+            if training_seconds >= at:
+                full, fast = n_full, n_fast
+            else:
+                break
+        return full, fast
 
     def lr_at(self, step: int) -> float:
         """Warmup, then either AGZ's step schedule or a cosine decay to ``lr_min``.
@@ -413,6 +447,17 @@ class Trainer:
                     f"pcr_fast_sims = {cfg.pcr_fast_sims} must sit in "
                     f"[1, n_sims = {cfg.n_sims}]: n_sims is the FULL cap under §11 and "
                     f"it is what sizes the node pool")
+            for at, n_full, n_fast in cfg.sims_schedule:
+                if not 1 <= n_fast <= n_full <= cfg.n_sims:
+                    raise ValueError(
+                        f"sims_schedule entry at {at} s asks for (N, n) = "
+                        f"({n_full}, {n_fast}); it must satisfy "
+                        f"1 <= n <= N <= n_sims = {cfg.n_sims}. n_sims is what "
+                        f"allocates the node pool, so no stage may exceed it")
+            ats = [a for a, _, _ in cfg.sims_schedule]
+            if ats != sorted(ats):
+                raise ValueError(f"sims_schedule must be in increasing order of "
+                                 f"training seconds, got {ats}")
             if round(cfg.pcr_p * cfg.moves_per_phase) < 1:
                 raise ValueError(
                     f"pcr_p = {cfg.pcr_p} over moves_per_phase = {cfg.moves_per_phase} "
@@ -498,6 +543,10 @@ class Trainer:
             self.search.stats.reset()
 
         full = self._pcr_schedule(moves)
+        # §11a, once per phase rather than per move: a phase is ~18 s of the axis the
+        # schedule is keyed on, so finer granularity would buy nothing and would make
+        # the caps change inside a phase whose counters are accumulated as one block.
+        n_full, n_fast = cfg.caps_at(self.training_seconds)
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         closed = 0
@@ -508,12 +557,11 @@ class Trainer:
             for m in range(moves):
                 self.search.reset_finished()
                 if full[m]:
-                    record = self.search.self_play_move()
-                    sims_total += cfg.n_sims
+                    record = self.search.self_play_move(sims=n_full)
+                    sims_total += n_full
                 else:
-                    record = self.search.self_play_move(sims=cfg.pcr_fast_sims,
-                                                        noise=False)
-                    sims_total += cfg.pcr_fast_sims
+                    record = self.search.self_play_move(sims=n_fast, noise=False)
+                    sims_total += n_fast
                 done, result = self._apply_ply_cap(record)
                 # ⚠️ Called on a cheap move too, with `store=False`. Skipping the call
                 # would leave every game that ends on a cheap move — most of them —
@@ -559,6 +607,10 @@ class Trainer:
         stats["records_stored"] = stored
         stats["full_moves"] = int(sum(full))
         stats["sims_mean"] = sims_total / max(moves, 1)
+        # §11a's caps as they actually were, so a schedule that failed to fire is
+        # visible in the log rather than inferred from a cost that moved.
+        stats["full_sims"] = n_full
+        stats["fast_sims"] = n_fast
         return stats
 
     def _pcr_schedule(self, moves: int) -> list:
@@ -1031,6 +1083,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "1/pcr_p without saying so")
     p.add_argument("--pcr-fast-sims", type=int, default=TrainConfig.pcr_fast_sims,
                    help="§11: the cheap cap, used on 1 - pcr_p of turns")
+    p.add_argument("--sims-schedule", default=None, metavar="SPEC",
+                   help="§11a: anneal the caps, as 'SECONDS:N/n,SECONDS:N/n' in "
+                        "**training seconds** (self-play + gradient, the curve's own "
+                        "x-axis -- not wall clock, which includes the puzzle probe). "
+                        "KataGo §3.1 anneals (600,100) -> (1000,200) after two days; "
+                        "e.g. '0:256/64,21600:512/128' doubles both at 6 h. "
+                        "⚠️ --sims is raised to the largest N automatically, because "
+                        "it allocates the node pool for the whole run")
     p.add_argument("--window-games", type=int, default=TrainConfig.window_games)
     p.add_argument("--mean-plies", type=int, default=TrainConfig.mean_plies)
     p.add_argument("--max-plies", type=int, default=TrainConfig.max_plies)
@@ -1123,6 +1183,34 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def parse_sims_schedule(spec: Optional[str]) -> Tuple[Tuple[float, int, int], ...]:
+    """``'0:256/64,21600:512/128'`` to §11a's tuple. ``None`` is the empty schedule.
+
+    Raises on anything it cannot read rather than falling back to a fixed cap: a
+    mistyped schedule that silently becomes "no schedule" is a twelve-hour run that
+    answers the wrong question and looks entirely normal while doing it.
+    """
+    if not spec:
+        return ()
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        try:
+            at, caps = part.split(":")
+            full, fast = caps.split("/")
+            out.append((float(at), int(full), int(fast)))
+        except ValueError as exc:
+            raise ValueError(
+                f"cannot read sims-schedule stage {part!r}: expected "
+                f"'SECONDS:N/n', e.g. '21600:512/128'") from exc
+    if out and out[0][0] != 0.0:
+        raise ValueError(
+            f"the first sims-schedule stage must start at 0 seconds, got {out[0][0]}; "
+            f"otherwise the caps before it are the --sims/--pcr-fast-sims defaults and "
+            f"the run has a stage nobody wrote down")
+    return tuple(out)
+
+
 def config_from_args(args) -> TrainConfig:
     cfg = TrainConfig(
         n_sims=args.sims, batch_games=args.games, moves_per_phase=args.moves_per_phase,
@@ -1144,7 +1232,20 @@ def config_from_args(args) -> TrainConfig:
         decay=args.decay, lr_min=args.lr_min,
         tau_plies=args.tau_plies, eps=args.eps, alpha=args.alpha,
         terminal_collapse=args.terminal_collapse, fp8=args.fp8,
-        pcr_p=args.pcr_p, pcr_fast_sims=args.pcr_fast_sims)
+        pcr_p=args.pcr_p, pcr_fast_sims=args.pcr_fast_sims,
+        sims_schedule=parse_sims_schedule(args.sims_schedule))
+    if cfg.sims_schedule:
+        # ⚠️ Raised here rather than validated, because `n_sims` is a tree allocation
+        # and not a training decision once a schedule exists: leaving it to the caller
+        # means a run that anneals to 512 with `--sims 256` dies at the switch, six
+        # hours in. The header prints what it became.
+        # ⚠️ **Set to the schedule's maximum, not `max(--sims, schedule)`.** The first
+        # version kept whichever was larger, so a schedule topping out at 512 run
+        # without an explicit `--sims` inherited the 800 default and allocated a
+        # 801-node pool for a run that never asks for more than 512 — a gigabyte of an
+        # 8 GB card, for nothing, silently. Once a schedule exists it *is* the caps.
+        cfg.n_sims = max(f for _, f, _ in cfg.sims_schedule)
+        cfg.pcr_fast_sims = cfg.sims_schedule[0][2]
     if args.smoke:
         cfg.n_sims, cfg.batch_games, cfg.moves_per_phase = 32, 256, 8
         cfg.window_games, cfg.mean_plies, cfg.max_plies = 2000, 128, 160
@@ -1174,6 +1275,13 @@ def main() -> None:
     logger.note(f"  {cfg.n_sims} sims, {cfg.batch_games} games in flight, "
                 f"batch {cfg.batch} in {math.ceil(cfg.batch / cfg.micro_batch)} "
                 f"micro-batches")
+    if cfg.sims_schedule:
+        stages = "  ".join(
+            f"{at / 3600:.1f}h:N={f}/n={s} (mean {cfg.pcr_p * f + (1 - cfg.pcr_p) * s:.0f})"
+            for at, f, s in cfg.sims_schedule)
+        logger.note(f"  §11a schedule, in TRAINING seconds: {stages}")
+        logger.note(f"  ⚠️ the node pool is allocated for N = {cfg.n_sims} from "
+                    f"generation 1, so the early stages do not use all of it")
     logger.note(f"  cadence {cfg.samples_per_position:.3f} samples/position -> "
                 f"{per_gen} records and {per_gen * cfg.samples_per_position / cfg.batch:.2f} "
                 f"steps per generation, constant in game length "

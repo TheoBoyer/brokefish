@@ -241,13 +241,27 @@ def play_match(eval_a: Callable, eval_b: Callable,
                openings: torch.Tensor, control: torch.Tensor,
                n_sims: int = 64, max_plies: int = 512,
                search_impl: str = "cuda", device: str | torch.device = "cuda",
-               seed: int = 0, adjudicate: bool = True) -> MatchResult:
+               seed: int = 0, adjudicate: bool = True,
+               sims_a: Optional[int] = None, sims_b: Optional[int] = None) -> MatchResult:
     """Play every opening twice, colours swapped, and score it for A.
 
     ``eval_a`` and ``eval_b`` are evaluators in the sense of
     `search.make_evaluator`: ``(boards, control, rep) -> (policy, promo, value)``.
     Networks are not taken directly, because the league already owns packed
     encoders and because it makes the whole harness testable with stubs.
+
+    ``sims_a`` / ``sims_b`` give the two players **different search budgets**, which
+    is what puts the budget on the same Elo scale as the training (`evaluation.md`
+    §5.1a). They default to ``n_sims`` for both, which is every caller written before
+    2026-08-08. This costs nothing: `_play_half` already runs one colour assignment
+    per batch and every row of a batch is at the same ply, so at any moment the whole
+    batch belongs to one player and can simply be searched at that player's budget.
+
+    ⚠️ **``sims = 0`` means uniformly random legal play** — `Search.random_move`, no
+    tree and no network. That is the anchor, and it is a different code path rather
+    than "a search with a tiny budget" on purpose: a one-simulation search inherits
+    §6.1a's root terminal sweep and finds every mate in one, so its strength would
+    move whenever the search did.
 
     ⚠️ **`no_grad` is not optional here.** `CLAUDE.md`: evaluation under autograd
     builds a graph across the run and takes the card out. It is on the function so
@@ -256,12 +270,17 @@ def play_match(eval_a: Callable, eval_b: Callable,
     if openings.shape[0] != control.shape[0]:
         raise ValueError(f"openings {tuple(openings.shape)} and control "
                          f"{tuple(control.shape)} disagree on the number of positions")
+    sims_a = n_sims if sims_a is None else int(sims_a)
+    sims_b = n_sims if sims_b is None else int(sims_b)
+    if sims_a < 0 or sims_b < 0:
+        raise ValueError(f"budgets must be >= 0 (0 = random play), got {sims_a}, {sims_b}")
 
     out = MatchResult()
     for a_is_white in (True, False):
         half = _play_half(eval_a, eval_b, a_is_white, openings, control,
                           n_sims=n_sims, max_plies=max_plies,
-                          search_impl=search_impl, device=device, seed=seed)
+                          search_impl=search_impl, device=device, seed=seed,
+                          sims_a=sims_a, sims_b=sims_b)
         _accumulate(out, half, a_is_white, adjudicate=adjudicate)
     return out
 
@@ -298,13 +317,21 @@ def _accumulate(out: MatchResult, half: HalfResult, a_is_white: bool,
 def _play_half(eval_a: Callable, eval_b: Callable, a_is_white: bool,
                openings: torch.Tensor, control: torch.Tensor,
                n_sims: int, max_plies: int, search_impl: str,
-               device: str | torch.device, seed: int) -> HalfResult:
+               device: str | torch.device, seed: int,
+               sims_a: Optional[int] = None,
+               sims_b: Optional[int] = None) -> HalfResult:
     """One colour assignment, `P` games in one batch, played to the end."""
     P = int(openings.shape[0])
     device = torch.device(device)
+    sims_a = n_sims if sims_a is None else sims_a
+    sims_b = n_sims if sims_b is None else sims_b
 
     Search = search_class(search_impl)
-    cfg = eval_config(n_sims, P)
+    # ⚠️ The **larger** budget sizes the tree: `config.n` fixes the node pool at
+    # `n + 1` and the path arrays at `n`, and `self_play_move(sims=k)` may only go
+    # down from it. `max(..., 1)` because a pool of zero nodes is not a thing even
+    # when both players are random.
+    cfg = eval_config(max(sims_a, sims_b, 1), P)
     # The evaluator is replaced before every move; the constructor argument only
     # has to be callable, and `_swap_evaluator` sets the right one before the
     # first search runs.
@@ -320,7 +347,10 @@ def _play_half(eval_a: Callable, eval_b: Callable, a_is_white: bool,
         if bool(finished.all()):
             break
         white_to_move = _swap_evaluator(search, eval_a, eval_b, a_is_white)
-        record = search.self_play_move()
+        # Whose turn it is decides the budget as well as the network. Both come from
+        # the same predicate, so they cannot disagree.
+        sims = sims_a if (white_to_move == a_is_white) else sims_b
+        record = search.random_move() if sims == 0 else search.self_play_move(sims=sims)
 
         newly = record.done & ~finished
         if bool(newly.any()):

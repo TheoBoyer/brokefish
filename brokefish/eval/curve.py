@@ -9,11 +9,18 @@ written by different processes they get joined by hand later, and by then nobody
 remembers whether the euro counter included the failed runs. So a curve point that
 arrives here with `euros_spent = null` is reported as null and is not repaired.
 
-⚠️ **This is the self-anchored scale** (`evaluation.md` §5.1, §6): Elo 0 is the
-frozen random-init network, not a CCRL rating and not a Lichess rating. Every
-table this writes says so in its header, because a number on this scale and a
-number on a published one are different quantities and the whole point of §6 is
-that they must never be silently mixed.
+⚠️ **This is the self-anchored scale** (`evaluation.md` §5.1, §6): Elo 0 is
+**uniformly random legal play** — rebased 2026-08-08 from the frozen random-init
+network, which was a network *plus a search* and therefore moved whenever the search
+did. It is not a CCRL rating and not a Lichess rating. Every table this writes says so
+in its header, because a number on this scale and a number on a published one are
+different quantities and the whole point of §6 is that they must never be silently
+mixed.
+
+⚠️ **`n_sims` is per player, not per league** (§5.1a). A curve may hold the same
+checkpoint at several budgets; sorting by step alone then puts them on top of each
+other, so the table carries the budget as a column and the reader should group by it
+before reading a slope.
 """
 
 from __future__ import annotations
@@ -24,8 +31,8 @@ import math
 import os
 from typing import List, Optional, Sequence, Tuple
 
-SCALE_NOTE = ("Elo is on the self-anchored scale of evaluation.md §5.1: 0 is the frozen "
-              "random-init network, not a published rating.")
+SCALE_NOTE = ("Elo is on the self-anchored scale of evaluation.md §5.1: 0 is uniformly "
+              "random legal play, not a published rating.")
 
 COLUMNS = ("checkpoint_id", "run", "step", "euros_spent", "training_seconds", "games_played",
            "elo", "ci95", "se", "se_raw", "n_sims", "draw_rate", "fit_version")
@@ -37,19 +44,26 @@ def load_report(path: str) -> dict:
 
 
 def curve_rows(report: dict) -> List[dict]:
-    """Curve points in step order, which is also compute order."""
-    return sorted(report.get("curve", []), key=lambda r: (r.get("step") or 0))
+    """Curve points in step order, then budget order.
+
+    ⚠️ Step alone is no longer a key (§5.1a, 2026-08-08): a pool that rates one
+    checkpoint at several budgets has several rows per step, and sorting on step alone
+    leaves their order to the sort's stability rather than to anything meaningful.
+    """
+    return sorted(report.get("curve", []),
+                  key=lambda r: (r.get("step") or 0, r.get("n_sims") or 0))
 
 
 def format_curve(report: dict) -> str:
     """A markdown table of the curve, for a log and for `docs/ledger/`."""
     rows = curve_rows(report)
     cfg = report.get("config", {})
-    head = (f"  {cfg.get('pairings', '?')} pairings, {cfg.get('games_played', '?')} games "
-            f"at n = {cfg.get('n_sims', '?')} sims. {SCALE_NOTE}")
+    head = (f"  {cfg.get('pairings', '?')} pairings, {cfg.get('games_played', '?')} games; "
+            f"reference n = {cfg.get('n_sims', '?')} sims, budgets in the pool "
+            f"{cfg.get('budgets', '?')}. {SCALE_NOTE}")
     out = [head, "",
-           "| checkpoint | step | train s | € | games | Elo | ±95% | draws |",
-           "|---|---:|---:|---:|---:|---:|---:|---:|"]
+           "| checkpoint | step | sims | train s | € | games | Elo | ±95% | draws |",
+           "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for r in rows:
         secs = "—" if r.get("training_seconds") is None else f"{r['training_seconds']:.0f}"
         euro = "—" if r.get("euros_spent") is None else f"{r['euros_spent']:.2f}"
@@ -57,7 +71,8 @@ def format_curve(report: dict) -> str:
         ci = "pinned" if r["checkpoint_id"] == report.get("fit", {}).get("anchor") else (
             "—" if r.get("ci95") is None else f"±{r['ci95']:.0f}")
         draw = "—" if r.get("draw_rate") is None else f"{r['draw_rate']:.1%}"
-        out.append(f"| {r['checkpoint_id']} | {r.get('step', '')} | {secs} | {euro} | "
+        out.append(f"| {r['checkpoint_id']} | {r.get('step', '')} | "
+                   f"{r.get('n_sims', '')} | {secs} | {euro} | "
                    f"{r.get('games_played', 0)} | {elo} | {ci} | {draw} |")
     return "\n".join(out)
 

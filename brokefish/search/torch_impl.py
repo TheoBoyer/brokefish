@@ -982,10 +982,30 @@ class Search:
         # over exactly the valid edges, in [0,1], mapped to [-1,1] to match `z`.
         root_value = (2.0 * (pi * self.edge_Q[:, 0]).sum(-1) - 1.0).float()
 
+        record, code = self._advance(label, policy_move, policy_prob,
+                                     keep.sum(-1).to(torch.uint8), self.root_rep,
+                                     root_value)
+        self.stats.on_move(self, pi, code, e)
+        return record
+
+    def _advance(self, label: torch.Tensor, policy_move: torch.Tensor,
+                 policy_prob: torch.Tensor, policy_len: torch.Tensor,
+                 rep: torch.Tensor, root_value: torch.Tensor):
+        """Play one edge label per game against the *game* state; emit §10's record.
+
+        Factored out of :meth:`select_and_advance` on 2026-08-08 so that a player
+        which builds no tree — :meth:`random_move`, the zero of the Elo scale — puts
+        its plies through exactly this code rather than a second transcription of the
+        step, the history push and the terminal test. **There is one place where a ply
+        happens**, which is what keeps a random game and a searched game legal in the
+        same way.
+
+        Returns the record and the terminal code, which the caller's counters want.
+        """
         record = MoveRecord(
             board=self.game_board.clone(), control=self.game_control.clone(),
-            rep=self.root_rep.clone(), policy_move=policy_move, policy_prob=policy_prob,
-            policy_len=keep.sum(-1).to(torch.uint8), played=label.to(torch.int16),
+            rep=rep.clone(), policy_move=policy_move, policy_prob=policy_prob,
+            policy_len=policy_len, played=label.to(torch.int16),
             ply=self.game_ply.clone(), root_value=root_value,
             weight_gen=self.weight_gen,
             done=torch.zeros_like(self.game_done), result=torch.zeros_like(self.game_result))
@@ -1009,8 +1029,73 @@ class Search:
         self.game_result = result
         record.done = self.game_done.clone()
         record.result = result.clone()
+        return record, code
 
-        self.stats.on_move(self, pi, code, e)
+    # -- the zero of the Elo scale ------------------------------------------ #
+
+    def random_move(self) -> MoveRecord:
+        """One uniformly random legal move per game. No tree, no network, no config.
+
+        This is the anchor of `evaluation.md` §5.1. It deliberately does **not** go
+        through `root_init` / `simulate`: a "random" player built as a one-simulation
+        search would inherit §6.1a's root terminal sweep and therefore find every mate
+        in one, and its strength would move whenever the search moved — which is the
+        exact fragility this player exists to remove. The only things it depends on
+        are the rules of chess and a uniform draw, so it is the same player on every
+        commit, on every architecture, and at every future search budget.
+
+        **Uniform over the move set, promotion type included.** A pawn reaching the
+        last rank offers four moves and not one, exactly as §4.3's candidate scan
+        enumerates them; weighting it as one move would make the player quietly
+        underpromote-averse, which is an opinion about chess.
+
+        ⚠️ The record carries `policy_len = 0` and an empty policy. A random move has
+        no search target, and `train/loss.py` refuses a zero-length policy, so such a
+        record cannot silently become training data.
+
+        ⚠️ It does **not** touch :attr:`stats`. The counters of §15 describe a search,
+        and this is not one; leaving them alone keeps `moves` and `simulations` an
+        honest description of the searched plies in a batch that mixes both.
+        """
+        B = self.config.B
+        if self.check_invariants and bool(self.game_done.any()):
+            raise AssertionError("invariant 8: a finished game was played; "
+                                 "call reset_finished() first")
+
+        # Over the game ring alone — there is no tree here, and the ring holds every
+        # position before this one (§7). Recomputed rather than taken from
+        # `root_init`, which a random player never calls.
+        rep = self.env.repetition_count(self.game_hash, self.game_ring, self.game_ring_len)
+        rep = (rep - 1).clamp(0, 2).to(torch.uint8)
+
+        mask, _ = self.env.movegen(self.game_board, self.game_control)
+        legal = self.env.bitset_to_bool(mask)                       # [B,32,64]
+        is_promo = self._promotion_targets(self.game_board, self.game_control) & legal
+        cand = legal[..., None].expand(-1, -1, -1, 4).clone()
+        cand[..., 1:] &= is_promo[..., None]
+
+        flat = cand.reshape(B, -1).to(torch.float32)
+        # ⚠️ `multinomial` on an all-zero row does not raise, it returns index 0 —
+        # a "move" that is not legal, played in silence. A row with no candidate
+        # means invariant 8 was violated upstream, so it is caught here by name.
+        empty = flat.sum(-1) == 0
+        if bool(empty.any()):
+            raise AssertionError(
+                f"{int(empty.sum())} of {B} games have no legal move but are not "
+                f"marked done — a terminal position was handed to random_move()")
+        pick = torch.multinomial(flat, 1, generator=self._gen).squeeze(-1)
+
+        # `cand` is [B, 32, 64, 4] flattened, so the last axis is the promotion type
+        # and everything above it is spec §3's `slot * 64 + target` move field.
+        promo = pick % 4
+        label = (pick // 4) | (promo << PROMO_SHIFT)
+
+        zeros_i = torch.zeros((B, self.config.E), dtype=torch.int16, device=self.device)
+        zeros_f = torch.zeros((B, self.config.E), dtype=torch.float16, device=self.device)
+        record, _ = self._advance(
+            label, zeros_i, zeros_f,
+            torch.zeros((B,), dtype=torch.uint8, device=self.device),
+            rep, torch.zeros((B,), dtype=torch.float32, device=self.device))
         return record
 
 

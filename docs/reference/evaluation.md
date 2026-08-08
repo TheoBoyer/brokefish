@@ -174,18 +174,93 @@ ladder adds calibration drift on top of match variance.
 A self-anchored league also answers "how do you gradually improve the opponents"
 for free: the opponent is the previous checkpoint, so it escalates automatically.
 
-### 5.1 The frozen anchor
+### 5.1 The anchor is uniformly random legal play
 
-One net stays in the pool forever and defines the zero of the scale: the
-**random-init network**. It is the origin of the cost-versus-Elo curve by
-construction, it costs nothing to keep, it carries no chess opinion, and any drift in
-the fitted scale shows up directly as the anchor's rating moving off zero.
+**The zero of the scale is a player that picks uniformly at random among the legal
+moves.** No network, no tree, no search configuration. It is the origin of the
+cost-versus-Elo curve by construction, it costs nothing to keep, it carries no chess
+opinion, and any drift in the fitted scale shows up directly as its rating moving off
+zero.
+
+⚠️ **Rebased 2026-08-08. The zero used to be the frozen random-init network**, held as
+a file (`checkpoints/anchor.pt`) rather than as a seed, precisely so that it could not
+move with a torch version or an edit to `BrokefishNet.__init__`. That fixed the wrong
+half of the problem, and the reasoning is worth keeping because the same mistake is
+easy to make again:
+
+- **It was never a network, it was a network plus a search.** The anchor was played at
+  64 simulations with whatever `SearchConfig` the league defaulted to. When §6.1a's
+  root terminal sweep landed, the anchor started finding every mate in one — it got
+  stronger while its file was untouched, and the origin of the curve moved in silence.
+  A zero that moves when the *search* changes cannot anchor a project whose whole
+  Track E is changing the search.
+- **`checkpoints/` is gitignored**, so the origin of every published number was one
+  untracked blob, and `league.py`'s own docstring said "delete that file and the whole
+  curve moves".
+- **It was saturated anyway.** Measured 2026-08-08 on `logs/league-joint-pcr.log`:
+  `anchor vs t12h-pcr@1405` and every pairing above it returned `0-0-36`. Its edges
+  cost a full 36 games each and carried no information.
+
+Random play has none of those properties. It is defined by the rules of chess and a
+uniform draw, so it is the same player on every commit, on every architecture, and at
+every future search budget, and there is no file to lose. It is implemented as
+`Search.random_move` **outside** the search rather than as a one-simulation search,
+because a one-simulation search inherits §6.1a and would find every mate in one — which
+is exactly the dependence being removed.
+
+Uniform over the **move set including promotion type**: a pawn reaching the last rank
+offers four moves, not one. Weighting it as one would make the anchor quietly
+underpromotion-averse, which is an opinion about chess.
+
+⚠️ **This does not make the previously published leagues comparable.** Different
+Bradley-Terry fits share a zero but not their units, so `t24h-fp8`'s +905, the muon
+league's +542 and `league-joint-pcr`'s +954 remain three scales. What the rebase fixes
+is everything from here on, plus one bridge: the old anchor stays in the pool as
+`init:n64`, so its rating on the new scale is a *measured* offset rather than an
+assertion.
 
 Precedent: lc0's training chart "sets 'the first net' to Elo 0", with the explicit
 warning that it is therefore "not comparable, even between different training runs"
 (lc0 FAQ, quoted in `2026-07-30-eval-prior-art.md` §4.1). KataGo instead anchors externally, at
 ELF ≈ 0. The difference matters only for §6: an internal anchor makes the calibration
 step mandatory, an external one folds it into the fit.
+
+### 5.1a A player is a `(network, budget)` pair
+
+§3 already fixes the principle — *"a rating is a function of `(net, n)`, never of `net`
+alone"*, and *"the Elo of a checkpoint at `n = 800` and at `n = 100` are two different
+numbers, and both are interesting."* Until 2026-08-08 the implementation honoured only
+the first half: `n` was a league-wide constant, reported per row, and therefore a
+**hidden term in the scale**. That is the reason every report so far carries "comparable
+to nothing else".
+
+The budget is now a per-player field. One checkpoint at 16, 64 and 256 simulations is
+**three players in one fit**, and the distance between them is the Elo value of a
+doubling of search, measured with the network held exactly fixed.
+
+Two things this buys that nothing else in the project measures:
+
+- **The bottom of the scale becomes estimable.** Random play loses 36-0 to anything
+  past the first few hundred training steps, so a scale hung directly off it would rest
+  on a saturated edge. The untrained network at `n ∈ {1, 4, 16, 64}` supplies the
+  intermediate rungs — `init:n1` is essentially the raw policy argmax — and the ladder
+  carries the zero up to the start of the training curve.
+- **The search-versus-training exchange rate.** Is `ckpt@2000` at 256 sims stronger
+  than `ckpt@4000` at 64? The x-axis of the curve is training seconds only, which for
+  a bot anyone actually *runs* is half the cost. This is the other half.
+
+⚠️ **Cost is not flat across the pool.** A pairing costs roughly the mean of its two
+budgets, so a 256-sim player is four times a 64-sim one and a pairing *count* hides it.
+The league reports `pairing_equivalents` — the calendar's size in units of one pairing
+at the reference budget — and that is the number to size a run against.
+
+⚠️ **The Bradley-Terry model assumes one latent strength per player.** A `(net, budget)`
+pair is a legitimate player so the model is sound, but the pool's strength range roughly
+doubles, and a wider range strains a single-parameter fit. Read `dispersion`.
+
+The calendar gets one addition for this: **every pair of players that share a network
+and differ only in budget plays**, since SAI's schedule orders by step and would pair
+budget variants only by accident of adjacency.
 
 ### 5.2 Do not chain
 
@@ -686,6 +761,26 @@ other way. `2026-07-30-eval-prior-art.md` §4.2.
 ---
 
 ## Changelog
+
+**2026-08-08.** §5.1 rebased and §5.1a added. **The zero of the scale is uniformly
+random legal play**, not the frozen random-init network — because the old zero was
+never a network but a network *plus a search*, and it moved in silence when §6.1a's
+root terminal sweep landed. Its file was also gitignored, and by 2026-08-08 it was
+saturated: `anchor vs t12h-pcr@1405` and everything above it came back `0-0-36`.
+Random play is defined by the rules alone, cannot be deleted, and is implemented
+outside the search (`Search.random_move`) precisely so that no future change to
+`SearchConfig` can move it. **§5.1a makes the search budget a per-player field**,
+which is §3's own principle — *"a rating is a function of `(net, n)`"* — finally
+reaching the implementation rather than being restated per row; the ladder
+`init:n{1,4,16,64}` bridges random play up to the training curve, and a budget grid on
+the checkpoints measures the search-versus-training exchange rate. ⚠️ This makes future
+leagues comparable, **not past ones**: different fits share a zero but not their units,
+so the three leagues already published stay on their own scales. The old anchor remains
+in the pool as `init:n64`, which turns the relation between the scales into a measured
+offset. Two bugs found on the way: a pool without the anchor made `fit_elo` invent a
+**phantom** player at Elo 0 that had played nothing, and in a joint league the anchor's
+cost axis was written as **null** rather than zero because `cost` is keyed by run and
+the anchor belongs to none — visible in `logs/curve-joint-pcr.csv`.
 
 **2026-07-31.** §5.4 added: D2's harness, specified and built the same day
 (`brokefish/eval/{match,elo,league,curve}.py`, `tests/test_league.py`). Three things

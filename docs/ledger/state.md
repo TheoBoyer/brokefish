@@ -446,11 +446,31 @@ and is not. Deleting one because it looks obvious is how it gets made again.
   `evaluation.md` §5.4, landed 2026-07-31**. `match.py` plays one pairing,
   `elo.py` fits one global Bradley-Terry model over the whole graph, `league.py`
   runs the fixed SAI calendar and joins the cost axis, `curve.py` presents.
-  `tests/test_league.py`, 56 checks, all of them CPU-only on stub evaluators, 58 s.
-  The frozen anchor is `checkpoints/anchor.pt`, **sha256
-  `a27a099aa62940f13cb859a2adf16900c3934282f13ac27ccb680792fab4da57`** — recorded
-  here because `checkpoints/` is gitignored and this digest is the only durable
-  record of what the zero of the scale was.
+  `tests/test_league.py`, 78 checks, 67 s.
+  ⚠️ **The zero was rebased on 2026-08-08 to uniformly random legal play** (§5.1).
+  It used to be `checkpoints/anchor.pt` at 64 sims, and the problem was not the file
+  but that the zero was a network *plus a search*: when §6.1a's root terminal sweep
+  landed the anchor started finding every mate in one and the origin of the curve
+  moved with nothing to show for it. By 2026-08-08 it was saturated as well —
+  `anchor vs t12h-pcr@1405` and every pairing above it returned `0-0-36`, a full 36
+  games each for no information. `Search.random_move` is implemented **outside** the
+  search for the same reason: a one-simulation search would inherit §6.1a. Measured:
+  0 illegal moves in 7 680 plies, and χ² = 13.5 on 19 df against the flat
+  distribution. The old anchor stays in the pool as `init:n64` — still **sha256
+  `a27a099aa62940f13cb859a2adf16900c3934282f13ac27ccb680792fab4da57`**, recorded here
+  because `checkpoints/` is gitignored — so the two scales are related by a measured
+  offset. ⚠️ Past leagues are **not** retro-comparable: different fits share a zero
+  but not their units.
+  ⚠️ **A player is a `(network, budget)` pair** (§5.1a, 2026-08-08). `n` used to be a
+  league-wide constant that silently belonged to the scale, which is why every report
+  before this carried "comparable to nothing else". One checkpoint at 16/64/256 sims
+  is three players in one fit and the gap between them is what a doubling of search is
+  worth; `budget_ladder_pairs` guarantees they play. Two bugs fell out: a pool without
+  the anchor made `fit_elo` invent a **phantom** zero that had played nothing (it
+  unions the anchor into its name list, so its own guard is dead code), and in a joint
+  league the anchor's cost axis was written **null** instead of 0.0 because `cost` is
+  keyed by run and the anchor belongs to none — see the empty `euros_spent` on the
+  `anchor` row of `logs/curve-joint-pcr.csv`.
   ⚠️ **No opening book, and the reason is not the tabula rasa boundary** — §2 permits
   standard books in evaluation. UHO exists to break draws between engines strong
   enough to hold a balanced position; our draws are a near-uniform policy shuffling

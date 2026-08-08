@@ -10,11 +10,34 @@ counter from the training log, and write one record per checkpoint.
 
 Three things are deliberate.
 
-**The anchor is a file, not a seed.** `evaluation.md` §5.1 makes the random-init
-network the zero of the scale forever. A seed is not forever — it depends on the
-torch version, on the initialisation order, and on nobody editing `BrokefishNet`'s
-constructor. So the first run writes `checkpoints/anchor.pt` and every run after
-that loads it. Delete that file and the whole curve moves.
+**The zero is uniformly random legal play** (rebased 2026-08-08, `evaluation.md`
+§5.1). It used to be a frozen random-init network at 64 simulations, held in
+`checkpoints/anchor.pt` — a file, so that the zero did not depend on a torch version
+or on nobody editing `BrokefishNet`'s constructor. That fixed the wrong half of the
+problem. The zero was never a *network*, it was a network **plus a search**: the day
+§6.1a's root terminal sweep landed, the anchor got stronger while its file was
+untouched, and the origin of the curve moved in silence. The file was also gitignored,
+so every published number hung off one untracked blob.
+
+Random play has none of that. It is defined by the rules of chess and a uniform draw,
+so it is the same player on every commit, every architecture and every future search
+budget — and it cannot be deleted. `Search.random_move` implements it *outside* the
+search on purpose: a one-simulation search would inherit the root terminal sweep and
+find every mate in one.
+
+The old anchor is still in the pool as `init:n64`, which is what lets this scale be
+related to the previous ones by a measured offset rather than by assertion. ⚠️ That
+relates *future* leagues; the three leagues already published stay on their own
+scales, because different fits have different units and only replaying their
+checkpoints here would change that.
+
+**A player is a `(network, budget)` pair.** The simulation count used to be a
+league-wide constant that quietly belonged to the scale, which is the reason every
+report so far carries "comparable to nothing else". As a per-player field it becomes
+a measured axis instead: one checkpoint at 16, 64 and 256 sims is three players in one
+fit, and the gap between them is what a doubling of search is worth. `--ladder` uses
+it to bridge random play up to the training curve; `--grid` uses it to measure the
+search-versus-training exchange rate.
 
 **The calendar is fixed.** Each checkpoint plays generation offsets ±1, ±2, ±3,
 ±6, ±8, ±12 (SAI's schedule, §5.2), plus the anchor plays a spread across the whole
@@ -58,8 +81,21 @@ from .match import MatchResult, play_match, random_openings
 # sizing arithmetic in §5.4 both come from.
 SAI_OFFSETS: Tuple[int, ...] = (1, 2, 3, 6, 8, 12)
 
-ANCHOR_NAME = "anchor"
+# §5.1, rebased 2026-08-08. **The zero is uniformly random legal play**, not the
+# frozen random-init network — see the module docstring. `ANCHOR_NAME` is what
+# `fit_elo` pins, and it is kept as the name of that concept rather than of that
+# file, so nothing outside this module has to know the zero moved.
+RANDOM_NAME = "random"
+ANCHOR_NAME = RANDOM_NAME
+INIT_NAME = "init"
 DEFAULT_ANCHOR_PATH = os.path.join("checkpoints", "anchor.pt")
+
+# §5.1a's bottom rungs: the untrained network at four budgets. These exist to make
+# the zero *estimable* — random play loses 36-0 to anything past the first few
+# hundred steps, so without intermediate strengths the scale would hang off a
+# saturated edge. `init:n64` is exactly the player that was the anchor before
+# 2026-08-08, which is what lets this scale be related to the previous one.
+DEFAULT_LADDER: Tuple[int, ...] = (1, 4, 16, 64)
 
 
 # --------------------------------------------------------------------------- #
@@ -68,12 +104,21 @@ DEFAULT_ANCHOR_PATH = os.path.join("checkpoints", "anchor.pt")
 
 @dataclass(frozen=True)
 class PoolEntry:
-    """One rated player: a name, a place on the x-axis, and where its weights are."""
+    """One rated player: a name, a place on the x-axis, weights, and a budget.
+
+    ⚠️ **A player is a `(network, budget)` pair, not a network** (§5.1a, 2026-08-08).
+    The search budget used to be a league-wide constant that silently belonged to the
+    scale — "ratings at 64 sims" — which is why no two leagues were comparable and why
+    every report carried that caveat. Making it a per-player field turns it into a
+    measured axis: the same checkpoint at 16, 64 and 256 simulations is three players
+    in one fit, and the distance between them is the Elo value of a doubling of search.
+    """
 
     name: str
     step: int
-    path: Optional[str]       # None only for a freshly minted anchor
-    run: str = ""             # which training run it came from; "" for the anchor
+    path: Optional[str]       # None for `random`, which has no network at all
+    run: str = ""             # which training run it came from; "" for the ladder
+    sims: int = 64            # 0 = uniformly random legal play, no tree, no network
 
 
 ANCHOR_SEED = 20260731
@@ -163,11 +208,25 @@ def subsample(items: Sequence, limit: Optional[int]) -> List:
 
 def build_pool(runs, checkpoint_dir: str = "checkpoints",
                anchor_path: str = DEFAULT_ANCHOR_PATH,
-               limit: Optional[int] = 32) -> List[PoolEntry]:
-    """The anchor at index 0, then every run's checkpoints **interleaved by step**.
+               limit: Optional[int] = 32, sims: int = 64,
+               ladder: Sequence[int] = DEFAULT_LADDER,
+               grid: Sequence[int] = (), grid_points: int = 0) -> List[PoolEntry]:
+    """Random play, then the untrained ladder, then the checkpoints by step.
+
+    The pool is ordered by *approximate strength* — `(step, sims)` — because that is
+    what the SAI calendar consumes: it pairs index `i` with `i + {1,2,3,6,8,12}`, so
+    the ordering decides which players actually meet. Two useful consequences fall
+    out of sorting on `sims` within a step: the four `init:n*` rungs land at indices
+    1-4 and so are bridged to `random` by the small offsets, and a checkpoint's own
+    budget variants are adjacent and therefore always play each other.
+
+    `ladder` is the untrained network's budgets (§5.1a). `grid` is the set of budgets
+    to also rate `grid_points` checkpoints at, evenly spaced over each run — that is
+    the search-versus-training exchange rate, and it is off by default because it
+    multiplies the pool.
 
     Index 0 is the anchor on purpose: the SAI calendar then connects it to
-    checkpoints 1, 2, 3, 6, 8 and 12 for free, so the zero of the scale is a real
+    players 1, 2, 3, 6, 8 and 12 for free, so the zero of the scale is a real
     node in the graph rather than an assumption bolted on afterwards.
 
     ⚠️ **Several runs are sorted together, not concatenated, and that is the whole
@@ -180,12 +239,15 @@ def build_pool(runs, checkpoint_dir: str = "checkpoints",
     only at the seam. Sorting by step interleaves them, and then **every** offset is a
     cross-run edge for half its length. That is what makes one scale one scale.
 
-    `limit` is per run, so the pool is about `len(runs) * limit` players and the
-    calendar grows linearly with it.
+    `limit` is the number of **checkpoints per run** (it excluded the anchor before
+    2026-08-08; the ladder is a fixed size now, so counting it in was only confusing),
+    and the calendar grows linearly with the pool.
     """
     if isinstance(runs, str):
         runs = [runs]
     runs = list(dict.fromkeys(runs))          # de-duplicate, keep order
+    init_path = ensure_anchor(anchor_path)
+
     entries: List[PoolEntry] = []
     for run in runs:
         found = discover_checkpoints(run, checkpoint_dir)
@@ -194,10 +256,49 @@ def build_pool(runs, checkpoint_dir: str = "checkpoints",
                 f"no {run}-NNNNNN.pt snapshots in {checkpoint_dir}/. A run only writes "
                 f"them with --keep-checkpoints; the rolling {run}.pt is one endpoint "
                 f"and a curve needs a history.")
-        for step, path in subsample(found, None if limit is None else max(1, limit - 1)):
-            entries.append(PoolEntry(name=f"{run}@{step}", step=step, path=path, run=run))
-    entries.sort(key=lambda e: (e.step, e.run))
-    return [PoolEntry(name=ANCHOR_NAME, step=0, path=ensure_anchor(anchor_path))] + entries
+        chosen = subsample(found, limit)
+        for step, path in chosen:
+            entries.append(PoolEntry(name=f"{run}@{step}:n{sims}", step=step,
+                                     path=path, run=run, sims=sims))
+        # The budget grid, on a spread of the checkpoints that were already chosen —
+        # a subsample of a subsample, so the grid points sit *on* the training curve
+        # and the vertical distance at a shared step is exactly the search value.
+        for step, path in subsample(chosen, grid_points) if grid_points else []:
+            for k in grid:
+                if k == sims:
+                    continue
+                entries.append(PoolEntry(name=f"{run}@{step}:n{k}", step=step,
+                                         path=path, run=run, sims=k))
+    entries.sort(key=lambda e: (e.step, e.sims, e.run))
+
+    head = [PoolEntry(name=RANDOM_NAME, step=0, path=None, run="", sims=0)]
+    head += [PoolEntry(name=f"{INIT_NAME}:n{k}", step=0, path=init_path, run="", sims=k)
+             for k in sorted(ladder)]
+    return head + entries
+
+
+def budget_ladder_pairs(pool: Sequence[PoolEntry]) -> List[Tuple[int, int]]:
+    """Every pair of players that share a network and differ only in budget.
+
+    The SAI calendar orders by step and would pair a checkpoint's budget variants only
+    by accident of adjacency. This makes the edge that actually measures §5.1a's axis
+    explicit: `ckpt:n16` vs `ckpt:n64` vs `ckpt:n256` is a direct, same-network
+    read of what a doubling of search is worth, with the network held exactly fixed.
+
+    It also produces the bottom of the ladder for free, since the `init:n*` rungs are
+    one network at four budgets.
+    """
+    by_net: Dict[tuple, List[int]] = {}
+    for i, e in enumerate(pool):
+        if e.path is None:
+            continue                       # `random` has no network to vary
+        by_net.setdefault((e.run, e.step, e.path), []).append(i)
+    out = set()
+    for idx in by_net.values():
+        for a in range(len(idx)):
+            for b in range(a + 1, len(idx)):
+                out.add((min(idx[a], idx[b]), max(idx[a], idx[b])))
+    return sorted(out)
 
 
 # --------------------------------------------------------------------------- #
@@ -205,7 +306,8 @@ def build_pool(runs, checkpoint_dir: str = "checkpoints",
 # --------------------------------------------------------------------------- #
 
 def sai_pairings(n: int, offsets: Sequence[int] = SAI_OFFSETS,
-                 anchor_every: int = 4) -> List[Tuple[int, int]]:
+                 anchor_every: int = 4,
+                 anchor_span: Optional[int] = None) -> List[Tuple[int, int]]:
     """Which pairs of pool indices play. `evaluation.md` §5.2.
 
     Each index plays the ones `offsets` ahead of it, which gives every checkpoint
@@ -216,10 +318,24 @@ def sai_pairings(n: int, offsets: Sequence[int] = SAI_OFFSETS,
     whose zero is measured only against the start of the run is one whose late
     points are reached through a long chain of intermediate fits — the exact
     failure mode §5.2 is about. Set it to 0 to get the bare SAI schedule.
+
+    ⚠️ **`anchor_span` bounds those edges, and it exists because they were measuring
+    nothing.** Against the pre-2026-08-08 anchor, `anchor vs t12h-pcr@1405` and every
+    pairing above it came back `0-0-36`: a saturated edge costs a full 36 games and
+    contributes no information beyond "further apart than this league can resolve".
+    With random play as the zero the saturation starts even earlier. So the anchor's
+    spread is capped at the first `anchor_span` players — where it can still lose
+    games — and one edge to the far end is kept deliberately, as the check that it
+    really is saturated rather than as a measurement. `None` is the old behaviour.
+
+    The right fix is variance-proportional sampling (spend games where `p(1-p)` is
+    largest), which `EloFit.predict` already has the machinery for; this is the cheap
+    version of it and says so.
     """
     pairs = {(i, i + d) for i in range(n) for d in offsets if i + d < n}
     if anchor_every > 0:
-        pairs |= {(0, j) for j in range(1, n, anchor_every)}
+        top = n if anchor_span is None else min(n, anchor_span + 1)
+        pairs |= {(0, j) for j in range(1, top, anchor_every)}
         if n > 1:
             pairs.add((0, n - 1))          # the far end always meets the anchor
     return sorted(pairs)
@@ -354,6 +470,7 @@ class _Log:
 def run_league(pool: Sequence[PoolEntry], games: int = 36, n_sims: int = 64,
                opening_plies: int = 8, max_plies: int = 512,
                offsets: Sequence[int] = SAI_OFFSETS, anchor_every: int = 4,
+               anchor_span: Optional[int] = None,
                impl: Optional[str] = "cuda", search_impl: str = "cuda",
                device: str = "cuda", seed: int = 0, prior: float = 1.0,
                cost=None,
@@ -369,28 +486,66 @@ def run_league(pool: Sequence[PoolEntry], games: int = 36, n_sims: int = 64,
     if games % 2:
         raise ValueError(f"games per pairing must be even — the unit is the "
                          f"colour-swapped pair, not the game. Got {games}")
+    # ⚠️ `fit_elo` unions the anchor into its name list, so an absent anchor does not
+    # raise there — it invents a phantom player at Elo 0 that played nothing, and
+    # every rating is then pinned to the `prior` instead of to a real opponent. Every
+    # number in the report would look normal. So the pool is checked here.
+    if not any(p.name == ANCHOR_NAME for p in pool):
+        raise ValueError(
+            f"no player named {ANCHOR_NAME!r} in the pool, so the zero of the scale "
+            f"would be a phantom that played no games (evaluation.md §5.1). "
+            f"`build_pool` always puts it at index 0.")
     log = log or (lambda line: None)
 
     n = len(pool)
-    pairs = sai_pairings(n, offsets=offsets, anchor_every=anchor_every)
+    # Two calendars unioned: SAI's step schedule, and the same-network budget edges
+    # that are the only direct read of §5.1a's axis.
+    ladder_pairs = budget_ladder_pairs(pool)
+    pairs = sorted(set(sai_pairings(n, offsets=offsets, anchor_every=anchor_every,
+                                    anchor_span=anchor_span)) | set(ladder_pairs))
     openings, opening_control = random_openings(games // 2, plies=opening_plies,
                                                 seed=seed, device=device)
+    budgets = sorted({e.sims for e in pool})
+    # A pairing costs roughly the mean of its two budgets, so this is the league's
+    # size in units of "one pairing at the reference budget" — the honest cost line,
+    # since a 256-sim player is four times a 64-sim one and a flat pairing count hides it.
+    units = sum((pool[i].sims + pool[j].sims) / (2.0 * n_sims) for i, j in pairs)
 
     log(f"  pool     {n} players, {pool[0].name} .. {pool[-1].name}")
-    log(f"  calendar {len(pairs)} pairings x {games} games = {len(pairs) * games} games")
+    log(f"  calendar {len(pairs)} pairings x {games} games = {len(pairs) * games} games"
+        f"  ({len(ladder_pairs)} of them same-network budget edges)")
     log(f"  openings {games // 2} distinct, {opening_plies} random legal plies")
-    log(f"  budget   n = {n_sims} sims, batch = {games // 2} games per half")
+    log(f"  budgets  {budgets} sims (0 = uniformly random legal play, the zero of the "
+        f"scale); reference {n_sims}; batch = {games // 2} games per half")
+    log(f"  cost     {units:.0f} pairing-equivalents at n = {n_sims}")
     log(f"  sizing   one edge resolves +-{elo_half_width(games, 0.8):.0f} Elo at d = 0.8, "
         f"+-{elo_half_width(games, 0.5):.0f} at d = 0.5 (arithmetic, evaluation.md §9)")
     log("")
 
     loader = engine_loader or (lambda path: load_engine(path, impl=impl, device=device))
-    engines: Dict[str, Callable] = {}
+    engines: Dict[object, Callable] = {}
+
+    def _refuse(*_a, **_k):
+        """The random player's evaluator. It must never be called.
+
+        `_swap_evaluator` points the search at *some* evaluator every ply, including
+        on the random player's turns, and `random_move` does not consult it. If that
+        ever stops being true this raises instead of quietly rating a network that
+        was supposed to be a coin."""
+        raise AssertionError(
+            "evaluation.md §5.1: the random player was asked to evaluate a position. "
+            "It has no network — `random_move` must not reach the evaluator.")
 
     def engine(entry: PoolEntry) -> Callable:
-        if entry.name not in engines:
-            engines[entry.name] = loader(entry.path)
-        return engines[entry.name]
+        # Keyed by **path**, not by name: the budget grid rates one network at several
+        # budgets, and loading the same 6.4M-parameter master three times would put
+        # three copies of it on an 8 GB card that is also driving the display.
+        key = entry.path
+        if key is None:
+            return _refuse
+        if key not in engines:
+            engines[key] = loader(key)
+        return engines[key]
 
     edges: List[Edge] = []
     raw: List[dict] = []
@@ -400,6 +555,7 @@ def run_league(pool: Sequence[PoolEntry], games: int = 36, n_sims: int = 64,
         t = time.time()
         result = play_match(engine(a), engine(b), openings, opening_control,
                             n_sims=n_sims, max_plies=max_plies,
+                            sims_a=a.sims, sims_b=b.sims,
                             search_impl=search_impl, device=device, seed=seed)
         edges.append(Edge(a=a.name, b=b.name, a_wins=result.a_wins,
                           draws=result.draws, b_wins=result.b_wins))
@@ -415,10 +571,19 @@ def run_league(pool: Sequence[PoolEntry], games: int = 36, n_sims: int = 64,
     seconds = time.time() - t0
 
     curve = _curve_points(pool, fit, edges, n_sims=n_sims, cost=cost)
+    # The ladder rung that *is* the pre-2026-08-08 anchor, i.e. the one at the
+    # reference budget — that is the player this scale relates to the old ones
+    # through, so it is the one worth naming. Any rung falls back, since they are all
+    # the same file and the digest is the file's.
+    rungs = [p for p in pool if p.run == "" and p.path is not None]
+    init = next((p for p in rungs if p.sims == n_sims), rungs[0] if rungs else None)
     return {
         "config": {"games_per_pairing": games, "n_sims": n_sims,
                    "opening_plies": opening_plies, "max_plies": max_plies,
                    "offsets": list(offsets), "anchor_every": anchor_every,
+                   "anchor_span": anchor_span, "budgets": budgets,
+                   "budget_edges": len(ladder_pairs),
+                   "pairing_equivalents": units,
                    "impl": impl, "search_impl": search_impl, "seed": seed,
                    "prior": prior, "pairings": len(pairs),
                    "games_played": sum(e.games for e in edges),
@@ -430,9 +595,12 @@ def run_league(pool: Sequence[PoolEntry], games: int = 36, n_sims: int = 64,
                 "decisive": fit.decisive,
                 "iterations": fit.iterations, "converged": fit.converged,
                 "fit_version": fit.fit_version,
-                # Which anchor this scale's zero actually was. `checkpoints/` is
-                # gitignored, so this digest is the only durable record of it.
-                "anchor_digest": anchor_digest(pool[0].path) if pool[0].path else None},
+                # ⚠️ Since 2026-08-08 the zero is `random`, which is defined by the
+                # rules and has no file to digest. This is the *ladder's* network —
+                # `init:n64` is the player that used to be the anchor, so the digest
+                # still says which untrained net relates this scale to the old ones.
+                "anchor_digest": anchor_digest(init.path) if init is not None else None,
+                "init_player": init.name if init is not None else None},
         "curve": curve,
     }
 
@@ -460,7 +628,18 @@ def _curve_points(pool: Sequence[PoolEntry], fit: EloFit, edges: Sequence[Edge],
         # only the dict would have made the cost axis silently null for them, which is
         # a column of `None` rather than an exception -- so both are accepted here.
         series = cost.get(entry.run) if isinstance(cost, dict) else cost
-        at = {} if not series else series_at(series, entry.step)
+        if not entry.run:
+            # ⚠️ The anchor and the §5.1a ladder belong to no run, so a per-run `cost`
+            # dict has no series for them and `cost.get("")` is None — which wrote a
+            # **null** x for the origin of the curve. Confirmed in
+            # `logs/curve-joint-pcr.csv`, whose `anchor` row has an empty
+            # `euros_spent` and `training_seconds`; every joint league since
+            # 2026-08-05 lost its zero that way, and a missing x reads as "not
+            # measured" rather than as the exact zero it is. They cost nothing to
+            # train because nobody trained them, so it is 0.0 and not unknown.
+            at = {"euros": 0.0, "training_seconds": 0.0}
+        else:
+            at = {} if not series else series_at(series, entry.step)
         out.append({
             "checkpoint_id": name,
             "run": entry.run,
@@ -472,7 +651,9 @@ def _curve_points(pool: Sequence[PoolEntry], fit: EloFit, edges: Sequence[Edge],
             "ci95": None if name not in fit.se else fit.ci95(name),
             "se": fit.se.get(name),
             "se_raw": fit.se_raw.get(name),
-            "n_sims": n_sims,
+            # ⚠️ The player's **own** budget, not the league's reference. This column
+            # used to be a constant restated per row; it is now the second axis.
+            "n_sims": entry.sims,
             "draw_rate": (drawn.get(name, 0) / n) if n else None,
             "opponents": sorted(opponents.get(name, [])),
             "fit_version": fit.fit_version,
@@ -496,7 +677,28 @@ def build_parser() -> argparse.ArgumentParser:
                         "then confounded with the fits")
     p.add_argument("--games", type=int, default=36,
                    help="games per pairing, even; half that many distinct openings")
-    p.add_argument("--sims", type=int, default=64, help="simulations per move")
+    p.add_argument("--sims", type=int, default=64,
+                   help="the REFERENCE budget: the one the training curve is rated "
+                        "at. Other budgets are players in the same fit, not other "
+                        "leagues -- see --ladder and --grid")
+    p.add_argument("--ladder", type=int, nargs="*", default=list(DEFAULT_LADDER),
+                   metavar="N",
+                   help="budgets to rate the untrained network at. These bridge "
+                        "uniformly random play (the zero) to the start of the "
+                        "training curve, which is 700+ Elo away and unmeasurable in "
+                        "one pairing. Empty for none")
+    p.add_argument("--grid", type=int, nargs="*", default=[], metavar="N",
+                   help="also rate --grid-points checkpoints at these budgets. This "
+                        "is the search-versus-training exchange rate: how much "
+                        "training a doubling of search is worth, measured on one "
+                        "scale. ⚠️ a 256-sim player costs 4x a 64-sim one")
+    p.add_argument("--grid-points", type=int, default=0,
+                   help="how many checkpoints per run get the --grid budgets, evenly "
+                        "spaced over the run")
+    p.add_argument("--anchor-span", type=int, default=None,
+                   help="cap the anchor's spread at the first N players. Its edges "
+                        "against anything far stronger come back 0-0-N and cost a "
+                        "full pairing to learn nothing")
     p.add_argument("--opening-plies", type=int, default=8,
                    help="random legal plies per opening, even so White is to move")
     p.add_argument("--max-plies", type=int, default=512)
@@ -529,7 +731,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     log(f"league  run={'+'.join(runs)}  {time.strftime('%Y-%m-%d %H:%M:%S')}")
     log(f"  tail -f {os.path.splitext(out_path)[0] + '.log'}")
     pool = build_pool(runs, checkpoint_dir=args.checkpoints,
-                      anchor_path=args.anchor, limit=args.limit)
+                      anchor_path=args.anchor, limit=args.limit, sims=args.sims,
+                      ladder=args.ladder, grid=args.grid,
+                      grid_points=args.grid_points)
     if len(runs) > 1:
         log(f"  ⚠️ {len(runs)} runs in ONE fit, interleaved by step so the calendar's "
             f"offsets cross between them. Ratings from this report are comparable "
@@ -549,6 +753,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     report = run_league(
         pool, games=args.games, n_sims=args.sims, opening_plies=args.opening_plies,
         max_plies=args.max_plies, anchor_every=args.anchor_every,
+        anchor_span=args.anchor_span,
         impl=None if args.impl == "none" else args.impl,
         search_impl=args.search_impl, device=args.device, seed=args.seed,
         prior=args.prior, cost=cost or None, log=log)
@@ -561,8 +766,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     from .curve import format_curve
     log(format_curve(report))
     log("")
-    log(f"  anchor sha256 {report['fit']['anchor_digest']}  "
-        f"(evaluation.md §5.1: the zero of this scale)")
+    log(f"  zero is {report['fit']['anchor']} — uniformly random legal play "
+        f"(evaluation.md §5.1). Ladder net {report['fit']['init_player']} "
+        f"sha256 {report['fit']['anchor_digest']}")
     fit_info = report["fit"]
     if fit_info["dispersion_applied"]:
         log(f"  dispersion {fit_info['dispersion']:.3f} applied over "

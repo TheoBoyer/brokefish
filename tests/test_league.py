@@ -584,13 +584,18 @@ class TestSizing:
 @pytest.fixture(scope="module")
 def league():
     """One whole league on stub engines, played once for the class below."""
-    pool = [league_mod.PoolEntry("anchor", 0, "anchor.pt")]
-    pool += [league_mod.PoolEntry(f"r@{s}", s, f"r-{s}.pt") for s in (50, 100, 150)]
+    # ⚠️ Index 0 is `random` at `sims = 0`: uniformly random legal play, no network,
+    # which is the zero of the scale since 2026-08-08 (§5.1). It is a real player here
+    # rather than a stub, because `random_move` is what the anchor actually is.
+    pool = [league_mod.PoolEntry(league_mod.RANDOM_NAME, 0, None, sims=0)]
+    pool += [league_mod.PoolEntry("init:n4", 0, "anchor.pt", sims=4)]
+    pool += [league_mod.PoolEntry(f"r@{s}:n4", s, f"r-{s}.pt", run="r", sims=4)
+             for s in (50, 100, 150)]
     # A distinct stub per player, so the games are real games. Keyed by name rather
     # than by `hash`, which is salted per process and would make this irreproducible.
     loader = lambda path: hashed_eval(sum(map(ord, path)) % 9973 + 1)  # noqa: E731
-    cost = [(50, {"euros": 1.0, "training_seconds": 600.0}),
-            (150, {"euros": 3.0, "training_seconds": 1800.0})]
+    cost = {"r": [(50, {"euros": 1.0, "training_seconds": 600.0}),
+            (150, {"euros": 3.0, "training_seconds": 1800.0})]}
     report = league_mod.run_league(
         pool, games=2, n_sims=4, max_plies=40, anchor_every=1,
         search_impl="torch", device=DEVICE, seed=0, cost=cost,
@@ -612,7 +617,7 @@ class TestRunLeague:
         assert len(report["curve"]) == len(pool)
         ids = [r["checkpoint_id"] for r in report["curve"]]
         assert ids == [p.name for p in pool]
-        assert report["fit"]["anchor"] == "anchor"
+        assert report["fit"]["anchor"] == league_mod.RANDOM_NAME
         assert report["curve"][0]["elo"] == 0.0, "the anchor is the zero of the scale"
 
     def test_every_game_is_scored_none_are_lost(self, league):
@@ -636,9 +641,9 @@ class TestRunLeague:
         # hand six weeks later.
         _pool, report = league
         by_id = {r["checkpoint_id"]: r for r in report["curve"]}
-        assert by_id["anchor"]["euros_spent"] == 0.0
-        assert by_id["r@100"]["euros_spent"] == 1.0     # last record at or before 100
-        assert by_id["r@150"]["training_seconds"] == 1800.0
+        assert by_id[league_mod.RANDOM_NAME]["euros_spent"] == 0.0
+        assert by_id["r@100:n4"]["euros_spent"] == 1.0     # last record at or before 100
+        assert by_id["r@150:n4"]["training_seconds"] == 1800.0
 
     def test_the_report_renders_as_a_curve(self, league):
         _pool, report = league
@@ -880,3 +885,210 @@ class TestTerminalNames:
         for name in env.TERMINAL_NAMES.values():
             assert f"terminal_{name}" in snap, name
         assert "terminal_codes" not in snap, "the by-index list is gone"
+
+
+# --------------------------------------------------------------------------- #
+# §5.1 — the zero is uniformly random legal play
+# --------------------------------------------------------------------------- #
+
+class TestTheRandomAnchor:
+    """The anchor rebased 2026-08-08. What it must be, and what it must not depend on."""
+
+    def _search(self, B=32, n=8, seed=0):
+        import torch
+        from brokefish.nn.model import BrokefishNet
+        from brokefish.search import Search, SearchConfig, make_evaluator
+        torch.manual_seed(0)
+        net = BrokefishNet().to(DEVICE).eval()
+        s = Search(SearchConfig(n=n, B=B, E=96), evaluate=make_evaluator(net),
+                   device=DEVICE, seed=seed)
+        b, c = env.initial_boards(B, device=DEVICE)
+        s.reset(b, c)
+        return s
+
+    def test_every_move_it_plays_is_legal(self):
+        """Over a long random game, judged by `movegen` and not by the search."""
+        import torch
+        from brokefish.search.torch_impl import MOVE_BITS, PROMO_SHIFT
+        s = self._search(B=32)
+        illegal = 0
+        with torch.no_grad():
+            for _ in range(80):
+                s.reset_finished()
+                legal = env.bitset_to_bool(env.movegen(s.game_board, s.game_control)[0])
+                promo_ok = s._promotion_targets(s.game_board, s.game_control) & legal
+                lab = s.random_move().played.to(torch.int64)
+                mv, pr = lab & ((1 << MOVE_BITS) - 1), (lab >> PROMO_SHIFT) & 0b11
+                rows = torch.arange(32, device=DEVICE)
+                illegal += int((~legal[rows, mv // 64, mv % 64]).sum())
+                # A promotion *type* on a move that is not a promotion is illegal too.
+                illegal += int(((pr > 0) & ~promo_ok[rows, mv // 64, mv % 64]).sum())
+        assert illegal == 0
+
+    def test_it_is_uniform_over_the_move_set(self):
+        """χ² against the flat distribution on the opening position (20 legal moves).
+
+        Uniformity is the whole definition, so it is tested as a distribution rather
+        than as "it played several different moves".
+        """
+        import collections
+        import torch
+        s = self._search(B=8192, seed=1)
+        with torch.no_grad():
+            played = s.random_move().played.tolist()
+        counts = collections.Counter(played)
+        legal = int(env.bitset_to_bool(
+            env.movegen(s.game_board[:1] * 0 + s.game_board[:1], s.game_control[:1])[0]).sum())
+        assert len(counts) == 20 and legal == 20, (len(counts), legal)
+        exp = 8192 / 20
+        chi2 = sum((k - exp) ** 2 / exp for k in counts.values())
+        # 19 df: the 99.9th percentile is 43.8. A biased sampler blows past it.
+        assert chi2 < 43.8, f"chi2 = {chi2:.1f} on 19 df — not uniform"
+
+    def test_it_never_touches_the_network(self):
+        """The property the whole rebase rests on: independent of the *network*."""
+        import torch
+        from brokefish.search import Search, SearchConfig
+
+        def refuse(*_a, **_k):
+            raise AssertionError("the random player evaluated a position")
+
+        s = Search(SearchConfig(n=8, B=8, E=96), evaluate=refuse, device=DEVICE, seed=0)
+        b, c = env.initial_boards(8, device=DEVICE)
+        s.reset(b, c)
+        with torch.no_grad():
+            for _ in range(30):
+                s.reset_finished()
+                s.random_move()
+
+    def test_it_does_not_move_when_the_search_config_does(self):
+        """⚠️ The failure that motivated the rebase.
+
+        The old anchor was a network *plus a search*, so §6.1a's root terminal sweep
+        made it stronger while its file was untouched. A random player built as a
+        one-simulation search would inherit exactly that. This asserts the sequence of
+        moves is identical under every search flag, from the same seed.
+        """
+        import torch
+        from brokefish.nn.model import BrokefishNet
+        from brokefish.search import Search, SearchConfig, make_evaluator
+
+        def moves(**flags):
+            torch.manual_seed(0)
+            net = BrokefishNet().to(DEVICE).eval()
+            s = Search(SearchConfig(n=8, B=16, E=96, **flags),
+                       evaluate=make_evaluator(net), device=DEVICE, seed=3)
+            b, c = env.initial_boards(16, device=DEVICE)
+            s.reset(b, c)
+            out = []
+            with torch.no_grad():
+                for _ in range(40):
+                    s.reset_finished()
+                    out.append(s.random_move().played.clone())
+            return torch.stack(out)
+
+        base = moves()
+        for flags in ({"root_terminal_sweep": False}, {"terminal_collapse": True},
+                      {"eps": 0.0}, {"pb_c_init": 99.0}, {"tau_plies": 0}):
+            assert torch.equal(base, moves(**flags)), \
+                f"the anchor moved when {flags} changed — it is not rules-only"
+
+    def test_a_terminal_position_is_refused_rather_than_played(self):
+        """`multinomial` on an all-zero row returns index 0 — an illegal 'move', silently."""
+        import torch
+        from brokefish.nn.model import BrokefishNet
+        from brokefish.search import Search, SearchConfig, make_evaluator
+        torch.manual_seed(0)
+        net = BrokefishNet().to(DEVICE).eval()
+        s = Search(SearchConfig(n=8, B=2, E=96), evaluate=make_evaluator(net),
+                   device=DEVICE, seed=0, check_invariants=False)
+        # Black is checkmated: no legal move at all.
+        b, c = env.from_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1")
+        s.reset(b.to(DEVICE).expand(2, -1).contiguous(), c.to(DEVICE).expand(2).contiguous())
+        with torch.no_grad():
+            with pytest.raises(AssertionError, match="no legal move"):
+                s.random_move()
+
+    def test_the_record_it_emits_can_never_become_training_data(self):
+        import torch
+        s = self._search(B=8)
+        with torch.no_grad():
+            rec = s.random_move()
+        assert int(rec.policy_len.sum()) == 0
+        # train/loss.py refuses a zero-length policy, which is the second lock.
+        from brokefish.train import loss as loss_mod
+        assert "policy_len > 0" in open(loss_mod.__file__).read()
+
+
+# --------------------------------------------------------------------------- #
+# §5.1a — a player is a (network, budget) pair
+# --------------------------------------------------------------------------- #
+
+class TestTheBudgetAxis:
+
+    def test_the_pool_is_ordered_by_strength_so_the_calendar_bridges_it(self, tmp_path):
+        pool = _pool_with(tmp_path, steps=(100, 200, 300), sims=64,
+                          ladder=(1, 4, 16, 64))
+        names = [p.name for p in pool]
+        assert names[0] == league_mod.RANDOM_NAME
+        assert names[1:5] == ["init:n1", "init:n4", "init:n16", "init:n64"]
+        assert [p.sims for p in pool[:5]] == [0, 1, 4, 16, 64]
+        # The ladder rungs sit inside the small SAI offsets of the anchor, which is
+        # what makes the zero estimable instead of hanging off a saturated edge.
+        pairs = set(league_mod.sai_pairings(len(pool), anchor_every=4))
+        assert {(0, 1), (0, 2), (0, 3)} <= pairs
+
+    def test_budget_variants_of_one_checkpoint_always_play_each_other(self, tmp_path):
+        pool = _pool_with(tmp_path, steps=(100, 200, 300), sims=64,
+                          ladder=(64,), grid=(16, 256), grid_points=3)
+        ladder = league_mod.budget_ladder_pairs(pool)
+        by_name = {i: p.name for i, p in enumerate(pool)}
+        got = {tuple(sorted((by_name[i], by_name[j]))) for i, j in ladder}
+        for step in (100, 200, 300):
+            for a, b in ((16, 64), (16, 256), (64, 256)):
+                key = tuple(sorted((f"r@{step}:n{a}", f"r@{step}:n{b}")))
+                assert key in got, f"{key} never plays, so the sims axis is unmeasured"
+
+    def test_the_random_player_has_no_budget_edges(self, tmp_path):
+        pool = _pool_with(tmp_path, steps=(100,), sims=64, ladder=(1, 64))
+        for i, j in league_mod.budget_ladder_pairs(pool):
+            assert pool[i].path is not None and pool[j].path is not None
+
+    def test_a_pool_without_the_anchor_is_refused(self):
+        """⚠️ `fit_elo` unions the anchor in, so it would invent a phantom at Elo 0
+        that played no games and pin every rating to the prior. Silently."""
+        with pytest.raises(ValueError, match="phantom"):
+            league_mod.run_league(
+                [league_mod.PoolEntry("a", 0, None), league_mod.PoolEntry("b", 1, None)],
+                games=2)
+
+    def test_the_anchor_span_stops_paying_for_saturated_edges(self):
+        wide = set(league_mod.sai_pairings(60, anchor_every=4))
+        capped = set(league_mod.sai_pairings(60, anchor_every=4, anchor_span=16))
+        # `anchor_every=4` puts the anchor's spread on 1, 5, 9, ... — 41 is one of them.
+        assert (0, 41) in wide and (0, 41) not in capped
+        assert (0, 59) in capped, "one far edge is kept, as the saturation check"
+        assert (0, 5) in capped and (0, 13) in capped, "the near edges must survive"
+
+    def test_the_curve_row_carries_the_players_own_budget(self, league):
+        _pool, report = league
+        by_id = {r["checkpoint_id"]: r for r in report["curve"]}
+        assert by_id[league_mod.RANDOM_NAME]["n_sims"] == 0
+        assert by_id["r@100:n4"]["n_sims"] == 4
+
+    def test_the_anchor_and_the_ladder_cost_exactly_zero_not_null(self, league):
+        """⚠️ Regression: in a joint league `cost` is keyed by run and the anchor has
+        none, so its x was written as null. A missing x reads as 'not measured'."""
+        _pool, report = league
+        row = {r["checkpoint_id"]: r for r in report["curve"]}[league_mod.RANDOM_NAME]
+        assert row["euros_spent"] == 0.0 and row["training_seconds"] == 0.0
+
+
+def _pool_with(tmp_path, steps, sims, ladder=(), grid=(), grid_points=0):
+    """A pool over fake checkpoint files, so pool shape can be tested without a card."""
+    for s in steps:
+        (tmp_path / f"r-{s:06d}.pt").write_bytes(b"")
+    (tmp_path / "anchor.pt").write_bytes(b"x")
+    return league_mod.build_pool(
+        ["r"], checkpoint_dir=str(tmp_path), anchor_path=str(tmp_path / "anchor.pt"),
+        limit=None, sims=sims, ladder=ladder, grid=grid, grid_points=grid_points)

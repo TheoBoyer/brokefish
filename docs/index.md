@@ -31,8 +31,13 @@ lc0 is the only project that has reached superhuman play from scratch, at roughl
 eight GPU-years per run on volunteer compute that was never costed. Solo attempts
 published since then plateau between 1200 and 2000 Elo, or start from a supervised
 network. The nearest reference point with a full accounting is
-[AlphaGateau](https://arxiv.org/abs/2410.23753), which reached 1830-2100 Elo in
-13.7 days on eight A5000s with a 1M-parameter network and 128k games.
+[AlphaGateau](https://arxiv.org/abs/2410.23753), which reached 2105 ± 42 Elo in
+13.7 days on eight A5000s with a 5-layer graph network.
+⚠️ **That rating is self-anchored** — a fit over their own checkpoints with the pool
+mean pinned at 1000, not an external rating — so it is not directly comparable to any
+number here. Their reported *cost* is, and it is 65.5M positions (256 streams of 512
+plies × 500 iterations), not the "128k games" this page said until 2026-08-09.
+See `journal/2026-08-09-alphagateau-read.md`.
 
 Brokefish targets that range first, then measures Elo gained per additional order of
 magnitude of compute.

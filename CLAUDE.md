@@ -47,8 +47,14 @@ distillation through a one-bit channel and looks like good practice.
   **NN-bound, not env-bound** — measured: the environment is 2.2 % of a node.
 - **Gate 1 (engineering)**: ≥45-50k evals/s **inside a real MCTS loop** on the 4060.
   **Cleared 2026-07-30: 56 996 useful evals/s at n=800, B=4096** (`bench_search.py`,
-  `logs/gate1a.log`, `docs/ledger/perf.md`). **Gate 2 (science)**: beat AlphaGateau
-  (~2100 Elo) with an Elo slope matching Jones' law (+500 Elo per 10× compute).
+  `logs/gate1a.log`, `docs/ledger/perf.md`). **Gate 2 (science)**: ⚠️ **restated
+  2026-08-09 after reading the paper** (`docs/journal/2026-08-09-alphagateau-read.md`).
+  AlphaGateau's 2105 is **self-anchored with its own pool mean pinned at 1000**
+  (`elo.py:96`) — no external reference anywhere in their repo — so "beat ~2100 Elo"
+  compared two arbitrary scales and was never well posed. The gate is now: **an Elo
+  slope matching Jones' law (+500 per 10× compute)**, plus a **direct head-to-head
+  against their released checkpoint**, which their repository ships and which needs no
+  rating conversion.
   ⚠️ **The slope depends on the evaluation budget** (measured 2026-08-08: +408/+703/+793
   per decade at n = 16/64/256), so a Gate 2 claim without its `n` is not a claim. And
   the *level* half is unmeasurable today — `evaluation.md` §6 calibration has never run,

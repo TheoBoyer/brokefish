@@ -60,6 +60,17 @@ strategy up front. Retrofitting it is exactly what produced NaN on 116 boards of
 from a `q_max` that disagreed across two languages, while every isolated component
 tested clean.
 
+> ⚠️ **Correction, same day, after reading `encoder.cu` instead of reasoning about it.**
+> The paragraph above originally continued *"and it shrinks the weight tiles, which is
+> the SMEM pressure blocking two-boards-per-CTA — the two levers may come for the price
+> of one."* **That is false.** `encoder.cu:52`: *"Three activation buffers and nothing
+> else — no weight tile, because the weights never pass through shared memory."*
+> Weights go global → registers → mma and never occupy SMEM at all, so making them fp8
+> frees **no** shared memory and unlocks no extra board per CTA. What fp8 weights buy is
+> real but narrower: half the L2→register traffic, and the 41.6 TFLOPS e4m3 issue rate
+> instead of 35.5. The SMEM budget is **activations**, and only an fp8 *residual stream*
+> would move it. See the occupancy arithmetic below.
+
 ### 2. Solve the occupancy equation on paper before writing the kernel
 
 The current design arrived at 1 board/CTA and 2 CTAs/SM, and *then* discovered that
@@ -71,6 +82,50 @@ Enumerating `(boards/CTA, CTAs/SM, weight precision)` against 99 KB of SMEM and 
 registers per SM is a small search, and it is the decision every later tuning inherits.
 Doing it after the kernel exists means discovering the constraint one blocked idea at a
 time.
+
+**Solved, from `encoder.cu`'s own constants.** `T = 32`, `Dm = 256`, `NWARPS = 8` so
+`THREADS = 256`; `SM_A = T·256`, `SM_B = SM_S = T·264` halves, totalling
+**50 176 B** per board. Per SM the machine offers 65 536 registers, 102 400 B of
+shared memory and 48 warps. At the shipped point of 2 CTAs/SM:
+
+| resource | used | available | |
+|---|---:|---:|---|
+| registers | 2 × 256 × 128 = **65 536** | 65 536 | **100 %** |
+| shared memory | 2 × 50 176 = **100 352** | 102 400 | **98 %** |
+| warps | 2 × 8 = **16** | 48 | 33 % |
+
+⚠️ **Both hard budgets are saturated to the byte and to the register.** That is not a
+coincidence — `AROWA` drops bufA's padding precisely to save the 512 B that buys the
+second CTA — but it does mean the design has no slack anywhere, and it is why every
+listed optimisation came back "exceeds the 128-register or 50 176-byte budget".
+
+The reachable points, with weight traffic per board relative to today:
+
+| variant | SMEM/board | boards/CTA | CTAs/SM | boards/SM | regs/thread | wt traffic/board |
+|---|---:|---:|---:|---:|---:|---:|
+| shipped (fp16 activations) | 50 176 | 1 | 2 | 2 | 128 | 1.00× |
+| fp8 weights everywhere | 50 176 | 1 | 2 | 2 | 128 | **0.50×** |
+| two boards, fp16 activations | 100 352 | 2 | **1** | 2 | **255** | 0.50× |
+| **fp8 activations too** | 25 088 | 2 | 2 | **4** | 128 | **0.25×** |
+
+Two conclusions fall out.
+
+**The ledger's two-boards-per-CTA proposal is really a register play, not a memory
+one.** At 1 CTA/SM the register file divides by 256 threads instead of 512, giving the
+hardware maximum of **255 registers per thread** — which is exactly what every blocked
+lever needed. The price is 8 warps of 48 instead of 16, and the ledger already measured
+that latency hiding suffers there: double-buffering the A fragments is worth *+0.56 % at
+1 CTA/SM and ±0 at 2*, i.e. at 2 CTAs the extra warps already cover LDSM latency and at
+1 CTA they do not.
+
+**And the only variant that raises boards per SM without paying occupancy is the one
+that puts the *activations* in fp8.** That is a numerics decision about the residual
+stream across eight layers, not a layout decision, and it is a much larger accuracy
+question than fp8 weights: `2026-08-04-fp8-encoder.md` measured 0.66 % max prior-space
+error for FFN *weights*, and says three quarters of the error in the full-fp8 variant
+came from the other two matmuls. Half measures do not fit either — keeping the residual
+in fp16 and demoting only `SM_B`/`SM_S` gives 33 280 B per board, and two of those is
+66 560 B, which still does not fit twice on an SM.
 
 ### 3. Do not let Triton's limitations pin the architecture
 

@@ -166,6 +166,27 @@ struct Params {
     float pb_c_init;
 };
 
+// §11's `select_root` / `select_interior`, Gumbel MuZero. `root_gumbel == nullptr`
+// is how the host says the flag is off -- the same "absent means null" convention
+// `edge_win` and `Counters` already use, so the feature has one representation and
+// cannot disagree with an allocation.
+//
+// `table` is `[m_max + 1, budget]` int32, the sequential-halving schedule built on
+// the host by `brokefish/search/gumbel.py`. Row `m` is indexed by the number of
+// simulations already spent on this move, and holds the visit count the edge to be
+// visited must currently have. Building it on device would mean a serial loop per
+// warp per simulation; it is 13 k ints at n = 800 and it changes only when the
+// budget does.
+struct Gumbel {
+    const float* root_gumbel;   // [B, kE], or nullptr for PUCT
+    const int32_t* table;       // [(m_max + 1) * budget]
+    int m_max;
+    int budget;                 // the table's row stride, i.e. this move's budget
+    float c_visit;
+    float c_scale;
+    bool interior;              // false leaves §6.6 in place below the root
+};
+
 __device__ inline size_t node_at(const Tree& t, int b, int v) {
     return (size_t)b * t.N + v;
 }
@@ -286,6 +307,219 @@ __device__ inline int puct_argmax(const int16_t* nvis, const __half* prior, cons
         }
     }
     return __shfl_sync(kAll, best_e, 0);
+}
+
+// ---------------------------------------------------------------------------
+// §11, the Gumbel selection score
+// ---------------------------------------------------------------------------
+
+// Warp-collective float reductions, uniform result. Written out rather than using
+// `__reduce_*_sync`, which the toolkit only provides for integers.
+__device__ inline float warp_sum_f(float x) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) x += __shfl_xor_sync(kAll, x, off);
+    return x;
+}
+__device__ inline float warp_max_f(float x) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) x = fmaxf(x, __shfl_xor_sync(kAll, x, off));
+    return x;
+}
+__device__ inline float warp_min_f(float x) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) x = fminf(x, __shfl_xor_sync(kAll, x, off));
+    return x;
+}
+
+// `torch.finfo(torch.float16).tiny`, the clamp under the logit recovery. ⚠️ Not
+// cosmetic: `edge_prior` is fp16 and underflows to a hard zero below this, and a
+// `-inf` logit on a *legal* move is unreachable at every budget -- the same
+// absorbing state the FPU bug was, one level up. See `gumbel.edge_logits`.
+constexpr float kHalfTiny = 6.103515625e-05f;
+// `mctx.seq_halving.score_considered`'s floor, which keeps a row from being all
+// `-inf` before the visit-count penalty is applied.
+constexpr float kLowLogit = -1e9f;
+// `qtransform_completed_by_mix_value`'s epsilon on the min-max range. At a node
+// with no visits every completed value is `v_mix`, so the range is exactly 0 and
+// this is what stops `0 / 0`: `sigma` comes out uniformly zero and `pi'` is the
+// prior, which is the correct answer there.
+constexpr float kQEps = 1e-8f;
+
+// The Gumbel argmax over one node's edges. Warp-collective, uniform result, and
+// the same lane-to-edge map as `puct_argmax`.
+//
+// ⚠️ **Bit-exactness is not guaranteed here the way it is for PUCT.** PUCT's only
+// reduction is a sum of non-negative integers, exact in any order; this needs float
+// sums -- `sum_probs`, the softmax denominator -- whose warp-shuffle tree differs
+// from the order torch's reduction happens to use, so the two can differ in the
+// last ulp and a last-ulp difference at a tie is a different tree.
+//
+// What makes that survivable is the opposite of what made PUCT hard: at a freshly
+// created node every PUCT score is exactly 0, so ties are the *common* case and the
+// tie-break alone decides the first descent below every new node. Here the scores
+// carry distinct logits and continuous Gumbel noise, so exact ties are measure
+// zero. Measured rather than argued -- `tests/test_search_cuda.py`'s five Gumbel
+// tests still assert the trees are **identical**, and they are, over 1088
+// simulations across four position sets, three budgets and both rules. Treat that
+// as an empirical result that could fail on a position with duplicate logits, not
+// as the guarantee `test_flat_priors_agree_bit_for_bit` gives PUCT.
+//
+// `root` selects between the two rules -- they are different rules, not one rule
+// with different constants, which is why the descent has to pass its depth down.
+__device__ inline int gumbel_argmax(const int16_t* nvis, const __half* prior,
+                                    const float* qs, const uint8_t* win,
+                                    float node_value, const float* gum,
+                                    bool root, int nedges, int lane,
+                                    const Gumbel& gp) {
+    // Held in registers across three passes rather than re-read: kEPerLane is 3, so
+    // this is nine registers against nine repeated global loads of L2-resident data.
+    float pr[kEPerLane], qv[kEPerLane], comp[kEPerLane];
+    int nv[kEPerLane];
+    bool own[kEPerLane];
+
+    float own_visits = 0.0f, own_maxv = 0.0f, own_probs = 0.0f;
+#pragma unroll
+    for (int j = 0; j < kEPerLane; ++j) {
+        const int e = lane + 32 * j;
+        own[j] = e < nedges;
+        nv[j] = own[j] ? (int)nvis[e] : 0;
+        pr[j] = own[j] ? __half2float(prior[e]) : 0.0f;
+        qv[j] = own[j] ? qs[e] : 0.0f;
+        // Non-negative integers summing to at most `n`, so fp32 is exact whatever
+        // the reduction order -- the same argument `puct_argmax` makes for doing it
+        // in integers, and here it has to be float anyway for the shuffle.
+        own_visits += (float)nv[j];
+        own_maxv = fmaxf(own_maxv, (float)nv[j]);
+        if (nv[j] > 0) own_probs += pr[j];
+    }
+    const float sum_visits = warp_sum_f(own_visits);
+    const float max_visits = warp_max_f(own_maxv);
+    const float sum_probs = warp_sum_f(own_probs);
+
+    // `mctx._compute_mixed_value`. The `where` on the denominator is theirs: the
+    // numerator is already zero wherever `sum_probs` is, so this only keeps 0/0 out.
+    const float denom = sum_probs > 0.0f ? sum_probs : 1.0f;
+    float own_wq = 0.0f;
+#pragma unroll
+    for (int j = 0; j < kEPerLane; ++j) {
+        if (nv[j] > 0) own_wq += pr[j] * qv[j] / denom;
+    }
+    const float v_mix = (node_value + sum_visits * warp_sum_f(own_wq)) / (sum_visits + 1.0f);
+
+    // Complete, then min-max rescale over the **valid prefix only**. `mctx`
+    // rescales over its whole fixed action space, illegal actions included; the
+    // edge list here is ragged under a cap and its tail is padding, so the padding
+    // is excluded. `gumbel.py`'s module docstring is where that deviation lives.
+    float own_lo = INFINITY, own_hi = -INFINITY;
+#pragma unroll
+    for (int j = 0; j < kEPerLane; ++j) {
+        comp[j] = nv[j] > 0 ? qv[j] : v_mix;
+        if (own[j]) {
+            own_lo = fminf(own_lo, comp[j]);
+            own_hi = fmaxf(own_hi, comp[j]);
+        }
+    }
+    const float lo = warp_min_f(own_lo);
+    const float span = fmaxf(warp_max_f(own_hi) - lo, kQEps);
+    const float vscale = (gp.c_visit + max_visits) * gp.c_scale;
+
+    // §6.6a. One warp-wide ballot before the scoring loop, so the branch is uniform
+    // and the reference's `win.any(-1)` is reproduced exactly. Identical to
+    // `puct_argmax`'s: the collapse is an override on an argmax, and both rules are
+    // argmaxes.
+    bool collapsed = false;
+    if (win) {
+        bool mine = false;
+#pragma unroll
+        for (int j = 0; j < kEPerLane; ++j) {
+            if (own[j] && win[lane + 32 * j]) mine = true;
+        }
+        collapsed = __any_sync(kAll, mine);
+    }
+
+    float sc[kEPerLane];
+    if (collapsed) {
+#pragma unroll
+        for (int j = 0; j < kEPerLane; ++j) {
+            sc[j] = (own[j] && win[lane + 32 * j]) ? -(float)nv[j] : -INFINITY;
+        }
+    } else if (root) {
+        // The schedule lookup. `sum_visits` *is* the simulation index because §6.1a
+        // does not seed `edge_N` under Gumbel -- see `_seed_terminal_edges`, where
+        // skipping the seed is what keeps the root in phase with this table.
+        const int m = min(max(nedges, 1), gp.m_max);
+        int idx = (int)sum_visits;
+        if (idx >= gp.budget) idx = gp.budget - 1;
+        const float want = (float)gp.table[(size_t)m * gp.budget + idx];
+
+        float own_lg[kEPerLane], own_max = -INFINITY;
+#pragma unroll
+        for (int j = 0; j < kEPerLane; ++j) {
+            own_lg[j] = own[j] ? logf(fmaxf(pr[j], kHalfTiny)) : -INFINITY;
+            own_max = fmaxf(own_max, own_lg[j]);
+        }
+        const float lmax = warp_max_f(own_max);
+#pragma unroll
+        for (int j = 0; j < kEPerLane; ++j) {
+            const int e = lane + 32 * j;
+            const float sigma = vscale * ((comp[j] - lo) / span);
+            const float s = fmaxf(gum[e] + (own_lg[j] - lmax) + sigma, kLowLogit);
+            sc[j] = (own[j] && (float)nv[j] == want) ? s : -INFINITY;
+        }
+    } else {
+        // `pi'(a) - N(a) / (1 + sum N)`. Argmaxing this repeatedly with `N` updated
+        // drives the visit frequencies towards `pi'` -- paper §5. The softmax is
+        // shifted by its max for the usual reason, which is free here because the
+        // max is a reduction the row needs anyway.
+        float own_z[kEPerLane], own_max = -INFINITY;
+#pragma unroll
+        for (int j = 0; j < kEPerLane; ++j) {
+            own_z[j] = own[j] ? logf(fmaxf(pr[j], kHalfTiny))
+                                    + vscale * ((comp[j] - lo) / span)
+                              : -INFINITY;
+            own_max = fmaxf(own_max, own_z[j]);
+        }
+        const float zmax = warp_max_f(own_max);
+        float own_e[kEPerLane], own_sum = 0.0f;
+#pragma unroll
+        for (int j = 0; j < kEPerLane; ++j) {
+            own_e[j] = own[j] ? expf(own_z[j] - zmax) : 0.0f;
+            own_sum += own_e[j];
+        }
+        const float esum = warp_sum_f(own_sum);
+#pragma unroll
+        for (int j = 0; j < kEPerLane; ++j) {
+            sc[j] = own[j] ? own_e[j] / esum - (float)nv[j] / (1.0f + sum_visits)
+                           : -INFINITY;
+        }
+    }
+
+    float best = -INFINITY;
+    int best_e = kE;
+#pragma unroll
+    for (int j = 0; j < kEPerLane; ++j) {
+        // j ascends with the edge index, so a plain `>` breaks the within-lane tie
+        // towards the lower index, as in `puct_argmax`.
+        if (sc[j] > best) {
+            best = sc[j];
+            best_e = lane + 32 * j;
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        const float other = __shfl_down_sync(kAll, best, off);
+        const int other_e = __shfl_down_sync(kAll, best_e, off);
+        if (other > best || (other == best && other_e < best_e)) {
+            best = other;
+            best_e = other_e;
+        }
+    }
+    best_e = __shfl_sync(kAll, best_e, 0);
+    // Every edge masked out is possible only if the schedule and the tree disagree,
+    // which `_seed_terminal_edges` is what prevents. Falling back to edge 0 keeps
+    // the tree well formed rather than indexing `kE`; the reference's
+    // `_lowest_argmax` over an all-`-inf` row does the same thing.
+    return best_e < kE ? best_e : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -652,7 +886,7 @@ __global__ void root_init_kernel(Tree t, const uint16_t* __restrict__ game_board
 // §6.2: select down to a leaf, apply the move, count repetitions, test for
 // termination, allocate. One warp per game, and the tree walk never leaves the
 // kernel, which is the whole reason the engine lives in headers.
-__global__ void descent_kernel(Tree t, Luts g, Params p, int s,
+__global__ void descent_kernel(Tree t, Luts g, Params p, Gumbel gp, int s,
                                Counters* __restrict__ ctr) {
     __shared__ SharedLuts sl;
     __shared__ SharedZobrist sz;
@@ -679,9 +913,17 @@ __global__ void descent_kernel(Tree t, Luts g, Params p, int s,
                 break;
             }
             const size_t ev = edge_at(t, b, v);
-            const int e = puct_argmax(t.edge_N + ev, t.edge_prior + ev, t.edge_Q + ev,
-                                      t.edge_win ? t.edge_win + ev : nullptr,
-                                      (int)t.node_nedges[node_at(t, b, v)], lane, p);
+            const int ne = (int)t.node_nedges[node_at(t, b, v)];
+            const uint8_t* win = t.edge_win ? t.edge_win + ev : nullptr;
+            // §11. Null `root_gumbel` is PUCT; with it on, `gp.interior` decides
+            // whether §6.6 survives below depth 0. `d` is the depth, so this is the
+            // only place the two rules are told apart.
+            const int e = (gp.root_gumbel && (d == 0 || gp.interior))
+                ? gumbel_argmax(t.edge_N + ev, t.edge_prior + ev, t.edge_Q + ev, win,
+                                __half2float(t.node_value[node_at(t, b, v)]),
+                                gp.root_gumbel + (size_t)b * kE, d == 0, ne, lane, gp)
+                : puct_argmax(t.edge_N + ev, t.edge_prior + ev, t.edge_Q + ev, win,
+                              ne, lane, p);
             if (lane == 0) {
                 path_node[d] = (int16_t)v;
                 path_edge[d] = (uint8_t)e;

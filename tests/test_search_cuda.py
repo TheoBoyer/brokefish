@@ -148,7 +148,9 @@ class Probe:
         """
         return s._puct_scores(v)
 
-    def __call__(self, v):
+    def __call__(self, v, depth: int = 0):
+        # `depth` reaches `_select` because §11's two Gumbel rules differ by it; the
+        # PUCT probe ignores it and passes it straight through.
         a = self._scores(self.ref, v)
         b = self._scores(self.cu, v)
         finite = torch.isfinite(a) & torch.isfinite(b)
@@ -168,7 +170,7 @@ class Probe:
             if gap.numel():
                 self.margin = min(self.margin, float(gap.min()))
         self.selections += int(v.numel())
-        return self.inner(v)
+        return self.inner(v, depth)
 
 
 def _pair(boards, control, n, eps=0.0, seed=11, stats=False, tau_plies=30,
@@ -797,3 +799,135 @@ def test_agrees_with_the_collapse_deep_in_the_endgame():
     live = int(max(ref.node_count.max(), cu.node_count.max()))
     marked = int(ref.edge_win[:, :live].sum())
     print(f"    collapse, endgame: {marked} winning edges proved across the batch")
+
+
+# --------------------------------------------------------------------------- #
+# §11, Gumbel: the comparison that cannot be bit-exact, and what replaces it
+# --------------------------------------------------------------------------- #
+
+def _gumbel_pair(boards, control, n, seed=11, collapse=False, interior=True):
+    """A reference and a kernel Gumbel search over the same games and the same noise.
+
+    ⚠️ The Gumbel draw is **copied**, not reseeded. Both classes inherit
+    `_draw_root_gumbel` and would consume the same generator stream only as long as
+    the two `root_init` paths make the same number of calls — which is exactly the
+    coupling `dirichlet`'s docstring warns is fragile. Copying makes the noise a
+    shared input rather than a coincidence, so what this measures is the selection
+    arithmetic and nothing else.
+    """
+    B = boards.shape[0]
+    cfg = SearchConfig(n=n, B=B, E=int(_ext().edge_cap()), gumbel=True,
+                       terminal_collapse=collapse, gumbel_interior=interior)
+    # `Recording`, not the plain reference: `_differences` compares §6.3's staging
+    # too, and only this subclass keeps what the reference handed the encoder.
+    ref = Recording(cfg, hash_eval, env=env, device="cuda", seed=seed)
+    cu = search_impl("cuda")(cfg, hash_eval, env=env, device="cuda", seed=seed)
+    ref.reset(boards.clone(), control.clone())
+    cu.reset(boards.clone(), control.clone())
+    return ref, cu
+
+
+def _run_gumbel(ref, cu, moves=1, label=""):
+    """Both searches, simulation by simulation, reporting where they first part.
+
+    ⚠️ **Bit-exactness is not available here and the kernel says why.** PUCT's only
+    reduction is a sum of non-negative integers, exact in any order; Gumbel needs
+    float sums — `sum_probs`, the softmax denominator — whose warp-shuffle tree
+    differs from torch's, so the two differ in the last ulp. What makes that
+    survivable is that PUCT's *ties are the common case* (every score at a fresh
+    node is exactly 0, and the tie-break alone decides the first descent) while
+    Gumbel's are measure-zero: continuous noise and distinct logits.
+
+    So this asserts the trees are identical, and on a divergence prints the
+    simulation it happened at rather than only that it did — a divergence at
+    simulation 3 is a wrong formula, one at simulation 500 is an ulp.
+    """
+    n = ref.config.n
+    for m in range(moves):
+        ref.root_init()
+        cu.root_init()
+        cu.root_gumbel.copy_(ref.root_gumbel)
+        for s in range(n):
+            ref.simulate(s)
+            cu.simulate(s)
+            diffs = _differences(ref, cu)
+            assert not diffs, (f"{label}diverged at move {m}, simulation {s} of {n}:"
+                               f"\n  " + "\n  ".join(diffs[:6]))
+        r1, r2 = ref.select_and_advance(), cu.select_and_advance()
+        for f in ("board", "control", "rep", "policy_move", "policy_len", "played",
+                  "ply", "done", "result"):
+            x, y = getattr(r1, f), getattr(r2, f)
+            assert bool((x == y).all()), f"{label}move {m}: the record's {f} differs"
+        # ⚠️ The target and `root_value` are computed by the *inherited torch*
+        # `select_and_advance` on each side's own tree, so they are equal exactly
+        # when the trees are — a tolerance here would hide a tree difference the
+        # loop above is meant to catch. fp16 storage is the only slack allowed.
+        assert float((r1.policy_prob.float() - r2.policy_prob.float()).abs().max()) == 0.0
+        assert float((r1.root_value - r2.root_value).abs().max()) == 0.0
+        for f in ("game_board", "game_control", "game_hash", "game_ring",
+                  "game_ring_len", "game_ply", "game_done", "game_result"):
+            assert bool((getattr(ref, f) == getattr(cu, f)).all()), \
+                f"{label}move {m}: {f} differs after the move"
+        if bool(ref.game_done.any()):
+            ref.reset_finished()
+            cu.reset_finished()
+    print(f"    {label}{moves} move(s) x {n} simulations: trees identical")
+
+
+def test_gumbel_agrees_from_the_start_position():
+    boards, control = env.initial_boards(8, device="cuda")
+    ref, cu = _gumbel_pair(boards, control, n=192)
+    _run_gumbel(ref, cu, label="gumbel startpos: ")
+
+
+def test_gumbel_agrees_across_moves_on_random_positions():
+    """Several moves and wide edge sets, which is where the halving phases differ.
+
+    `m = min(16, nedges)` varies across the batch here, so every row is on a
+    different schedule row of the table — the case a single-position test cannot
+    reach, and the one an off-by-one in the schedule index would break.
+    """
+    boards, control = _live(24, plies=60, seed=5)
+    ref, cu = _gumbel_pair(boards, control, n=96)
+    _run_gumbel(ref, cu, moves=3, label="gumbel random: ")
+
+
+def test_gumbel_agrees_with_the_root_rule_alone():
+    """`gumbel_interior = False`: §6.6 below the root, Gumbel at it.
+
+    The two rules are dispatched by depth in one kernel branch, so this is what
+    says the branch is on `d == 0` and not on something correlated with it.
+    """
+    boards, control = _live(16, plies=40, seed=3)
+    ref, cu = _gumbel_pair(boards, control, n=96, interior=False)
+    _run_gumbel(ref, cu, moves=2, label="gumbel root-only: ")
+
+
+def test_gumbel_agrees_with_the_collapse_deep_in_the_endgame():
+    """§6.6a overriding both Gumbel rules, where mates are dense enough to fire."""
+    boards, control = _live(24, plies=160, seed=9)
+    ref, cu = _gumbel_pair(boards, control, n=128, collapse=True)
+    _run_gumbel(ref, cu, moves=3, label="gumbel collapse: ")
+    live = int(max(ref.node_count.max(), cu.node_count.max()))
+    print(f"    gumbel collapse: {int(ref.edge_win[:, :live].sum())} winning edges proved")
+
+
+def test_gumbel_agrees_with_the_collapse_on_a_won_root():
+    """The collapse overriding the halving from the first simulation.
+
+    ⚠️ Added because `test_gumbel_agrees_with_the_collapse_deep_in_the_endgame`
+    proves **0** winning edges on positions where the PUCT run proves 2 — the two
+    rules descend differently, so a test that only asserts agreement can leave the
+    collapse branch of `gumbel_argmax` entirely dead and still pass. Here the root
+    itself is proved won by §6.1a's sweep, so the ballot, the `-N` score and the
+    seeded mask are all on the path, and the count below says so rather than
+    assuming it.
+    """
+    boards, control = _from_fen(MATE_IN_1, copies=2)
+    ref, cu = _gumbel_pair(boards, control, n=96, collapse=True)
+    _run_gumbel(ref, cu, moves=1, label="gumbel won root: ")
+    assert int(ref.edge_win[0, 0].sum()) == 1, "the sweep proved no win on a mate in one"
+    # ⚠️ And no *visit* was seeded: the halving schedule indexes by `sum(N)`, so a
+    # root starting at N = 1 would be out of phase for the whole move.
+    assert int(ref.seeded.sum()) == 0
+    assert int(cu.edge_N[0, 0].sum()) == 96

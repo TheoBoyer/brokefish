@@ -207,12 +207,40 @@ void root_init_cuda(TensorMap tree, torch::Tensor game_board, torch::Tensor game
 void descent_cuda(TensorMap tree, int64_t s, double pb_c_base, double pb_c_init,
                   torch::Tensor move_bitsets, torch::Tensor occl_offsets,
                   torch::Tensor occl_masks, torch::Tensor filled_lines,
-                  torch::Tensor counters) {
+                  torch::Tensor counters, torch::Tensor root_gumbel,
+                  torch::Tensor visit_table, int64_t gumbel_m, double c_visit,
+                  double c_scale, bool gumbel_interior) {
     const Tree t = make_tree(tree);
     if (t.B == 0) return;
     Params p{(float)pb_c_base, (float)pb_c_init};
+
+    // §11's Gumbel. Empty tensors are how the host says "off", the same convention
+    // `edge_win` and `counters` use, so there is no flag that can disagree with an
+    // allocation. Checked here rather than trusted: the kernel indexes
+    // `table[m * budget + idx]` with `m` up to `gumbel_m` and `idx` up to
+    // `budget - 1`, and a table built for a different budget would read a valid
+    // address holding the wrong schedule -- a tree that is wrong and not a crash.
+    Gumbel gp{nullptr, nullptr, (int)gumbel_m, 1, (float)c_visit, (float)c_scale,
+              gumbel_interior};
+    if (root_gumbel.numel()) {
+        TORCH_CHECK(root_gumbel.scalar_type() == torch::kFloat32
+                        && root_gumbel.dim() == 2 && root_gumbel.size(0) == t.B
+                        && root_gumbel.size(1) == kE,
+                    "root_gumbel must be [B, ", kE, "] float32, got ",
+                    root_gumbel.sizes());
+        TORCH_CHECK(visit_table.scalar_type() == torch::kInt32 && visit_table.dim() == 2
+                        && visit_table.size(0) == gumbel_m + 1,
+                    "visit_table must be [gumbel_m + 1, budget] int32, got ",
+                    visit_table.sizes());
+        TORCH_CHECK(root_gumbel.is_contiguous() && visit_table.is_contiguous(),
+                    "root_gumbel and visit_table must be contiguous");
+        gp.root_gumbel = raw<float>(root_gumbel);
+        gp.table = raw<int32_t>(visit_table);
+        gp.budget = (int)visit_table.size(1);
+    }
+
     descent_kernel<<<blocks_for(t.B), kWarps * 32, 0, at::cuda::getCurrentCUDAStream()>>>(
-        t, make_luts(move_bitsets, occl_offsets, occl_masks, filled_lines), p, (int)s,
+        t, make_luts(move_bitsets, occl_offsets, occl_masks, filled_lines), p, gp, (int)s,
         counter_ptr(counters));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

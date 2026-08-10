@@ -384,16 +384,49 @@ def test_the_interior_rule_can_be_turned_off_alone():
     check_invariants(s)
 
 
-def test_the_cuda_search_refuses_rather_than_running_puct():
-    """⚠️ The failure this would otherwise be: a PUCT tree read as a Gumbel one."""
+def test_the_cuda_search_runs_gumbel_rather_than_puct():
+    """The kernel is on the Gumbel path, and it is the *Gumbel* one.
+
+    ⚠️ This replaces a guard that asserted `cuda_impl` **refused** a Gumbel config,
+    which is what it did before `gumbel_argmax` existed. The failure it was there
+    to prevent — a PUCT tree with a Gumbel target read off it, internally consistent
+    and invisible in every counter — is now prevented by the kernel implementing the
+    rule instead, and `tests/test_search_cuda.py` is what holds it to the reference.
+    What is still worth pinning here is that the two paths *differ*: PUCT and Gumbel
+    over the same position and seed must not produce the same visit distribution, or
+    the flag is being dropped somewhere between the config and the kernel.
+    """
     if not torch.cuda.is_available():
         pytest.skip("no CUDA")
+    from brokefish.env import cuda_impl as cenv
     from brokefish.search import search_impl
+    from brokefish.train.sync import PackedWeights
+
     torch.manual_seed(0)
     net = BrokefishNet().to("cuda").eval()
-    with pytest.raises(NotImplementedError, match="descent_kernel"):
-        search_impl("cuda")(SearchConfig(n=8, B=2, E=96, gumbel=True),
-                            evaluate=make_evaluator(net), device="cuda")
+    packed = PackedWeights.pack(net, 0, impl="cuda", fp8=False)
+    visits = {}
+    for g in (False, True):
+        s = search_impl("cuda")(SearchConfig(n=64, B=4, E=96, gumbel=g),
+                                evaluate=packed.evaluate(), env=cenv, device="cuda",
+                                seed=0)
+        s.reset(*cenv.initial_boards(4, device="cuda"))
+        s.self_play_move()
+        visits[g] = s.edge_N[:, 0].clone()
+    ne = 20                                        # the start position's edge count
+    distinct = {g: (v > 0).sum(-1) for g, v in visits.items()}
+    # PUCT reaches every edge at n = 64; Gumbel reaches **exactly** `min(m, nedges)`,
+    # because the top-`m` sample is the whole candidate set and halving only ever
+    # removes from it.
+    assert bool((distinct[False] == ne).all()), distinct[False].tolist()
+    assert bool((distinct[True] == 16).all()), distinct[True].tolist()
+    # And the survivor's visit count is the schedule read off by hand: `m = 16` at
+    # `n = 64` is four phases of `n / (log2(16) * |alive|)` extra visits each, so the
+    # edge that survives to the end carries 1 + 2 + 4 + 8 = 15. An off-by-one in the
+    # table moves this number and moves nothing else.
+    assert bool((visits[True].max(-1).values == 15).all()), \
+        visits[True].max(-1).values.tolist()
+    assert int(visits[True].sum()) == int(visits[False].sum()) == 64 * 4
 
 
 if __name__ == "__main__":

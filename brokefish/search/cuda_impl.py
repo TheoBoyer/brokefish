@@ -118,16 +118,6 @@ class Search(_ref.Search):
     def __init__(self, config: SearchConfig, evaluate: Callable, env=None,
                  device: str | torch.device = "cuda", seed: int = 0,
                  check_invariants: bool = True, collect_stats: bool = False) -> None:
-        if config.gumbel:
-            # ⚠️ A hard error, not a fallback. `descent_kernel` implements §6.6's
-            # PUCT and nothing else, so a Gumbel config here would run a PUCT tree
-            # and then read a Gumbel target off it — internally consistent, wrong,
-            # and invisible in every counter. `search_impl("torch")` is the Gumbel
-            # path until the kernel exists.
-            raise NotImplementedError(
-                "SearchConfig(gumbel=True) has no CUDA kernel yet: csrc/search.cuh's "
-                "descent_kernel is PUCT. Use search_impl('torch'), or run with "
-                "gumbel=False")
         cap = int(_ext().edge_cap())
         if config.E != cap:
             raise ValueError(
@@ -276,7 +266,13 @@ class Search(_ref.Search):
             mask, _ = self.env.movegen(self.game_board, self.game_control)
             self._root_code, self._root_result = self._root_terminal_scan(mask)
         _ext().expand(self._tree, policy, promo, value, *self._tables, self._ctr)
-        if noise:
+        if self.config.gumbel:
+            # Inherited from the reference, and it is pure torch: one `[B, E]` draw
+            # per move, not per simulation, so there is nothing here worth a kernel.
+            # Sharing it also means the two implementations cannot disagree about
+            # the noise, which is the mistake `dirichlet`'s docstring records.
+            self._draw_root_gumbel(scale=self.config.gumbel_scale if noise else 0.0)
+        elif noise:
             self._add_exploration_noise()
         # §6.1a. Inherited from the reference unchanged: it writes `edge_N` and
         # `edge_Q` in place, and those are the very tensors `self._tree` hands the
@@ -284,6 +280,24 @@ class Search(_ref.Search):
         # That is also what keeps the two implementations identical here by
         # construction rather than by a second transcription.
         self._seed_terminal_edges()
+
+    def _gumbel_args(self):
+        """The extra `descent` arguments of §11, or the "off" ones.
+
+        ⚠️ The visit table has to be built for **this move's** budget, not for
+        `config.n`: the kernel indexes `table[m * budget + idx]` with `budget` taken
+        from the tensor's own second dimension, so a table of the wrong width is a
+        valid read of the wrong schedule. Playout cap randomisation calls
+        `self_play_move(sims=k)` with `k < n`, which is exactly when that would
+        happen. Empty tensors are the "off" convention, matching `edge_win`.
+        """
+        c = self.config
+        if not c.gumbel:
+            empty = torch.zeros((0,), device=self.device)
+            return (empty, empty.to(torch.int32), c.gumbel_m, c.c_visit, c.c_scale,
+                    c.gumbel_interior)
+        return (self.root_gumbel, self._visit_table(max(int(self._budget_scalar), 1)),
+                c.gumbel_m, c.c_visit, c.c_scale, c.gumbel_interior)
 
     # -- §6.2 to §6.5 ------------------------------------------------------- #
 
@@ -299,7 +313,8 @@ class Search(_ref.Search):
         c = self.config
         if self.check_invariants:
             self._check_tree_is_current()
-        _ext().descent(self._tree, s, c.pb_c_base, c.pb_c_init, *self._tables, self._ctr)
+        _ext().descent(self._tree, s, c.pb_c_base, c.pb_c_init, *self._tables, self._ctr,
+                       *self._gumbel_args())
         policy, promo, value = self._evaluate_staged()
         _ext().expand(self._tree, policy, promo, value, *self._tables, self._ctr)
         _ext().backup(self._tree)
@@ -315,7 +330,8 @@ class Search(_ref.Search):
 
     def descent_only(self, s: int) -> None:
         c = self.config
-        _ext().descent(self._tree, s, c.pb_c_base, c.pb_c_init, *self._tables, self._ctr)
+        _ext().descent(self._tree, s, c.pb_c_base, c.pb_c_init, *self._tables, self._ctr,
+                       *self._gumbel_args())
 
     def expand_only(self, policy, promo, value) -> None:
         _ext().expand(self._tree, policy.contiguous(), promo.contiguous(),

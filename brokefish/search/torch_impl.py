@@ -1370,7 +1370,15 @@ class SearchStats:
         self.root_max_pi += float(pi.max(-1).values.sum())
         p = pi.clamp(min=torch.finfo(pi.dtype).tiny)
         self.root_entropy += float(-(pi * p.log()).sum())
-        self.root_covered += int((pi > 0).sum())
+        # ⚠️ From `edge_N`, not from `pi > 0`. Under PUCT the two are the same set —
+        # `pi = N / n`, so a positive target is a visited edge — and under Gumbel
+        # they are not: §6.7's target is dense over every legal move by construction,
+        # so `pi > 0` counts the *edge set* and this counter would silently stop
+        # measuring search coverage and start measuring mean mobility. Measured on
+        # `probe-gumbel` before the fix: 28-30 against `t24h-fp8`'s 22-25 at the same
+        # generation, which reads as "Gumbel explores more" and is not that at all.
+        # `edge_N` is identical for PUCT, so no run measured before this moves.
+        self.root_covered += int((search.edge_N[:, 0] > 0).sum())
         # Search that never disagrees with the policy is search that is not
         # earning its cost, and this is the cheapest signal that `n` is too small
         # or that `cpuct` is wrong (§15.2).

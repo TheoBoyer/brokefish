@@ -118,6 +118,16 @@ class Search(_ref.Search):
     def __init__(self, config: SearchConfig, evaluate: Callable, env=None,
                  device: str | torch.device = "cuda", seed: int = 0,
                  check_invariants: bool = True, collect_stats: bool = False) -> None:
+        if config.gumbel:
+            # ⚠️ A hard error, not a fallback. `descent_kernel` implements §6.6's
+            # PUCT and nothing else, so a Gumbel config here would run a PUCT tree
+            # and then read a Gumbel target off it — internally consistent, wrong,
+            # and invisible in every counter. `search_impl("torch")` is the Gumbel
+            # path until the kernel exists.
+            raise NotImplementedError(
+                "SearchConfig(gumbel=True) has no CUDA kernel yet: csrc/search.cuh's "
+                "descent_kernel is PUCT. Use search_impl('torch'), or run with "
+                "gumbel=False")
         cap = int(_ext().edge_cap())
         if config.E != cap:
             raise ValueError(

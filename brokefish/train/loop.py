@@ -91,6 +91,14 @@ class TrainConfig:
     # **56.1 %** of the time. It touches **0.89 %** of positions, so expect `loss` and
     # `kl` not to move; what should move is the mate rate and the game length.
     terminal_collapse: bool = False
+    # `search.md` §11's three seams together: Gumbel MuZero root sampling,
+    # sequential halving, and the completed-Q policy target in place of `N / n`.
+    # ⚠️ Needs `--impl torch` today: `csrc/search.cuh`'s `descent_kernel` is PUCT,
+    # and `search/cuda_impl.py` refuses rather than running one and reading the
+    # other. ⚠️ `--tau-plies` and `--eps` stop meaning anything with it on.
+    gumbel: bool = False
+    gumbel_m: int = 16
+    gumbel_scale: float = 1.0
     # §fp8. The FFN's two matmuls in e4m3 during **self-play only** -- the gradient
     # step runs the fp32 master weights through torch, so this cannot destabilise the
     # optimiser and its whole effect is slightly noisier data. Measured on
@@ -476,7 +484,9 @@ class Trainer:
         self.search = search_impl("cuda" if cfg.impl == "cuda" else "torch")(
             SearchConfig(n=cfg.n_sims, B=cfg.batch_games, E=cfg.e_cap,
                          tau_plies=cfg.tau_plies, eps=cfg.eps, alpha=cfg.alpha,
-                         terminal_collapse=cfg.terminal_collapse),
+                         terminal_collapse=cfg.terminal_collapse,
+                         gumbel=cfg.gumbel, gumbel_m=cfg.gumbel_m,
+                         gumbel_scale=cfg.gumbel_scale),
             evaluate=self.packed.evaluate(), env=self.env, device=device,
             seed=cfg.seed, check_invariants=False,
             **({"collect_stats": cfg.collect_search_stats} if cfg.impl == "cuda" else {}))
@@ -1073,6 +1083,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "and store the target as a point mass on them. Off by default "
                         "-- it changes both the move played and the training target, "
                         "so a run with it is not comparable to one without")
+    p.add_argument("--gumbel", action="store_true",
+                   help="§11: Gumbel MuZero root sampling, sequential halving and a "
+                        "completed-Q policy target instead of N/n. Replaces the "
+                        "Dirichlet noise and --tau-plies both. Needs --impl torch "
+                        "until descent_kernel learns it")
+    p.add_argument("--gumbel-m", type=int, default=TrainConfig.gumbel_m,
+                   help="root actions sampled without replacement (default 16)")
+    p.add_argument("--gumbel-scale", type=float, default=TrainConfig.gumbel_scale,
+                   help="scale on the root Gumbel noise; 0 is deterministic play, "
+                        "which is what evaluation uses")
     p.add_argument("--pcr-p", type=float, default=TrainConfig.pcr_p,
                    help="§11 playout cap randomisation: the proportion of turns given "
                         "the full --sims cap and recorded for training. The rest run "
@@ -1232,6 +1252,7 @@ def config_from_args(args) -> TrainConfig:
         decay=args.decay, lr_min=args.lr_min,
         tau_plies=args.tau_plies, eps=args.eps, alpha=args.alpha,
         terminal_collapse=args.terminal_collapse, fp8=args.fp8,
+        gumbel=args.gumbel, gumbel_m=args.gumbel_m, gumbel_scale=args.gumbel_scale,
         pcr_p=args.pcr_p, pcr_fast_sims=args.pcr_fast_sims,
         sims_schedule=parse_sims_schedule(args.sims_schedule))
     if cfg.sims_schedule:

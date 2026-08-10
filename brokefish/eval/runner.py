@@ -37,8 +37,19 @@ def search_class(search_impl: str = "torch"):
 
 
 def eval_config(n: int, B: int, **kw):
-    """A `SearchConfig` in the evaluation protocol of `evals.md` §3."""
+    """A `SearchConfig` in the evaluation protocol of `evals.md` §3.
+
+    ⚠️ ``gumbel_scale = 0`` belongs with ``eps = 0`` and ``tau_plies = 0``, and for
+    the same reason. Gumbel replaces both of those: at scale 1 every move is a
+    sample forever, where v0 goes argmax past ply 30. `match.py`'s header states
+    the protocol this breaks — evaluation takes all of its diversity from the
+    random openings, and a pairing of `G` games needs `G/2` distinct ones because
+    two engines replaying an opening produce the same game every time. Left at 1,
+    a league would rate the noise, and a Gumbel run measured against a PUCT control
+    would be measured on a different protocol from it.
+    """
     from brokefish.search.torch_impl import SearchConfig
+    kw.setdefault("gumbel_scale", 0.0)
     return SearchConfig(n=n, B=B, eps=0.0, tau_plies=0, **kw)
 
 

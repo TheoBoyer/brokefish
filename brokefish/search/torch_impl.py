@@ -47,6 +47,7 @@ import torch
 
 from brokefish.env import torch_impl as _default_env
 from brokefish.env.torch_impl import INSUFFICIENT, PAWN, REPETITION
+from brokefish.search import gumbel as _gumbel
 
 # `node_flags` (§4.2). Bits 0-2 are the terminal code of spec §4.3, bit 3 says the
 # node has been expanded, and bit 4 says the move that created it was
@@ -114,6 +115,33 @@ class SearchConfig:
     # changes the move played and the training target, so every number measured
     # before 2026-08-03 was measured without it. See `Search._puct_scores`.
     terminal_collapse: bool = False
+
+    # §11's `select_root`, `select_interior` and `policy_target` seams, taken
+    # together: Gumbel MuZero. **Off by default**, like the collapse — it replaces
+    # PUCT, the Dirichlet noise and the visit-count target all at once, so no
+    # number measured before it can be compared across the flag. `gumbel.py` has
+    # the arithmetic and the citations.
+    gumbel: bool = False
+    # Root actions sampled without replacement. `mctx`'s default, and the paper's
+    # Go setting at n = 200.
+    gumbel_m: int = 16
+    # ⚠️ **The evaluation knob.** Gumbel replaces `tau_plies` as well as the
+    # Dirichlet: at scale 1 every move is a sample, forever, where v0 goes argmax
+    # past ply 30. `runner.eval_config` already plays deterministically (`eps = 0`,
+    # `tau_plies = 0`) and takes its diversity from the random openings alone
+    # (`eval/match.py`'s header), so evaluation wants **0.0** here and loses
+    # nothing by it. A league that rates a Gumbel run with noise on against a PUCT
+    # control with noise off measures the noise.
+    gumbel_scale: float = 1.0
+    # Whether §5's deterministic visit matching replaces PUCT *below* the root as
+    # well. Off leaves the interior at §6.6, which is the smaller change and the
+    # one that leaves `descent_kernel` alone below depth 0.
+    gumbel_interior: bool = True
+    # `mctx.qtransform_completed_by_mix_value`. ⚠️ These are `mctx`'s values, not
+    # the paper's — see `gumbel.py`'s module docstring, which is the only place
+    # the discrepancy is written down.
+    c_visit: float = _gumbel.C_VISIT
+    c_scale: float = _gumbel.C_SCALE
 
     @property
     def n_max(self) -> int:
@@ -260,6 +288,23 @@ class Search:
         # rather than the constant `n`, which is what playout cap randomisation
         # needs and what is awkward to retrofit. In v0 every entry is `n`.
         self.budget = torch.full((B,), c.n, dtype=torch.int32, device=dev)
+        # Gumbel's root noise, drawn once per move in `root_init` and read by every
+        # simulation of that move. ⚠️ Once per *move*, not once per simulation: the
+        # top-`m` sample has to stay the same set for the whole sequential halving,
+        # and redrawing would make it a different bandit every step. [B, E] float32
+        # is 1.5 MB at the Gate 1a shape, and it is a root-only side array like
+        # `root_rep`, so §4.2's tree arrays are untouched (§11's claim, kept).
+        self.root_gumbel = (z((B, E), torch.float32) if c.gumbel
+                            else z((0,), torch.float32))
+        # `[m + 1, k]` sequential-halving schedules, keyed by the budget actually
+        # asked for -- playout cap randomisation may call with `sims < n`, and the
+        # schedule depends on the budget. CPU-cheap (13k ints at n = 800) and built
+        # at most once per distinct budget.
+        self._visit_tables: dict = {}
+        # The budget of the move in flight, host-side. `budget` is the device copy
+        # the descent reads per game; this is the same number for the schedule
+        # lookup, kept off the device so no simulation has to sync to find it.
+        self._budget_scalar = c.n
         # §6.1a: visits handed to the root's terminal edges by the rules rather than
         # by a simulation. They cost no network evaluation, so they are *added* to
         # the budget rather than taken out of it; invariant 6 accounts for them.
@@ -337,6 +382,7 @@ class Search:
                 f"allocated for n_max = {self.config.n_max} nodes and d_max = "
                 f"{self.config.d_max}, so a larger budget would overrun both")
         self.budget.fill_(k)
+        self._budget_scalar = k
         self.root_init(noise=noise)
         for s in range(k):
             self.simulate(s)
@@ -389,9 +435,31 @@ class Search:
 
         root = torch.zeros_like(b)
         self._expand(root, mask, torch.ones_like(self.game_done), policy, promo, value)
-        if noise:
+        if self.config.gumbel:
+            # Gumbel *is* the exploration, so §6.1's Dirichlet does not run — mixing
+            # both would sample from a distribution that is neither the prior nor an
+            # improvement of it. `noise=False` (a PCR fast search, or evaluation)
+            # maps to scale 0, which makes the root selection the deterministic
+            # argmax of `logits + sigma(completedQ)`.
+            self._draw_root_gumbel(scale=self.config.gumbel_scale if noise else 0.0)
+        elif noise:
             self._add_exploration_noise()
         self._seed_terminal_edges()
+
+    def _draw_root_gumbel(self, scale: float) -> None:
+        """`g ~ Gumbel(0)` per root edge, scaled. Zero off the edge set.
+
+        ``-log(-log U)`` with `U` clamped away from 0 and 1 — an exact 0 gives
+        `+inf` and an exact 1 gives `-inf`, and `torch.rand` can return 0.
+        """
+        shape = (self.config.B, self.config.E)
+        u = torch.rand(shape, generator=self._gen, device=self.device,
+                       dtype=torch.float32)
+        eps = torch.finfo(torch.float32).tiny
+        u = u.clamp(min=eps, max=1.0 - 2.0 ** -24)
+        valid = self._e[None, :] < self.node_nedges[:, 0].long()[:, None]
+        g = -torch.log(-torch.log(u)) * scale
+        self.root_gumbel = torch.where(valid, g, torch.zeros_like(g))
 
     def _root_terminal_scan(self, mask: torch.Tensor) -> torch.Tensor:
         """`[B, 32, 64, 4]` spec §4.3 code for every legal candidate at the root.
@@ -495,11 +563,25 @@ class Search:
         # root's mover, which is 1.0 in the tree's [0, 1] (§3.5). Every other terminal
         # is a draw at 0.5. Same parity argument as `_backup`'s flip.
         won = self._root_result[hr, slot[term], square[term], promo[term]] == -1
-        self.edge_N[hr, 0, he] = 1
-        self.edge_Q[hr, 0, he] = torch.where(
-            won, torch.ones_like(won, dtype=torch.float32),
-            torch.full_like(won, 0.5, dtype=torch.float32))
-        self.seeded.index_add_(0, hr, torch.ones_like(hr, dtype=torch.int32))
+        if not self.config.gumbel:
+            self.edge_N[hr, 0, he] = 1
+            self.edge_Q[hr, 0, he] = torch.where(
+                won, torch.ones_like(won, dtype=torch.float32),
+                torch.full_like(won, 0.5, dtype=torch.float32))
+            self.seeded.index_add_(0, hr, torch.ones_like(hr, dtype=torch.int32))
+        # ⚠️ **Under Gumbel the visits are not seeded, and the win mask still is.**
+        # Sequential halving indexes its schedule by `sum(N)` and eliminates an edge
+        # by the visit count it holds, so an edge starting at `N = 1` while its
+        # rivals start at 0 is out of phase with the table for the whole move: it is
+        # never eligible again, and the budget is misspent silently. Skipping the
+        # seed restores invariant 6 to `total == budget` exactly.
+        #
+        # Nothing measured is given up. Seeding existed to make a mate *visible to
+        # PUCT*, which chose it anyway only 56.1 % of the time; §6.6a's collapse is
+        # what actually fixed that, it reads `edge_win` and not `edge_N`, and it
+        # still fires here and in `select_and_advance`. The exact value the seed
+        # carried is restored where it is read: a collapsed root takes
+        # `root_value = 1.0` outright.
         # §6.6a. The sweep is the only place a root's winning edge is known *before*
         # any simulation descends into it -- no child node exists yet, so nothing
         # else can see it. Without this the collapse would not fire at the root
@@ -624,8 +706,76 @@ class Search:
                                 score)
         return score
 
-    def _select(self, v: torch.Tensor) -> torch.Tensor:
-        """The PUCT argmax over node `v`'s edges, one row per game."""
+    # -- §11's `select_root` / `select_interior`, Gumbel ---------------------- #
+
+    def _visit_table(self, budget: int) -> torch.Tensor:
+        table = self._visit_tables.get(budget)
+        if table is None:
+            table = _gumbel.visit_table(self.config.gumbel_m, budget, self.device)
+            self._visit_tables[budget] = table
+        return table
+
+    def _gumbel_completed(self, v: torch.Tensor):
+        """``(sigma, completed, logits, nvis, valid)`` for node `v`, one row per game."""
+        b = self._b
+        nvis = self.edge_N[b, v].to(torch.float32)
+        prior = self.edge_prior[b, v].float()
+        valid = self._e[None, :] < self.node_nedges[b, v].long()[:, None]
+        sigma, completed = _gumbel.completed_q(
+            self.edge_Q[b, v], nvis, valid, self.node_value[b, v].float(), prior,
+            self.config.c_visit, self.config.c_scale)
+        return sigma, completed, _gumbel.edge_logits(prior, valid), nvis, valid
+
+    def _gumbel_scores(self, v: torch.Tensor, depth: int) -> torch.Tensor:
+        """§11's Gumbel selection score, `-inf` off the edge set.
+
+        Depth 0 is sequential halving over the top-`m` Gumbel sample; below that it
+        is the deterministic visit matching of the paper's §5. The two are different
+        rules, not a shared one with different constants, which is why `depth` has
+        to reach here at all.
+        """
+        sigma, _, logits, nvis, valid = self._gumbel_completed(v)
+
+        if depth == 0 and self.config.gumbel:
+            # `simulation_index` is read off the tree rather than passed in, so this
+            # stays correct if a simulation is ever skipped: with no seeded visits
+            # (see `_seed_terminal_edges`) the root's total *is* the count of
+            # simulations already spent on this move.
+            # ⚠️ From the python-side scalar, never from `self.budget.max()`: that is
+            # a device-to-host sync inside the descent, once per simulation, and it
+            # would not show up as anything but "the search got slower".
+            table = self._visit_table(max(int(self._budget_scalar), 1))
+            s_index = torch.where(valid, nvis, torch.zeros_like(nvis)).sum(-1)
+            s_index = s_index.to(torch.long).clamp(max=table.shape[1] - 1)
+            m = self.node_nedges[self._b, v].long().clamp(1, self.config.gumbel_m)
+            considered = table[m, s_index].to(nvis.dtype)[:, None]
+            score = _gumbel.root_scores(self.root_gumbel, logits, sigma, nvis,
+                                        considered, valid)
+        else:
+            score = _gumbel.interior_scores(logits, sigma, nvis, valid)
+
+        if self.edge_win.numel():
+            # §6.6a, unchanged in meaning and re-derived here rather than shared:
+            # both rules are argmaxes over `[B, E]`, so the collapse is the same
+            # override in both. It pre-empts the halving schedule for that game,
+            # which is the intent — a proved mate is not an estimate to refine.
+            win = (self.edge_win[self._b, v] != 0) & valid
+            score = torch.where(win.any(-1, keepdim=True),
+                                torch.where(win, -nvis,
+                                            torch.full_like(score, float("-inf"))),
+                                score)
+        return score
+
+    def _select(self, v: torch.Tensor, depth: int = 0) -> torch.Tensor:
+        """The argmax over node `v`'s edges, one row per game.
+
+        ``depth`` is ignored by PUCT, which scores the root exactly as it scores an
+        interior node (§6.6); Gumbel does not, and the default of 0 keeps every
+        existing single-argument caller on the rule it was written against.
+        """
+        c = self.config
+        if c.gumbel and (depth == 0 or c.gumbel_interior):
+            return _lowest_argmax(self._gumbel_scores(v, depth))
         return _lowest_argmax(self._puct_scores(v))
 
     # -- §6.2 --------------------------------------------------------------- #
@@ -657,7 +807,7 @@ class Search:
             if not bool(live.any()):
                 break
 
-            e = self._select(v)
+            e = self._select(v, d)
             rows = live.nonzero(as_tuple=True)[0]
             self.path_node[rows, d] = v[rows].to(torch.int16)
             self.path_edge[rows, d] = e[rows].to(torch.uint8)
@@ -933,6 +1083,28 @@ class Search:
                 "rules-seeded terminal edges (§6.1a)")
         pi = nvis / total
 
+        # §11's `policy_target` seam. Under Gumbel the target stops being the visit
+        # distribution and becomes `softmax(logits + sigma(completedQ))` over the
+        # *whole* edge set — dense, and using the value head on every legal move
+        # rather than a 3-visits-per-edge histogram. §6.6a's own measurement says the
+        # same thing from the other side: not one of 785 mate-in-1 targets was a
+        # point mass.
+        gumbel_played = None
+        if c.gumbel:
+            root = torch.zeros_like(b)
+            sigma, completed, logits, _, gvalid = self._gumbel_completed(root)
+            pi = _gumbel.improved_policy(logits, sigma, gvalid)
+            # The move played is the argmax of the same score the halving ranked by,
+            # over the edges holding the top visit count — i.e. the survivors of the
+            # final phase. This is where the policy-improvement guarantee lives, and
+            # it holds at **any** budget, including n = 1. There is no `tau_plies`:
+            # the Gumbel noise already made the choice a sample, and `gumbel_scale`
+            # is what turns that off for evaluation.
+            considered = nvis.max(-1, keepdim=True).values
+            gumbel_played = _lowest_argmax(_gumbel.root_scores(
+                self.root_gumbel, logits, sigma, nvis, considered, gvalid))
+            root_value_01 = (pi * completed).sum(-1)
+
         if self.edge_win.numel():
             # §6.6a. **The one place `pi` is not the visit distribution**, and it is
             # deliberate. The collapse already sends every simulation to the winning
@@ -956,10 +1128,23 @@ class Search:
             w = win.to(pi.dtype)
             pi = torch.where(collapsed, w / w.sum(-1, keepdim=True).clamp(min=1.0), pi)
             self.stats.collapsed_roots += int(collapsed.sum())
+            if c.gumbel:
+                # The seeded `edge_Q = 1.0` that carried this value under PUCT is not
+                # written under Gumbel (`_seed_terminal_edges`), so the win has to be
+                # restored here: every proved win at the root is a mate **in one**,
+                # the sweep being depth 1, so the root's value is exactly 1.0.
+                root_value_01 = torch.where(
+                    collapsed.squeeze(-1), torch.ones_like(root_value_01),
+                    root_value_01)
+                gumbel_played = torch.where(
+                    collapsed.squeeze(-1), _lowest_argmax(w), gumbel_played)
 
-        sampled = torch.multinomial(pi, 1, generator=self._gen).squeeze(-1)
-        best = _lowest_argmax(pi)
-        e = torch.where(self.game_ply < c.tau_plies, sampled, best)
+        if gumbel_played is not None:
+            e = gumbel_played
+        else:
+            sampled = torch.multinomial(pi, 1, generator=self._gen).squeeze(-1)
+            best = _lowest_argmax(pi)
+            e = torch.where(self.game_ply < c.tau_plies, sampled, best)
         label = self.edge_move[b, 0, e].to(torch.int64)
 
         # ⚠️ **Every valid edge, not only the visited ones** (revised 2026-07-31,
@@ -980,7 +1165,14 @@ class Search:
         # §10's reserved field. `pi` is zero outside the root's own edges and
         # `_clear_edges` zeroed `edge_Q` there, so this is the visit-weighted mean
         # over exactly the valid edges, in [0,1], mapped to [-1,1] to match `z`.
-        root_value = (2.0 * (pi * self.edge_Q[:, 0]).sum(-1) - 1.0).float()
+        #
+        # Under Gumbel it is the same formula with the same meaning and two better
+        # inputs: `pi` is the improved policy rather than the visit histogram, and
+        # the Q it weighs is *completed*, so an edge the search never reached
+        # contributes `v_mix` instead of a hard zero that no `pi` was ever going to
+        # cancel exactly.
+        root_value = (2.0 * (root_value_01 if c.gumbel
+                             else (pi * self.edge_Q[:, 0]).sum(-1)) - 1.0).float()
 
         record, code = self._advance(label, policy_move, policy_prob,
                                      keep.sum(-1).to(torch.uint8), self.root_rep,

@@ -256,6 +256,16 @@ class TrainConfig:
     puzzle_limit: int = 20_000
     buffer_snapshot_every: int = 10_000
     autocast: bool = True              # §8.2, bf16 forward and backward
+    # `torch.compile` on the gradient step's forward. ~1.25x measured at batch 256;
+    # see `Trainer.__init__` for why the dead-end entry in `CLAUDE.md` is about
+    # something else. Off by default: it changes training numerics, so a compiled run
+    # is not bit-comparable with one before it.
+    compile: bool = False
+    # §5.5's floor on the buffer before the gradient phase starts, in *records*.
+    # 0 keeps the historical behaviour of `cfg.batch` alone. See `steps_owed` for the
+    # failure this exists to stop; AlphaGateau's iteration is 131 072 positions, which
+    # is the natural value when reproducing their cadence.
+    min_records: int = 0
 
     # -- §10, §11, §12
     euros_per_hour: float = 0.0
@@ -476,6 +486,20 @@ class Trainer:
         torch.manual_seed(cfg.seed)
         self.net = BrokefishNet().to(self.device)          # fp32 master weights, §8.2
         self.opt = build_optimizer(self.net, cfg)
+        # ⚠️ `self.net` stays the **raw** module and only the call is compiled.
+        # `PackedWeights.pack`, §12 check 9 and every checkpoint path read the module
+        # directly, and an `OptimizedModule` wrapper in their way would either break
+        # the state-dict keys or silently pack the wrong object.
+        #
+        # ⚠️ `CLAUDE.md` lists torch.compile as a measured dead end, and that entry is
+        # about a different thing: `perf.md`'s ladder row 0b is the **encoder forward
+        # at B = 4096**, compute-bound, where compile has nothing to win. The gradient
+        # step at a small batch is a different regime. Measured 2026-08-12 at batch
+        # 256, fwd + bwd + fused AdamW under bf16 autocast, interleaved A/B over three
+        # separate runs: **x1.28, x1.11, x1.24**, so call it ~1.25x. `reduce-overhead`
+        # (CUDA graphs) measured the same as `default`, so the win is kernel fusion
+        # and not launch overhead.
+        self.fwd = torch.compile(self.net) if cfg.compile else self.net
 
         self.env = ENVIRONMENTS[cfg.impl]
         self.weight_gen = 0
@@ -685,10 +709,21 @@ class Trainer:
         """
         cfg = self.cfg
         self.carry += cfg.samples_per_position * records
-        if self.buffer.n_records < cfg.batch:
+        if self.buffer.n_records < max(cfg.batch, cfg.min_records):
             # §5.5: before the buffer holds one full batch of *sampleable* records the
             # loop is pure self-play. The carry is dropped rather than banked, or the
             # first gradient phase would take a hundred steps over a handful of games.
+            #
+            # ⚠️ **`cfg.batch` alone is the wrong floor once the cadence is high**, and
+            # it fails in the direction that hides itself. The guard scales *with* the
+            # batch, so a small-batch high-reuse recipe gets a smaller floor exactly
+            # when it needs a larger one. Measured 2026-08-12 on a probe at
+            # AlphaGateau's settings (batch 256, 7.6 samples/position): training began
+            # at 256 records and took **304 steps over a 465-record buffer** by
+            # generation 3, with loss collapsing to 1.68 and KL to 0.17 -- that is
+            # memorising a few hundred positions, not learning, and every counter says
+            # the run is going well. `min_records` defaults to 0, so no run measured
+            # before this moves.
             self.samples_dropped_filling += self.carry
             self.carry = 0.0
             return 0
@@ -728,7 +763,7 @@ class Trainer:
             mb = batch.slice(i * cfg.micro_batch, (i + 1) * cfg.micro_batch)
             with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16,
                                 enabled=cfg.autocast):
-                parts = az_loss(self.net, mb, strict=cfg.strict_labels)
+                parts = az_loss(self.fwd, mb, strict=cfg.strict_labels)
             # §7.2: four micro-batch means each scaled by 1/4 sum to the gradient of
             # the mean over 4096. The network is pre-norm LayerNorm with no batch
             # statistics anywhere, so this is batch 4096 and not an approximation.
@@ -1116,6 +1151,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-plies", type=int, default=TrainConfig.max_plies)
     p.add_argument("--batch", type=int, default=TrainConfig.batch)
     p.add_argument("--micro-batch", type=int, default=TrainConfig.micro_batch)
+    p.add_argument("--compile", action="store_true",
+                   help="torch.compile the gradient step's forward. ~1.25x at batch "
+                        "256, measured 2026-08-12; changes training numerics, so a "
+                        "compiled run is not bit-comparable with an earlier one")
+    p.add_argument("--min-records", type=int, default=TrainConfig.min_records,
+                   help="records the buffer must hold before the gradient phase "
+                        "starts. 0 uses --batch alone, which is the historical "
+                        "behaviour and too small for a high-reuse cadence")
     p.add_argument("--total-steps", type=int, default=TrainConfig.total_steps)
     p.add_argument("--lr", type=float, default=None,
                    help="override the whole §7.3 schedule with one constant rate")
@@ -1237,6 +1280,7 @@ def config_from_args(args) -> TrainConfig:
         samples_per_position=args.samples_per_position,
         window_games=args.window_games, mean_plies=args.mean_plies,
         max_plies=args.max_plies, batch=args.batch, micro_batch=args.micro_batch,
+        compile=args.compile, min_records=args.min_records,
         total_steps=args.total_steps, euros_per_hour=args.euros_per_hour,
         buffer_dir=args.buffer_dir, seed=args.seed, impl=args.impl,
         encoder=args.encoder, deterministic=not args.nondeterministic,

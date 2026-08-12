@@ -157,8 +157,20 @@ def edge_logits(policy_logits: torch.Tensor, promo_logits: torch.Tensor,
     return base + torch.where(promotes, lp_at, torch.zeros_like(lp_at))
 
 
-def az_loss(net, batch: TrainBatch, strict: bool = True) -> LossParts:
+def az_loss(net, batch: TrainBatch, strict: bool = True,
+            value_weight: float = 1.0) -> LossParts:
     """AZ eq. (1) without the L2 term, for one (micro-)batch.
+
+    ``value_weight`` scales the squared-error term against the policy
+    cross-entropy. **1.0 is AlphaZero's and this project's**, and is the default, so
+    nothing measured before it moves.
+
+    ⚠️ It exists because **AlphaGateau's code and its own paper disagree**. Their
+    eq. (10) is ``-pi^T log(pi~) + (v - v~)^2``, unweighted; their `train.py:275`
+    calls ``optax.l2_loss``, which is ``0.5 * (x - y)^2``. So the run that produced
+    their published numbers weighted value at **half** the policy, and reproducing
+    the paper's formula would not reproduce the experiment. 0.5 is the faithful
+    value.
 
     ⚠️ **No ``env``.** The record carries its own support (§3.5), so the loss touches
     no engine, no legality mask and no move generator. Whether that is *correct* is
@@ -201,7 +213,7 @@ def az_loss(net, batch: TrainBatch, strict: bool = True) -> LossParts:
         policy_loss = -(pi * logp).sum(-1).mean()
         entropy = -(pi * pi.clamp(min=torch.finfo(torch.float32).tiny).log()).sum(-1).mean()
         v = value_pred.float()
-        value_loss = ((batch.value - v) ** 2).mean()
+        value_loss = value_weight * ((batch.value - v) ** 2).mean()
 
     return LossParts(total=policy_loss + value_loss, policy=policy_loss,
                      value=value_loss, entropy=entropy, kl=policy_loss - entropy,

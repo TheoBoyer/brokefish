@@ -256,6 +256,11 @@ class TrainConfig:
     puzzle_limit: int = 20_000
     buffer_snapshot_every: int = 10_000
     autocast: bool = True              # §8.2, bf16 forward and backward
+    # The squared-error term's weight against the policy cross-entropy. 1.0 is
+    # AlphaZero's and ours; AlphaGateau's code uses `optax.l2_loss`, which is
+    # 0.5*(x-y)^2, so their runs weighted value at half -- and their own eq. (10)
+    # says otherwise. See `az_loss`.
+    value_weight: float = 1.0
     # `torch.compile` on the gradient step's forward. ~1.25x measured at batch 256;
     # see `Trainer.__init__` for why the dead-end entry in `CLAUDE.md` is about
     # something else. Off by default: it changes training numerics, so a compiled run
@@ -763,7 +768,8 @@ class Trainer:
             mb = batch.slice(i * cfg.micro_batch, (i + 1) * cfg.micro_batch)
             with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16,
                                 enabled=cfg.autocast):
-                parts = az_loss(self.fwd, mb, strict=cfg.strict_labels)
+                parts = az_loss(self.fwd, mb, strict=cfg.strict_labels,
+                                value_weight=cfg.value_weight)
             # §7.2: four micro-batch means each scaled by 1/4 sum to the gradient of
             # the mean over 4096. The network is pre-norm LayerNorm with no batch
             # statistics anywhere, so this is batch 4096 and not an approximation.
@@ -1186,6 +1192,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="sgd is AGZ's; adamw is ablation 1")
     p.add_argument("--adam-wd", type=float, default=TrainConfig.adam_wd,
                    help="AdamW's decoupled decay -- NOT --l2, see build_optimizer")
+    p.add_argument("--value-weight", type=float, default=TrainConfig.value_weight,
+                   help="weight on the value term against the policy term. 1.0 is "
+                        "AlphaZero's; AlphaGateau's code uses optax.l2_loss = "
+                        "0.5*(x-y)^2, so 0.5 reproduces what they ran")
     p.add_argument("--betas", type=float, nargs=2, default=list(TrainConfig.betas))
     p.add_argument("--grad-clip", type=float, default=TrainConfig.grad_clip,
                    help="global grad-norm clip; 0 disables (AGZ specifies none)")
@@ -1281,6 +1291,7 @@ def config_from_args(args) -> TrainConfig:
         window_games=args.window_games, mean_plies=args.mean_plies,
         max_plies=args.max_plies, batch=args.batch, micro_batch=args.micro_batch,
         compile=args.compile, min_records=args.min_records,
+        value_weight=args.value_weight,
         total_steps=args.total_steps, euros_per_hour=args.euros_per_hour,
         buffer_dir=args.buffer_dir, seed=args.seed, impl=args.impl,
         encoder=args.encoder, deterministic=not args.nondeterministic,

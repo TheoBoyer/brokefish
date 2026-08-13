@@ -141,6 +141,23 @@ curve is denominated in. The cheap variant — one shared `W` with a learned per
 scalar gate — costs essentially nothing and is the only version worth considering,
 and only if fp8 activations are actually attempted.
 
+**The two cheap changes the literature names are both small here.** One is an
+explicit **bias on the QKV projection** — and **we already have it**: `nn.TransformerEncoderLayer` defaults to
+`bias=True`, so every layer carries `in_proj_bias` (768), `out_proj.bias` (256) and
+both FFN biases. Only the three heads are deliberately biasless (`model.py:94`).
+So the fix Sun et al. recommend is already in the architecture **and the spike is
+there anyway** — which is a real data point against the explicit-bias remedy being
+sufficient, at least at this scale.
+
+That leaves the **learned per-head sink gate**, `sigmoid(lse − sink)`: `n_heads = 8`
+parameters per layer, **64 in total**. Against 17 M for the logit lane, free. It is
+the only untried item of the three.
+
+⚠️ Neither is worth doing on this evidence alone. We have no measurement that the
+spike costs Elo, and both would change the trained network, so nothing measured
+before them would compare across the flag. They belong to the fp8-activations
+question, not to a general clean-up.
+
 ## What is not established
 
 - **Whether the spike costs us any Elo.** Nothing here measures that. The literature

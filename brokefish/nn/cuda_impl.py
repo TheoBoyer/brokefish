@@ -106,7 +106,8 @@ class FusedEncoder:
     EMB_TABLES = ("emb_square", "emb_type_special", "emb_color_turn",
                   "emb_clock", "emb_rep")
 
-    def __init__(self, source, acc_dtype: str = "fp16", fp8: bool = False):
+    def __init__(self, source, acc_dtype: str = "fp16", fp8: bool = False,
+                 int8: bool = False):
         net = source if isinstance(source, BrokefishNet) else None
         encoder = net.encoder if net is not None else source
         layers = encoder.layers
@@ -173,11 +174,28 @@ class FusedEncoder:
         # memory and every measurement before 2026-08-04 was taken without it.
         # `docs/journal/2026-08-04-fp8-encoder.md`: the FFN's two matmuls in e4m3,
         # 1.70x on the tile, 0.66 % max prior-space error measured in emulation.
+        #
+        # §int8. The same two matmuls, the same slab layout, the same packed B order --
+        # `docs/journal/2026-08-14-int8-kernel-spec.md`. int8 issues at exactly the e4m3
+        # rate (72.2 TFLOPS, both) and measures 2.3x lower flip risk, because our tiles
+        # span ~2 binades of e4m3's 18 and an exponent buys nothing on data with no
+        # outliers.
+        #
+        # ⚠️ The two slabs are byte-identical in shape and size, so nothing downstream
+        # can tell them apart. `quant` is passed explicitly to the kernel for exactly
+        # that reason: int8 bytes read as e4m3 stay in range and produce plausible
+        # logits, which is a wrong answer that no assertion would catch.
         self.fp8 = bool(fp8)
+        self.int8 = bool(int8)
+        if self.fp8 and self.int8:
+            raise ValueError("fp8 and int8 quantise the same two matmuls; pick one")
+        self.quant = 2 if self.int8 else (1 if self.fp8 else 0)
         self._wq8 = torch.empty(0, dtype=torch.uint8, device="cuda")
         self._sq8 = torch.empty(0, dtype=torch.float, device="cuda")
         if self.fp8:
             self._pack_fp8(layers, ff1_folded)
+        elif self.int8:
+            self._pack_int8(layers, ff1_folded)
 
         self._empty = torch.empty(0, dtype=torch.int8, device="cuda")
         self._empty_h = torch.empty(0, dtype=torch.half, device="cuda")
@@ -221,6 +239,34 @@ class FusedEncoder:
                 # be silently ignored except for its first column, which is a wrong
                 # answer that stays finite and plausible.
                 qb, sc = quantise_weights_bytes(w.float(), Q_MAX, tile_k=w.shape[1])
+                blobs.append(pack_b_fp8(qb).reshape(-1))
+                scales.append(sc.reshape(-1))
+        self._wq8 = torch.cat(blobs).contiguous().cuda()
+        self._sq8 = torch.cat(scales).float().contiguous().cuda()
+
+    def _pack_int8(self, layers, ff1_folded) -> None:
+        """The FFN weights in int8, in the same `Fp8Off`/`Fp8SOff` order.
+
+        ⚠️ **`pack_b_fp8` is reused verbatim and that is correct, not lazy.** The
+        m16n8k32 B-fragment map is a property of the element *width*: eight bytes per
+        lane, laid out the same whether the bytes are e4m3 or s8. Reusing it is also
+        what keeps `csrc/tests/tfp8.cu`'s independent C++ packing and
+        `test_the_packed_layout_decodes_back` load-bearing for this path too.
+
+        ⚠️ `w_ff1` is the **folded** matrix, `linear1.weight * norm2.gamma`, for the
+        same reason the e4m3 packer takes it: the kernel's LayerNorm no longer applies
+        gamma, and folding moves each 128-output block's amax, so quantising the
+        unfolded matrix would be a different network rather than a different rounding.
+        """
+        from brokefish.nn.quant import pack_b_fp8, quantise_weights_int8_bytes
+
+        blobs, scales = [], []
+        for lay, w_ff1 in zip(layers, ff1_folded):
+            for w in (w_ff1, lay.linear2.weight.detach()):
+                # No `q_max` argument, and none exists: int8 has no accumulator squeeze
+                # to co-ordinate across two languages. `Q_MAX`'s cross-language pin was
+                # a day's debugging; this path cannot have that bug.
+                qb, sc = quantise_weights_int8_bytes(w.float())
                 blobs.append(pack_b_fp8(qb).reshape(-1))
                 scales.append(sc.reshape(-1))
         self._wq8 = torch.cat(blobs).contiguous().cuda()
@@ -323,7 +369,7 @@ class FusedEncoder:
             boards.contiguous(), control.contiguous(), rep.contiguous(),
             self.weights, self.emb, self.tail,
             self.policy_out, self.promo_out, self.value_out, self._empty_h,
-            self.n_layers, self.eps, 0, self._wq8, self._sq8)
+            self.n_layers, self.eps, 0, self._wq8, self._sq8, self.quant)
         return self.policy_out, self.promo_out, self.value_out
 
     def forward_stage(self, boards, control, rep, stage: int):
@@ -342,5 +388,5 @@ class FusedEncoder:
             boards.contiguous(), control.contiguous(), rep.contiguous(),
             self.weights, self.emb, self.tail,
             self._empty_h, self._empty_h, self._empty_f, self.state,
-            self.n_layers, self.eps, stage, self._wq8, self._sq8)
+            self.n_layers, self.eps, stage, self._wq8, self._sq8, self.quant)
         return self.state

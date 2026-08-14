@@ -59,7 +59,7 @@ class PackedWeights:
 
     @classmethod
     def pack(cls, net, weight_gen: int, impl: str = "cuda",
-             fp8: bool = False) -> "PackedWeights":
+             fp8: bool = False, int8: bool = False) -> "PackedWeights":
         """Permute the master weights into the kernel's order. Milliseconds.
 
         ⚠️ `fp8` puts the FFN's two matmuls in e4m3 (`csrc/fp8_gemm.cuh`). It is
@@ -67,10 +67,18 @@ class PackedWeights:
         the torch module -- so it cannot destabilise the optimiser; the whole effect
         is slightly noisier self-play. Measured: 1.15x encoder throughput at 1.05 %
         max prior-space error.
+
+        ⚠️ `int8` is the same two matmuls in s8 (`csrc/int8_gemm.cuh`), same inference-
+        only property, and it is **strictly better on both axes**: measured 1.016x the
+        throughput of e4m3 and 2.56x lower max prior error (1.71e-2 against 4.37e-2 on
+        `t12h-gumbel-004009`). docs/journal/2026-08-14-int8-kernel-spec.md.
         """
-        kw = {"fp8": True} if fp8 else {}
-        if fp8 and impl != "cuda":
-            raise ValueError(f"fp8 is a CUDA-kernel feature; impl is {impl!r}")
+        if fp8 and int8:
+            raise ValueError("fp8 and int8 quantise the same two matmuls; pick one")
+        kw = {"fp8": True} if fp8 else ({"int8": True} if int8 else {})
+        if (fp8 or int8) and impl != "cuda":
+            raise ValueError(
+                f"{'fp8' if fp8 else 'int8'} is a CUDA-kernel feature; impl is {impl!r}")
         return cls(encoder=encoder_impl(impl)(net, **kw), weight_gen=int(weight_gen),
                    fingerprint=weight_fingerprint(net))
 

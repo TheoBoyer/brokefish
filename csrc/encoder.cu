@@ -29,6 +29,7 @@
 #include <c10/cuda/CUDAException.h>
 
 #include "fp8_gemm.cuh"
+#include "int8_gemm.cuh"
 #include "mma.cuh"
 
 
@@ -763,7 +764,13 @@ struct Timer {
 // hiding; halving it costs more than the spill traffic ever did. 2 CTAs/SM needs
 // 65536 / (2 * 256) = 128 registers exactly, so 128 is not a tuning knob -- the way
 // out is to *need* fewer registers, i.e. to drop the fp32 running accumulator.
-template <bool FP8, bool PROF = false>
+// `INT8` swaps e4m3 for s8 in the FFN's two matmuls and nowhere else -- the same two
+// places, the same block/row scale granularity, the same packed B layout. It is a
+// separate template parameter rather than a mode of `FP8` because the two slabs are
+// laid out identically and a runtime switch between them would be invisible: int8
+// bytes read as e4m3 stay in range and produce plausible logits.
+// docs/journal/2026-08-14-int8-kernel-spec.md.
+template <bool FP8, bool INT8, bool PROF = false>
 __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
     half* __restrict__ y, const half* __restrict__ weights,
     const uint8_t* __restrict__ wq8, const float* __restrict__ sq8,
@@ -783,6 +790,9 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
     const half* __restrict__ tail, half* __restrict__ policy,
     half* __restrict__ promo, float* __restrict__ value,
     int n_layers, float eps, int debug_stage) {
+    static_assert(!(FP8 && INT8), "the FFN is quantised once, in one format");
+    // Both quantised paths read the same byte slab and the same scale slab.
+    constexpr bool Q8 = FP8 || INT8;
     extern __shared__ half smem[];
     half* bufA = smem;                    // residual stream
     half* bufB = bufA + SM_A;             // normed input, then attention output
@@ -827,8 +837,8 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
 
     for (int layer = 0; layer < n_layers; ++layer) {
         const half* W = weights + (size_t)layer * Off::stride;
-        const uint8_t* Wq = FP8 ? wq8 + (size_t)layer * Fp8Off::stride : nullptr;
-        const float* Sq = FP8 ? sq8 + (size_t)layer * Fp8SOff::stride : nullptr;
+        const uint8_t* Wq = Q8 ? wq8 + (size_t)layer * Fp8Off::stride : nullptr;
+        const float* Sq = Q8 ? sq8 + (size_t)layer * Fp8SOff::stride : nullptr;
 
         // The affine slots hold ones and zeros: gamma lives in w_qkv's input axis and
         // beta in b_qkv, folded there by `FusedEncoder._fold_norm`.
@@ -898,25 +908,42 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
 
         uint32_t ff[2][4][2];
         zero_frags(ff);
-        if constexpr (FP8) {
+        if constexpr (Q8) {
             // Quantise the normed input **in place**, once for all four chunks: one
-            // scale for the whole 256-wide row, which is what lets `gemm_fp8_row` keep
-            // a single fp16 accumulator. `quantise_row` owns the three aliasing
-            // orderings this relies on; they are documented there.
+            // scale for the whole 256-wide row, which is what lets the row GEMM keep a
+            // single accumulator. `quantise_row` owns the three aliasing orderings this
+            // relies on; they are documented there and `quantise_row_int8` inherits
+            // them verbatim, because they are a property of the buffer geometry rather
+            // than of the format.
             uint8_t* aq = reinterpret_cast<uint8_t*>(bufB);
             float* as = reinterpret_cast<float*>(aq + fp8cfg::kScaleOff);
             const int r0 = warp * (T / NWARPS);
-            fp8::quantise_row<Dm>(aq + (size_t)r0 * fp8cfg::kAPitch, fp8cfg::kAPitch,
-                                  as + (size_t)r0 * fp8cfg::kScaleStride,
-                                  fp8cfg::kScaleStride,
-                                  bufB + (size_t)r0 * AROW, AROW, T / NWARPS, lane);
+            if constexpr (INT8)
+                int8q::quantise_row_int8<Dm, /*UNSIGNED=*/false>(
+                    aq + (size_t)r0 * fp8cfg::kAPitch, fp8cfg::kAPitch,
+                    as + (size_t)r0 * fp8cfg::kScaleStride, fp8cfg::kScaleStride,
+                    bufB + (size_t)r0 * AROW, AROW, T / NWARPS, lane);
+            else
+                fp8::quantise_row<Dm>(aq + (size_t)r0 * fp8cfg::kAPitch, fp8cfg::kAPitch,
+                                      as + (size_t)r0 * fp8cfg::kScaleStride,
+                                      fp8cfg::kScaleStride,
+                                      bufB + (size_t)r0 * AROW, AROW, T / NWARPS, lane);
             __syncthreads();
             tm.mark(prof::kQuantA);
         }
         for (int c = 0; c < DFF / HCHUNK; ++c) {
             uint32_t hacc[2][4][2];
             // ff1 is [1024][256]: chunk c starts at n-tile 32c.
-            if constexpr (FP8) {
+            if constexpr (INT8) {
+                // A is the normed input, which is signed.
+                int8q::gemm_s8_row<NK, NK, /*ADD=*/false, /*UNSIGNED_A=*/false>(
+                    hacc, reinterpret_cast<const uint8_t*>(bufB), fp8cfg::kAPitch,
+                    reinterpret_cast<const float*>(
+                        reinterpret_cast<const uint8_t*>(bufB) + fp8cfg::kScaleOff),
+                    fp8cfg::kScaleStride,
+                    reinterpret_cast<const uint2*>(Wq + Fp8Off::w_ff1),
+                    Sq + Fp8SOff::s_ff1, c * 32 + warp * 4, 0, lane);
+            } else if constexpr (FP8) {
                 fp8::gemm_fp8_row<NK, NK, /*ADD=*/false>(
                     hacc, reinterpret_cast<const uint8_t*>(bufB), fp8cfg::kAPitch,
                     reinterpret_cast<const float*>(
@@ -945,11 +972,14 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
             // k-groups 8c..8c+7 of a matrix whose packed row pitch is 32.
             __syncthreads();
             tm.mark(prof::kHidStore);
-            if constexpr (FP8) {
+            if constexpr (Q8) {
                 // Same in-place quantisation, on this chunk of the hidden. Its input
                 // is post-ReLU and therefore non-negative, so its partial sums get no
                 // sign cancellation -- this is where `q_max = 8`'s 4x accumulator
-                // headroom is doing real work rather than being slack.
+                // headroom is doing real work rather than being slack. ⚠️ Under int8
+                // that non-negativity is spent differently and better: the operand goes
+                // out **unsigned**, 256 levels instead of 127, because `mma...u8.s8`
+                // exists and a float cannot make the same trade.
                 //
                 // Each chunk carries its **own** scale and is descaled before being
                 // added into `ff`, so the four never have to agree on one -- which
@@ -958,12 +988,18 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
                 uint8_t* hq = reinterpret_cast<uint8_t*>(hid);
                 float* hs = reinterpret_cast<float*>(hq + fp8cfg::kScaleOff);
                 const int r0 = warp * (T / NWARPS);
-                fp8::quantise_row<HCHUNK>(hq + (size_t)r0 * fp8cfg::kAPitch,
-                                          fp8cfg::kAPitch,
-                                          hs + (size_t)r0 * fp8cfg::kScaleStride,
-                                          fp8cfg::kScaleStride,
-                                          hid + (size_t)r0 * HROW, HROW,
-                                          T / NWARPS, lane);
+                if constexpr (INT8)
+                    int8q::quantise_row_int8<HCHUNK, /*UNSIGNED=*/true>(
+                        hq + (size_t)r0 * fp8cfg::kAPitch, fp8cfg::kAPitch,
+                        hs + (size_t)r0 * fp8cfg::kScaleStride, fp8cfg::kScaleStride,
+                        hid + (size_t)r0 * HROW, HROW, T / NWARPS, lane);
+                else
+                    fp8::quantise_row<HCHUNK>(hq + (size_t)r0 * fp8cfg::kAPitch,
+                                              fp8cfg::kAPitch,
+                                              hs + (size_t)r0 * fp8cfg::kScaleStride,
+                                              fp8cfg::kScaleStride,
+                                              hid + (size_t)r0 * HROW, HROW,
+                                              T / NWARPS, lane);
                 __syncthreads();
                 tm.mark(prof::kQuantH);
                 // ⚠️ The weight is addressed globally from `k32_0 = 8c`; the activation
@@ -971,10 +1007,17 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
                 // gemm_fp8_row keeps the two indices apart -- csrc/tests/tfp8.cu's
                 // k-slice check is exactly this call shape, and two bugs lived in the
                 // difference.
-                fp8::gemm_fp8_row<HCHUNK / 32, DFF / 32, /*ADD=*/true>(
-                    ff, hq, fp8cfg::kAPitch, hs, fp8cfg::kScaleStride,
-                    reinterpret_cast<const uint2*>(Wq + Fp8Off::w_ff2),
-                    Sq + Fp8SOff::s_ff2, warp * 4, c * (HCHUNK / 32), lane);
+                if constexpr (INT8)
+                    int8q::gemm_s8_row<HCHUNK / 32, DFF / 32, /*ADD=*/true,
+                                       /*UNSIGNED_A=*/true>(
+                        ff, hq, fp8cfg::kAPitch, hs, fp8cfg::kScaleStride,
+                        reinterpret_cast<const uint2*>(Wq + Fp8Off::w_ff2),
+                        Sq + Fp8SOff::s_ff2, warp * 4, c * (HCHUNK / 32), lane);
+                else
+                    fp8::gemm_fp8_row<HCHUNK / 32, DFF / 32, /*ADD=*/true>(
+                        ff, hq, fp8cfg::kAPitch, hs, fp8cfg::kScaleStride,
+                        reinterpret_cast<const uint2*>(Wq + Fp8Off::w_ff2),
+                        Sq + Fp8SOff::s_ff2, warp * 4, c * (HCHUNK / 32), lane);
             } else {
                 gemm_direct<8, DFF / 32>(ff, hid, HROW, W + Off::w_ff2, warp * 4, c * 8, lane);
             }
@@ -1031,36 +1074,47 @@ T* ptr_or_null(const torch::Tensor& t) {
 // spill the one every number in perf.md was measured on. `PROF=false` is the shipped
 // kernel; `csrc/tests/README.md` records the ptxas report that proves it.
 bool g_profile = false;
-template <bool FP8, bool PROF>
+template <bool FP8, bool INT8, bool PROF>
 void launch_one(int n_boards, size_t smem, half* y, const half* weights,
                 const uint8_t* wq8, const float* sq8, const int8_t* alive,
                 const uint16_t* boards, const int16_t* control, const uint8_t* rep,
                 const half* emb, const half* tail, half* policy, half* promo,
                 float* value, int n_layers, float eps, int debug_stage) {
-    cudaFuncSetAttribute(brokefish::encoder_kernel<FP8, PROF>,
+    constexpr bool Q8 = FP8 || INT8;
+    cudaFuncSetAttribute(brokefish::encoder_kernel<FP8, INT8, PROF>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-    brokefish::encoder_kernel<FP8, PROF><<<n_boards, brokefish::THREADS, smem>>>(
-        y, weights, FP8 ? wq8 : nullptr, FP8 ? sq8 : nullptr, alive, boards, control,
+    brokefish::encoder_kernel<FP8, INT8, PROF><<<n_boards, brokefish::THREADS, smem>>>(
+        y, weights, Q8 ? wq8 : nullptr, Q8 ? sq8 : nullptr, alive, boards, control,
         rep, emb, tail, policy, promo, value, n_layers, eps, debug_stage);
 }
 
-void launch(int n_boards, half* y, const half* weights, const uint8_t* wq8,
+// `quant`: 0 = fp16, 1 = e4m3, 2 = int8. ⚠️ An explicit mode rather than a property of
+// the pointers, because the int8 and e4m3 slabs have **identical** layout and size --
+// int8 bytes read as e4m3 stay in range and produce plausible logits, so a
+// pointer-derived switch would fail silently. The fp16/quantised distinction keeps its
+// old all-or-nothing pointer check on top.
+void launch(int n_boards, int quant, half* y, const half* weights, const uint8_t* wq8,
             const float* sq8, const int8_t* alive,
             const uint16_t* boards, const int16_t* control, const uint8_t* rep,
             const half* emb, const half* tail, half* policy, half* promo, float* value,
             int n_layers, float eps, int debug_stage) {
     size_t smem = brokefish::SMEM_HALVES * sizeof(half);
-    // ⚠️ Both instantiations, selected here. `wq8 && sq8` is the switch and it is
-    // all-or-nothing: half a slab would read the fp16 weights through an fp8 layout,
-    // which stays in range and produces plausible numbers.
-    const bool fp8 = (wq8 != nullptr) && (sq8 != nullptr);
-#define BROKEFISH_LAUNCH(F, P)                                                       \
-    launch_one<F, P>(n_boards, smem, y, weights, wq8, sq8, alive, boards, control,    \
-                     rep, emb, tail, policy, promo, value, n_layers, eps, debug_stage)
-    if (fp8) {
-        if (g_profile) BROKEFISH_LAUNCH(true, true); else BROKEFISH_LAUNCH(true, false);
+    const bool have_slab = (wq8 != nullptr) && (sq8 != nullptr);
+    TORCH_CHECK(quant == 0 || have_slab,
+                "quant mode ", quant, " needs both the byte slab and the scale slab; "
+                "half a slab reads the wrong matrix and stays in range");
+#define BROKEFISH_LAUNCH(F, I, P)                                                     \
+    launch_one<F, I, P>(n_boards, smem, y, weights, wq8, sq8, alive, boards, control,  \
+                        rep, emb, tail, policy, promo, value, n_layers, eps, debug_stage)
+    if (quant == 2) {
+        if (g_profile) BROKEFISH_LAUNCH(false, true, true);
+        else           BROKEFISH_LAUNCH(false, true, false);
+    } else if (quant == 1) {
+        if (g_profile) BROKEFISH_LAUNCH(true, false, true);
+        else           BROKEFISH_LAUNCH(true, false, false);
     } else {
-        if (g_profile) BROKEFISH_LAUNCH(false, true); else BROKEFISH_LAUNCH(false, false);
+        if (g_profile) BROKEFISH_LAUNCH(false, false, true);
+        else           BROKEFISH_LAUNCH(false, false, false);
     }
 #undef BROKEFISH_LAUNCH
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -1080,8 +1134,8 @@ void encoder_forward(torch::Tensor y, torch::Tensor weights, torch::Tensor alive
     TORCH_CHECK(weights.is_cuda() && weights.scalar_type() == torch::kHalf);
     // No fp8 here on purpose: this entry point is the A/B control against Triton and
     // the eleven tests of tests/test_model.py, so it stays the fp16 kernel exactly.
-    launch((int)y.size(0), ptr_or_null<half>(y), ptr_or_null<const half>(weights),
-           nullptr, nullptr,
+    launch((int)y.size(0), /*quant=*/0, ptr_or_null<half>(y),
+           ptr_or_null<const half>(weights), nullptr, nullptr,
            ptr_or_null<const int8_t>(alive), nullptr, nullptr, nullptr, nullptr, nullptr,
            nullptr, nullptr, nullptr, (int)n_layers, (float)eps, (int)debug_stage);
 }
@@ -1094,7 +1148,7 @@ void model_forward(torch::Tensor boards, torch::Tensor control, torch::Tensor re
                    torch::Tensor weights, torch::Tensor emb, torch::Tensor tail,
                    torch::Tensor policy, torch::Tensor promo, torch::Tensor value,
                    torch::Tensor y, int64_t n_layers, double eps, int64_t debug_stage,
-                   torch::Tensor wq8, torch::Tensor sq8) {
+                   torch::Tensor wq8, torch::Tensor sq8, int64_t quant) {
     TORCH_CHECK(boards.is_cuda() && boards.scalar_type() == torch::kShort
                 && boards.is_contiguous() && boards.dim() == 2
                 && boards.size(1) == brokefish::T,
@@ -1152,7 +1206,8 @@ void model_forward(torch::Tensor boards, torch::Tensor control, torch::Tensor re
                     sq8.numel());
     }
 
-    launch((int)n, ptr_or_null<half>(y), ptr_or_null<const half>(weights),
+    TORCH_CHECK(quant >= 0 && quant <= 2, "quant is 0 fp16, 1 e4m3, 2 int8; got ", quant);
+    launch((int)n, (int)quant, ptr_or_null<half>(y), ptr_or_null<const half>(weights),
            ptr_or_null<const uint8_t>(wq8), ptr_or_null<const float>(sq8), nullptr,
            ptr_or_null<const uint16_t>(boards), ptr_or_null<const int16_t>(control),
            ptr_or_null<const uint8_t>(rep), ptr_or_null<const half>(emb),
@@ -1200,5 +1255,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             "hid_store", "quant_h", "ff2_gemm", "ff2_epi", "res2", "epilogue"};
     }, "phase names, in slot order");
     m.def("encoder_forward", &encoder_forward, "fused encoder forward");
-    m.def("model_forward", &model_forward, "boards in, policy/promo/value out");
+    m.def("model_forward", &model_forward, "boards in, policy/promo/value out",
+          py::arg("boards"), py::arg("control"), py::arg("rep"), py::arg("weights"),
+          py::arg("emb"), py::arg("tail"), py::arg("policy"), py::arg("promo"),
+          py::arg("value"), py::arg("y"), py::arg("n_layers"), py::arg("eps"),
+          py::arg("debug_stage"), py::arg("wq8"), py::arg("sq8"), py::arg("quant") = 0);
+    m.def("int8_q_max", []() {
+        return std::pair<double, double>{(double)brokefish::int8q::kQMaxS,
+                                         (double)brokefish::int8q::kQMaxU};
+    }, "the s8 and u8 quantisation maxima, pinned against nn/quant.py");
 }

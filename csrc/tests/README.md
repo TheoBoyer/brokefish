@@ -5,6 +5,7 @@ layout is *silent*: every address stays in range, every mma still issues, and th
 error only shows up as plausible-looking wrong numbers eight layers downstream.
 
     nvcc -arch=sm_89 -O3 -std=c++17 -I. -I.. tdirect.cu -o tdirect && ./tdirect
+    nvcc -arch=sm_89 -O3 -std=c++17 -I. -I.. tint8.cu   -o tint8   && ./tint8
 
 ⚠️ **Nothing runs these automatically.** `pytest tests/` does not reach them, so a
 check here can be red for days and say nothing. It has happened: `tselect.cu`'s host
@@ -33,6 +34,7 @@ host helpers in front of it, so the marker moved.)
 | `tmovegen.cu` | **the first-order move generator**, stage by stage against the PyTorch engine's own dump: base bitsets, pawns, sliders, castling, the friendly filter, the control-mode attack map and `in_check` | bit-exact over 10 000 positions |
 | `tselect.cu` | **docs/mcts.md §6.6, §6.6a and §6.4**: the PUCT scan and its tie-break, §6.6a's terminal collapse in both branches, and the canonical edge enumeration with promotions and truncation, against a host reference in double | 20 000 selections, 20 000 collapse cases, 400 enumerations, no dump needed |
 | `tfp8.cu` | **docs/journal/2026-08-04-fp8-encoder.md** and `-08-05-fp8-per-row.md`: the e4m3 primitives the FFN kernel rests on — `cvt.e4m3x2.f16x2`'s byte order against NVIDIA's host converter, `mma.m16n8k32`'s 8-bit fragment layout against a host product, `quantise_row` including the in-place case, and `gemm_fp8_row` on exactly-representable values, on realistic ones, and in the ff2 four-chunk `ADD` shape | layout, packing and both accumulate paths exact; realistic values 1.7e-3 relative, which is the fp16 accumulator |
+| `tint8.cu` | **docs/journal/2026-08-14-int8-kernel-spec.md**: the int8 primitives, the twin of `tfp8.cu` — `cvt_int8x4`'s byte order and its round-to-nearest-**even** ties, `mma.m16n8k32`'s s8 and u8 fragment layouts **including the s32 D fragment's row split**, which `gemm_s8_row`'s descale assumes, and `quantise_row_int8` in the aliasing in-place case for both signednesses | all exact — int8 operands into an s32 accumulator have no rounding at all once the inputs are integers, so there is no tolerance to choose |
 | `tdirect.cu` | **the packed weight layout**: `gemm_direct` against a host reference that reimplements `pack_b` from the fragment definition | bit-exact |
 | `tgemm.cu` | A, B and D fragment layouts for one 32x32 tile | bit-exact |
 | `tg2.cu` | the same at A row pitches 40 and 264 | bit-exact |

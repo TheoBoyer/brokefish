@@ -544,9 +544,17 @@ def main() -> int:
                         "a fitted threshold")
     p.add_argument("--fp32-tol", type=float, default=2.0)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--quant", default=None,
+                   help="comma separated subset of fp8,int8 -- the CUDA kernel's "
+                        "quantised FFN paths. ⚠️ Without this the tool cannot reach "
+                        "them at all: `--impl` names a *registry* entry and both "
+                        "quantised paths are constructor flags on the CUDA one, which "
+                        "is why the fp8 kernel that shipped in August had no coverage "
+                        "here for its first ten days")
     p.add_argument("--json", default=None)
     a = p.parse_args()
 
+    device = "cuda"
     impls = [s for s in (a.impl.split(",") if a.impl else available()) if s]
     if not impls:
         print(f"no encoder implementation available: {why_unavailable()}")
@@ -564,9 +572,33 @@ def main() -> int:
     control = torch.cat([x[1] for x in parts])
     rep = torch.cat([x[2] for x in parts])
 
+    forwards, net = None, None
+    quant = [q for q in (a.quant.split(",") if a.quant else []) if q]
+    if quant:
+        import copy as _copy
+
+        from brokefish.nn.cuda_impl import FusedEncoder
+        bad_q = [q for q in quant if q not in ("fp8", "int8")]
+        if bad_q:
+            print(f"unknown quant mode {bad_q}, expected fp8 and/or int8")
+            return 1
+        net, _src = load_net(a.checkpoint, device)
+        # ⚠️ Built from the same module the oracle is, per `validate`'s own contract:
+        # letting it construct a second random net would compare two unrelated
+        # networks and report a delta that is the gap between them.
+        forwards = {q: FusedEncoder(_copy.deepcopy(net), **{q: True}).forward_full
+                    for q in quant}
+        impls = impls + quant
+
     deltas = validate(a.checkpoint, boards, control, rep, impls,
-                      e_cap=a.e_cap, rel_floor=a.rel_floor)
-    bad = report(deltas, impls, a.max_abs_dp, a.fp32_tol)
+                      e_cap=a.e_cap, rel_floor=a.rel_floor,
+                      forwards=forwards, net=net)
+    # ⚠️ `fp32_tol=None` for the quantised paths: the bar asks "is this no further from
+    # fp32 than torch's own fp16 is", which is the right question for an fp16 kernel and
+    # a meaningless one for a path whose lower precision is the feature. They are judged
+    # by `--max-abs-dp` against a budget agreed in advance, as `report` documents.
+    bad = report(deltas, [i for i in impls if i not in quant], a.max_abs_dp, a.fp32_tol)
+    bad += report(deltas, quant, a.max_abs_dp, None)
 
     print()
     t16 = deltas.get("torch16")

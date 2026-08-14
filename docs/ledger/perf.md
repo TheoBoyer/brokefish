@@ -629,6 +629,97 @@ accumulators, and cuBLAS through `torch.mm` on the exact shapes.
 | cuBLAS on the four real per-layer shapes at M = 524288 | 16.1-16.5 TFLOPS |
 | HBM, plain copy | ~155 GB/s |
 
+### int8 issues at exactly the fp8 rate
+
+Re-measured 2026-08-14 with a register-resident loop, eight independent
+accumulators, no memory traffic in the loop. Two rows have published answers above
+and are there to validate the harness rather than to inform anything.
+
+| what | rate | |
+|---|---|---|
+| `mma.sync.m16n8k16.f16.f16.f16.f16` | 36.1 TFLOPS | validates against 35.5 |
+| `mma.sync.m16n8k32.f16.e4m3.e4m3.f16` | 72.2 TFLOPS | validates against the 72.0 of `2026-08-04-fp8-encoder.md` |
+| **`mma.sync.m16n8k32.s32.s8.s8.s32`** | **72.2 TFLOPS** | the new one |
+
+Identical rate and identical wall clock (13.94 ms for all three). All four
+mixed-sign forms — `s8.s8`, `u8.s8`, `s8.u8`, `u8.u8` — compile for sm89, so a
+provably non-negative operand (the post-ReLU FFN hidden) can use 256 levels
+instead of 127.
+
+⚠️ **Integer mma has only an `s32` accumulator.** `f16`, `s16` and `f32` forms all
+fail to compile with s8 operands, while e4m3 has both `f16` and `f32`. That
+asymmetry is not an oversight: fp16 accumulation is affordable for e4m3 only
+because `kQMax = 8` throws away range we do not use, and an integer's range *is*
+its precision. The consequence is 4 accumulator registers per mma tile against the
+packed-fp16 path's 2.
+
+⚠️ `mma...f32.e4m3.e4m3.f32` does **not** compile under the `/bin/nvcc` on PATH
+(CUDA 12.0). The toolkit the extension actually builds with is
+`/usr/local/cuda` → **13.2**; the 12.0 binary shadows it on PATH and silently
+breaks any hand-compiled fp8 microbenchmark.
+⚠️ `ncu` does not follow `uv run` — it reports "No kernels were profiled". Profile
+by invoking `.venv/bin/python` directly.
+
+### int8 shipped: faster than e4m3 *and* 2.6x more accurate
+
+Landed 2026-08-14 behind `--int8`, same two FFN matmuls, one board per CTA and two
+CTAs per SM — i.e. **the format change only**; the two-boards-per-CTA half of
+`2026-08-14-int8-kernel-spec.md` is not built.
+
+Throughput, `t12h-gumbel-004009`, 4096 boards, **6 interleaved order-balanced rounds**
+× 5 calls, full boards-to-logits path:
+
+| arm | ms/call | evals/s | vs fp16 |
+|---|---:|---:|---:|
+| fp16 | 61.217 | 66 909 | 1.000× |
+| e4m3 | 50.294 | 81 441 | 1.217× |
+| **int8** | **49.482** | **82 778** | **1.237×** |
+
+**int8 / e4m3 = 1.016×.** The e4m3 row reproduces the ledger's 1.214× within thermal
+noise, which is what makes the comparison readable.
+
+Accuracy, prior space through `Search._expand`, 1039 non-terminal positions, against
+the fp32 oracle:
+
+| | max \|Δp\| | p95 | top-1 moved | flip risk |
+|---|---:|---:|---:|---:|
+| fp16 kernel | 3.42e-3 | 4.88e-4 | 0.00 % | 0.00 % |
+| e4m3 kernel | 4.37e-2 | 5.19e-3 | 2.41 % | 4.43 % |
+| **int8 kernel** | **1.71e-2** | **1.95e-3** | **1.06 %** | **1.83 %** |
+| *nn/quant.py's prediction for it* | *1.71e-2* | *1.92e-3* | *1.35 %* | *1.64 %* |
+
+**The kernel lands on its emulation to four digits on the max and 1.5 % on p95.** The
+e4m3 path missed its own prediction by 1.6× on first landing; this one did not, which
+is the emulation earning the trust it was built for.
+
+⚠️ **Predicted wrong, in the good direction.** Step 0 measured int8 at 2 CTAs/SM
+raising spill loads 240 → 336 B, and `fp8_gemm.cuh` records that 16 extra registers
+once cost 27 %. The prediction was therefore a small *regression*; it measured
+**+1.6 %**. Unexplained. The descale is cheaper — `(float)s32 * sa * sw` against
+unpacking two packed halves — and the quantise is dearer, four `cvt.rni.sat` against
+two `cvt.rn.satfinite.e4m3x2`; which dominates has not been measured.
+
+### The register budget under int8 and two boards per CTA
+
+`nvcc -c -O3 -arch=sm_89 -Xptxas -v` on `csrc/encoder.cu`, reading the shipping
+instantiation `encoder_kernel<FP8=1, PROF=0>`. `MT` is m-tiles: 2 is one board, 4
+is two boards sharing one weight stream. Row one is the kernel at HEAD and is
+there to validate the measurement.
+
+| | regs | spill stores | spill loads |
+|---|---:|---:|---:|
+| 1 board, 2 CTA/SM, e4m3 — **ships** | 128 | 40 B | 240 B |
+| 1 board, 2 CTA/SM, int8 | 128 | 56 B | **336 B** |
+| 1 board, 1 CTA/SM, int8 | 168 | 0 B | **0 B** |
+| 2 boards, 1 CTA/SM, e4m3 | 206 | 0 B | **0 B** |
+| **2 boards, 1 CTA/SM, int8** | **223** | **0 B** | **0 B** |
+
+Against a 255-register cap: the proposed configuration lands at **223 with 32 to
+spare and no spill at all**. Device limits, queried rather than assumed:
+`maxSharedMemoryPerBlockOptin` **101 376 B**, `maxSharedMemoryPerMultiprocessor`
+102 400 B, 65 536 registers/SM, 24 SMs. Two boards need 2 × 50 176 = **100 352 B**,
+so it fits with 1 024 B spare.
+
 **fp32 accumulation is half rate on GeForce Ada.** The 35-40 TFLOPS this project
 had been reasoning with is the fp16-accumulate rate; the kernel we ship
 accumulates in fp32 for torch parity, so its ceiling is 18, not 36.

@@ -137,6 +137,63 @@ __device__ __forceinline__ uint32_t cvt_e4m3x4(__half2 lo, __half2 hi) {
 }
 
 // ---------------------------------------------------------------------------
+// int8. Same shape as the e4m3 mma above -- A is four registers of sixteen bytes,
+// B is two of eight -- and therefore the **same packed B layout**, which is why
+// `pack_b_fp8` is reused verbatim for int8 weights: the m16n8k32 fragment map is a
+// property of the element *width*, not of how the bytes are interpreted.
+//
+// ⚠️ The accumulator is `s32` and there is no narrower form. `f16`, `s16` and `f32`
+// accumulators all fail to assemble with s8 operands, while e4m3 has both `f16` and
+// `f32` (probed, 2026-08-14). That is arithmetic rather than an omission: fp16
+// accumulation is affordable for e4m3 only because `kQMax = 8` discards range we do
+// not use, and an integer's range *is* its precision. The cost is 4 accumulator
+// registers per tile against the packed-fp16 path's 2, and it is the whole reason the
+// int8 kernel runs one CTA per SM.
+__device__ __forceinline__ void mma_s8(int32_t (&d)[4], const uint32_t (&a)[4],
+                                       const uint32_t (&b)[2]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+// A unsigned, B signed. The FFN hidden is post-ReLU and therefore provably
+// non-negative, so its sign bit is dead weight: u8 gives 256 levels where s8 gives
+// 127. A float cannot make this trade -- its sign bit buys no mantissa -- so this is
+// an int8-only gain. ⚠️ Measured effect is inside noise (flip 1.93 % -> 1.64 %); it is
+// here because it is free, not because it was shown to help.
+__device__ __forceinline__ void mma_u8s8(int32_t (&d)[4], const uint32_t (&a)[4],
+                                         const uint32_t (&b)[2]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+// Four scaled floats to four packed bytes, low byte first -- the int8 twin of
+// `cvt_e4m3x4`. `cvt.rni.sat` clamps rather than wrapping, which matters: a value a
+// hair past 127 from a rounding division would otherwise become -128 and change sign.
+// ⚠️ Unlike e4m3 there is no NaN to make here, because there is no NaN encoding.
+template <bool UNSIGNED>
+__device__ __forceinline__ uint32_t cvt_int8x4(float a, float b, float c, float d) {
+    uint32_t x, y, z, w;
+    if constexpr (UNSIGNED) {
+        asm("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(x) : "f"(a));
+        asm("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(y) : "f"(b));
+        asm("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(z) : "f"(c));
+        asm("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(w) : "f"(d));
+    } else {
+        asm("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(x) : "f"(a));
+        asm("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(y) : "f"(b));
+        asm("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(z) : "f"(c));
+        asm("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(w) : "f"(d));
+    }
+    return (x & 0xffu) | ((y & 0xffu) << 8) | ((z & 0xffu) << 16) | ((w & 0xffu) << 24);
+}
+
+// ---------------------------------------------------------------------------
 // Fragment plumbing
 
 // Two D fragments, covering n-tiles at column offsets 0..7 and 8..15, become

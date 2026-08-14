@@ -215,6 +215,87 @@ def quantise_weights_bytes(w: torch.Tensor, q_max: float = Q_MAX,
     return q.view(torch.uint8), scale.reshape(N // block_n, K // tile_k).contiguous()
 
 
+# --------------------------------------------------------------------------- #
+# int8, the same scheme in a different format
+# --------------------------------------------------------------------------- #
+
+#: ⚠️ **Must equal `int8q::kQMaxS` / `kQMaxU` in csrc/int8_gemm.cuh.** Unlike
+#: :data:`Q_MAX` these are not a tuning choice and there is nothing to sweep: they are
+#: the format's own limits. The e4m3 path needs `q_max = 8` because an fp16 accumulator
+#: sums `ROW_K = 256` products; int8's accumulator is `s32` and the worst partial is
+#: `127 * 127 * 256 = 4.13e6` against 2.147e9, a 520x margin. There is no saturation to
+#: get wrong, no infinity and no NaN encoding.
+Q_MAX_S8 = 127.0
+#: The post-ReLU FFN hidden is provably non-negative, so its sign bit is dead weight
+#: and `mma...u8.s8.s32` exists. 256 levels instead of 127. A float cannot make this
+#: trade, which is why there is no e4m3 analogue.
+Q_MAX_U8 = 255.0
+
+assert Q_MAX_S8 * Q_MAX_U8 * ROW_K < 2 ** 31 - 1, "s32 accumulator margin"
+
+
+def quantise_activations_int8(x: torch.Tensor, unsigned: bool = False):
+    """`[M, K]` -> `(q [M, K] float, scale [M, 1])`, one scale per row.
+
+    Symmetric, round to nearest, clamped. ⚠️ `-128` is representable but unreachable:
+    with `scale = amax/127` the largest magnitude maps to exactly 127, so the clamp is
+    the same defensive line `_to_e4m3`'s is and never actually fires. The kernel's
+    `cvt.rni.sat.s8.f32` saturates identically.
+    """
+    if unsigned:
+        amax = x.clamp(min=0).amax(dim=-1, keepdim=True)
+        s = torch.where(amax > 0, amax / Q_MAX_U8, torch.ones_like(amax))
+        return torch.round(x.clamp(min=0) / s).clamp(0, Q_MAX_U8), s
+    amax = x.abs().amax(dim=-1, keepdim=True)
+    s = torch.where(amax > 0, amax / Q_MAX_S8, torch.ones_like(amax))
+    return torch.round(x / s).clamp(-Q_MAX_S8, Q_MAX_S8), s
+
+
+def quantise_weights_int8_bytes(w: torch.Tensor, block_n: int = BLOCK_N):
+    """`[N, K]` -> `(bytes [N, K] uint8, scale [N // block_n] fp32)`.
+
+    One scale per `block_n` output channels over the **whole** reduction, because
+    `gemm_s8_row` reads `w_scale[n8 / 16]` with no k index at all — exactly the
+    constraint :func:`quantise_weights_bytes` documents for e4m3, and for the same
+    reason: one accumulator spans the whole depth and can only be descaled once.
+    """
+    N, K = w.shape
+    if N % block_n:
+        raise ValueError(f"weight {tuple(w.shape)} does not tile into {block_n} rows")
+    b = w.float().reshape(N // block_n, block_n, K)
+    amax = b.abs().amax(dim=(1, 2), keepdim=True)
+    scale = torch.where(amax > 0, amax / Q_MAX_S8, torch.ones_like(amax))
+    q = torch.round(b / scale).clamp(-Q_MAX_S8, Q_MAX_S8).to(torch.int8).reshape(N, K)
+    return q.view(torch.uint8), scale.reshape(N // block_n).contiguous()
+
+
+def int8_linear(x: torch.Tensor, w: torch.Tensor, bias: Optional[torch.Tensor],
+                unsigned: bool = False, row_k: int = ROW_K) -> torch.Tensor:
+    """`F.linear` as `gemm_s8_row` computes it: exact s32 accumulation, one descale.
+
+    ⚠️ The accumulation is done in float64 rather than float32. int32 is *exact* on the
+    device and fp32 is not — `127 * 127 * 256 = 4.13e6` needs 23 bits and fp32 has 24,
+    so fp32 would be exact here by one bit and would stop being so the moment anybody
+    widened `row_k`. Modelling the hardware's exactness with a type that is only
+    accidentally exact is how an emulation stops predicting its kernel.
+    """
+    shape = x.shape
+    a = x.reshape(-1, shape[-1]).float()
+    M, K = a.shape
+    N = w.shape[0]
+    wq, ws = quantise_weights_int8_bytes(w.float())
+    wq = wq.view(torch.int8).double()
+
+    out = torch.zeros((M, N), dtype=torch.float64, device=a.device)
+    for lo in range(0, K, row_k):
+        tq, sa = quantise_activations_int8(a[:, lo:lo + row_k], unsigned)
+        out += (tq.double() @ wq[:, lo:lo + row_k].T) * sa.double()
+    out = out.float() * ws.repeat_interleave(BLOCK_N)[None, :]
+    if bias is not None:
+        out = out + bias.float()
+    return out.reshape(*shape[:-1], N).to(x.dtype)
+
+
 def pack_b_fp8(qbytes: torch.Tensor) -> torch.Tensor:
     """Permute e4m3 weight bytes `[N, K]` into `mma.m16n8k32` B-fragment order.
 

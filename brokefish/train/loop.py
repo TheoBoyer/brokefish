@@ -107,6 +107,14 @@ class TrainConfig:
     # `docs/journal/2026-08-04-fp8-encoder.md`. Off, like every other new lever.
     fp8: bool = False
 
+    # The same two matmuls in **int8** rather than e4m3, and the same inference-only
+    # property. ⚠️ It is not a trade: measured on `t12h-gumbel-004009`, int8 is
+    # **1.016x** e4m3's throughput *and* **2.56x** lower max prior error (1.71e-2
+    # against 4.37e-2), because our tiles span ~2 binades of e4m3's 18 and an exponent
+    # buys nothing on data with no outliers. Mutually exclusive with `fp8`.
+    # `docs/journal/2026-08-14-int8-kernel-spec.md`. Off, because no run has used it.
+    int8: bool = False
+
     # -- §11, playout cap randomisation (KataGo §3.1), `training.md` §11
     #
     # On a proportion `pcr_p` of turns the search runs the full `n_sims` cap and the
@@ -508,7 +516,8 @@ class Trainer:
 
         self.env = ENVIRONMENTS[cfg.impl]
         self.weight_gen = 0
-        self.packed = PackedWeights.pack(self.net, self.weight_gen, impl=cfg.encoder, fp8=cfg.fp8)
+        self.packed = PackedWeights.pack(self.net, self.weight_gen, impl=cfg.encoder, fp8=cfg.fp8,
+                                          int8=cfg.int8)
 
         self.search = search_impl("cuda" if cfg.impl == "cuda" else "torch")(
             SearchConfig(n=cfg.n_sims, B=cfg.batch_games, E=cfg.e_cap,
@@ -850,7 +859,8 @@ class Trainer:
         self.seconds["gradient"] += dt
 
         self.weight_gen += 1
-        self.packed = PackedWeights.pack(self.net, self.weight_gen, impl=self.cfg.encoder, fp8=self.cfg.fp8)
+        self.packed = PackedWeights.pack(self.net, self.weight_gen, impl=self.cfg.encoder,
+                                          fp8=self.cfg.fp8, int8=self.cfg.int8)
         last.update({"steps": steps, "seconds": dt,
                      "positions_per_s": steps * self.cfg.batch / max(dt, 1e-9)})
         return last
@@ -876,7 +886,8 @@ class Trainer:
             with torch.no_grad():
                 for p in self.net.parameters():
                     p.add_(torch.randn_like(p) * 0.02)
-            packed = PackedWeights.pack(self.net, self.weight_gen + 1, impl=self.cfg.encoder, fp8=self.cfg.fp8)
+            packed = PackedWeights.pack(self.net, self.weight_gen + 1, impl=self.cfg.encoder,
+                                          fp8=self.cfg.fp8, int8=self.cfg.int8)
             after = packed.encoder.forward_full(boards, control, rep)[0].float().clone()
             with torch.no_grad():
                 ref = self.net(boards, control, rep)[0].float()
@@ -905,7 +916,7 @@ class Trainer:
         # 3.28 %, so 8 % leaves fp8 a 2.4x margin while still catching a stale snapshot
         # or a wrong weight slab, both of which are order-one errors. The fp16 bar is
         # untouched: it is the one every existing run was started under.
-        if self.cfg.fp8:
+        if self.cfg.fp8 or self.cfg.int8:
             tol = max(tol, 0.08 * scale)
         if agree > tol:
             raise AssertionError(
@@ -976,7 +987,8 @@ class Trainer:
             getattr(self.search, name).copy_(tensor)
         if hasattr(self.search, "_refresh_tree"):
             self.search._refresh_tree()
-        self.packed = PackedWeights.pack(self.net, self.weight_gen, impl=self.cfg.encoder, fp8=self.cfg.fp8)
+        self.packed = PackedWeights.pack(self.net, self.weight_gen, impl=self.cfg.encoder,
+                                          fp8=self.cfg.fp8, int8=self.cfg.int8)
 
         got = weight_fingerprint(self.net)
         if got != blob["fingerprint"]:
@@ -1119,6 +1131,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fp8", action="store_true",
                    help="self-play the FFN in e4m3 (inference only; the gradient step "
                         "is unchanged). ~1.15x encoder throughput for ~1 % prior error")
+    p.add_argument("--int8", action="store_true",
+                   help="self-play the FFN in int8 instead of e4m3. Same two matmuls, "
+                        "inference only, and better on both axes: 1.016x e4m3's "
+                        "throughput at 2.56x lower max prior error")
     p.add_argument("--terminal-collapse", action="store_true",
                    help="§6.6a: send a node's simulations to its proved-winning edges "
                         "and store the target as a point mass on them. Off by default "
@@ -1306,7 +1322,7 @@ def config_from_args(args) -> TrainConfig:
         betas=tuple(args.betas), warmup_steps=args.warmup,
         decay=args.decay, lr_min=args.lr_min,
         tau_plies=args.tau_plies, eps=args.eps, alpha=args.alpha,
-        terminal_collapse=args.terminal_collapse, fp8=args.fp8,
+        terminal_collapse=args.terminal_collapse, fp8=args.fp8, int8=args.int8,
         gumbel=args.gumbel, gumbel_m=args.gumbel_m, gumbel_scale=args.gumbel_scale,
         pcr_p=args.pcr_p, pcr_fast_sims=args.pcr_fast_sims,
         sims_schedule=parse_sims_schedule(args.sims_schedule))

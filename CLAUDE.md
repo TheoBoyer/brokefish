@@ -78,7 +78,13 @@ docs/       three kinds, and the kind is the directory. reference/ is normative 
             lessons, never edited after the fact. roadmap.md and index.md sit on top
 debugger/   the web viewer, the only part not importable from `brokefish`
 data/       cuda_testset (A1's dump), suites.pt (D1), lichess_db_puzzle.csv
-logs/       campaign output, tail -f-able while it runs
+runs/<run>/ **everything one run produces, in one folder** (2026-08-14): the .log and
+            .jsonl, checkpoints/, replay/, wandb/, and every league / curve / match it
+            fed. `brokefish/paths.py` owns the layout and is the only place that names
+            it. ⚠️ Artifacts spanning runs land in the **first run named**; the shared
+            `checkpoints/anchor.pt` stays out, since every Elo scale anchors to it
+logs/       investigation output that belongs to no run — a kernel measurement, a gate
+            log. Still tail -f-able; no longer where runs live
 ```
 Production repository: no staging areas, no ladders, no snapshots of work happening
 elsewhere. Code lands here correct and tested; exploratory kernels belong in scratch.

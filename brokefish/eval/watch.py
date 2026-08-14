@@ -33,6 +33,8 @@ import os
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from brokefish import paths
+
 import torch
 
 # Coarse buckets for the dashboard. The full 14-bin curve lives in the JSONL; 56
@@ -202,7 +204,7 @@ class PuzzleProbe:
             self.detail_path = None
 
 
-def watch(run: str, checkpoint_dir: str = "checkpoints", interval: float = 120.0,
+def watch(run: str, checkpoint_dir: Optional[str] = None, interval: float = 120.0,
           limit: Optional[int] = 20_000, impl: Optional[str] = None,
           ks: Sequence[int] = (1, 3, 5), device: str = "cuda",
           use_wandb: bool = True, project: str = "brokefish",
@@ -266,7 +268,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     ap = argparse.ArgumentParser(
         description="score a run's checkpoints on Lichess puzzles, out of process")
     ap.add_argument("--run", required=True)
-    ap.add_argument("--checkpoints", default="checkpoints")
+    ap.add_argument("--checkpoints", default=None,
+                    help="runs/<run>/checkpoints by default")
     ap.add_argument("--interval", type=float, default=120.0)
     ap.add_argument("--limit", type=int, default=20_000, help="puzzles to load")
     ap.add_argument("--impl", default=None, help="fused encoder; None is the torch module")
@@ -277,7 +280,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args = ap.parse_args(argv)
 
     print(f"watching {args.run} in {args.checkpoints}/  "
-          f"-> logs/{args.run}-puzzles.jsonl", flush=True)
+          f"-> {paths.artifact(args.run, args.run + '-puzzles.jsonl')}", flush=True)
     watch(args.run, checkpoint_dir=args.checkpoints, interval=args.interval,
           limit=args.limit, impl=args.impl, ks=args.ks, device=args.device,
           use_wandb=not args.no_wandb, once=args.once)

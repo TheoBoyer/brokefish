@@ -27,6 +27,8 @@ from typing import Optional
 
 import wandb
 
+from brokefish import paths
+
 
 def _flatten(prefix: str, obj) -> dict:
     out = {}
@@ -44,10 +46,15 @@ def _flatten(prefix: str, obj) -> dict:
 class Logger:
     """JSONL plus an optional wandb run. Nothing here ever raises on a logging path."""
 
-    def __init__(self, run: str, log_dir: str = "logs", config: Optional[dict] = None,
+    def __init__(self, run: str, log_dir: Optional[str] = None,
+                 config: Optional[dict] = None,
                  use_wandb: bool = True, wandb_mode: str = "online",
                  project: str = "brokefish", append: bool = False) -> None:
+        # `runs/<run>/` unless the caller names somewhere else. `brokefish/paths.py`
+        # owns the layout; this module only asks it where to write.
+        log_dir = log_dir or paths.run_dir(run)
         os.makedirs(log_dir, exist_ok=True)
+        self.dir = log_dir
         self.run = run
         self.jsonl_path = os.path.join(log_dir, f"{run}.jsonl")
         self.text_path = os.path.join(log_dir, f"{run}.log")
@@ -64,8 +71,12 @@ class Logger:
             # JSONL above is the sink that matters. The *import* is unconditional;
             # the *session* is not.
             try:
+                # ⚠️ `dir=` is what keeps wandb's own `wandb/run-<id>/` tree inside the
+                # run folder instead of at the repository root, where its directories
+                # are named after wandb ids and tell you nothing about which run they
+                # belong to. wandb creates `<dir>/wandb/` itself.
                 self.wandb = wandb.init(project=project, name=run, config=config or {},
-                                        mode=wandb_mode, reinit=True)
+                                        mode=wandb_mode, reinit=True, dir=log_dir)
                 self.wandb_why = f"wandb {wandb.__version__}, mode={wandb_mode}"
             except Exception as exc:  # noqa: BLE001 - reported, never fatal
                 self.wandb = None

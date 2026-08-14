@@ -833,10 +833,34 @@ class TestAntiSelection:
         assert not offenders, offenders
 
     def test_the_league_writes_only_where_it_is_allowed(self):
+        """The league's write locations are derived, not typed, and pinned here.
+
+        ⚠️ Since 2026-08-14 a league writes into `runs/<run>/`, which is the **same
+        folder the training loop writes**. That is safe, and the reason is the sibling
+        test above rather than the directory: no module under `brokefish/train/` so
+        much as mentions `league-`, so nothing training reads can see a rating. The
+        boundary evaluation.md §2 protects is about *what reads what*, not about which
+        directory the bytes sit in -- and it never was, since both used to share
+        `logs/`.
+
+        Asserting the resolved paths rather than the flag's literal default also means
+        this bites if `brokefish/paths.py` ever moves the layout underneath it.
+        """
+        from brokefish import paths
+
         parser = league_mod.build_parser()
         args = parser.parse_args(["--run", "x"])
-        assert args.out is None       # defaults to logs/league-<run>.json
-        assert args.checkpoints == "checkpoints"
+        assert args.out is None            # -> runs/x/league-x.json
+        assert args.checkpoints is None    # -> runs/x/checkpoints, per run
+        assert paths.checkpoint_dir("x") == os.path.join("runs", "x", "checkpoints")
+        assert paths.artifact("x", "league-x.json") == os.path.join(
+            "runs", "x", "league-x.json")
+        # A joint league lands in the first run named, never in a shared bucket.
+        assert paths.joint_dir(["x", "y"]) == os.path.join("runs", "x")
+        # ⚠️ The anchor is the one thing that must NOT be per-run: every Elo scale is
+        # anchored to this single file, and a copy per run would let two leagues
+        # anchor to two different networks without either saying so.
+        assert args.anchor == os.path.join("checkpoints", "anchor.pt")
 
 
 class TestTerminalNames:

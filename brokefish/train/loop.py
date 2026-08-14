@@ -48,6 +48,7 @@ from brokefish.nn.model import BrokefishNet
 from brokefish.search import SearchConfig, search_impl
 
 from .buffer import ReplayBuffer
+from brokefish import paths
 from .log import Logger
 from .loss import TrainBatch, audit_labels, az_loss, l2_penalty, weight_decay_for
 from .sync import PackedWeights, weight_fingerprint
@@ -155,7 +156,10 @@ class TrainConfig:
     window_games: int = 500_000
     mean_plies: int = 80
     max_plies: int = 512               # §5.4, scored drawn
-    buffer_dir: str = "data/replay"
+    # ⚠️ `None` means `runs/<run>/replay/`, which is what a run should use. It stays
+    # overridable because a rented box with a fast scratch disk is a real case.
+    # `brokefish/paths.py` owns the layout.
+    buffer_dir: Optional[str] = None
     buffer_in_memory: bool = False
 
     # -- the cadence, §6
@@ -446,7 +450,7 @@ class Trainer:
 
     def __init__(self, cfg: TrainConfig, run: str = "run", device: str = "cuda",
                  logger: Optional[Logger] = None, resume: Optional[str] = None,
-                 log_dir: str = "logs") -> None:
+                 log_dir: Optional[str] = None) -> None:
         self.cfg = cfg
         self.run = run
         self.device = torch.device(device)
@@ -532,7 +536,9 @@ class Trainer:
         self.search.weight_gen = self.weight_gen
         self.search.reset()
 
-        path = None if cfg.buffer_in_memory else os.path.join(cfg.buffer_dir, f"{run}.dat")
+        path = (None if cfg.buffer_in_memory
+                else os.path.join(paths.resolve(cfg.buffer_dir, run, "replay", create=True),
+                                  f"{run}.dat"))
         self.buffer = ReplayBuffer(
             path=path, window_games=cfg.window_games, mean_plies=cfg.mean_plies,
             seed=cfg.seed, resume=resume is not None)
@@ -555,7 +561,7 @@ class Trainer:
             from brokefish.eval.watch import PuzzleProbe
             self.probe = PuzzleProbe(
                 limit=cfg.puzzle_limit, device=self.device,
-                detail_path=os.path.join("logs", f"{run}-puzzles.jsonl"))
+                detail_path=paths.artifact(run, f"{run}-puzzles.jsonl", create=True))
 
         self.t_start = time.time()
 
@@ -1017,8 +1023,10 @@ class Trainer:
 
     def run_loop(self, generations: Optional[int] = None,
                  max_steps: Optional[int] = None, max_seconds: Optional[float] = None,
-                 checkpoint_dir: str = "checkpoints") -> None:
+                 checkpoint_dir: Optional[str] = None) -> None:
         """Until whichever of the three limits comes first, then checkpoint.
+
+        `checkpoint_dir=None` means `runs/<run>/checkpoints/`.
 
         ⚠️ A wall-clock limit stops at a **generation boundary**, so the run overruns
         by up to one phase. That is deliberate: a phase interrupted between self-play
@@ -1029,6 +1037,8 @@ class Trainer:
         cfg = self.cfg
         started = time.time()
         self.log.note(f"  §12 check 9 at startup: {self.check_weights_propagate()}")
+        checkpoint_dir = paths.resolve(checkpoint_dir, self.run, "checkpoints",
+                                       create=True)
         next_ckpt = self.step + cfg.checkpoint_every
         next_snap = self.step + cfg.buffer_snapshot_every
         g = 0
@@ -1250,10 +1260,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="steps between §12 check 3's engine-side label audit; 0 is off")
     p.add_argument("--resume", default=None)
     p.add_argument("--allow-config-change", action="store_true")
-    p.add_argument("--buffer-dir", default=TrainConfig.buffer_dir)
+    p.add_argument("--buffer-dir", default=None,
+                   help="runs/<run>/replay by default")
     p.add_argument("--puzzle-limit", type=int, default=TrainConfig.puzzle_limit,
                    help="puzzles scored after each checkpoint; 0 disables the probe")
-    p.add_argument("--checkpoints", default="checkpoints")
+    p.add_argument("--checkpoints", default=None,
+                   help="runs/<run>/checkpoints by default")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--impl", default="cuda", choices=("cuda", "torch"),
                    help="the engine and the search")

@@ -197,7 +197,7 @@ easy to make again:
 - **`checkpoints/` is gitignored**, so the origin of every published number was one
   untracked blob, and `league.py`'s own docstring said "delete that file and the whole
   curve moves".
-- **It was saturated anyway.** Measured 2026-08-08 on `logs/league-joint-pcr.log`:
+- **It was saturated anyway.** Measured 2026-08-08 on `runs/t12h-pcr/league-joint-pcr.log`:
   `anchor vs t12h-pcr@1405` and every pairing above it returned `0-0-36`. Its edges
   cost a full 36 games each and carried no information.
 

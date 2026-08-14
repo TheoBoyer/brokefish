@@ -1,7 +1,7 @@
 """The cost-versus-Elo curve, which is the deliverable. `evaluation.md` §5.3.
 
     uv run --no-project --python .venv/bin/python -m brokefish.eval.curve \
-        logs/league-t4h-n64.json --csv docs/ledger/curve-t4h-n64.csv
+        runs/t4h-n64/league-t4h-n64.json
 
 This module presents; `league.py` measures. In particular the euro axis is
 **joined by the league**, not here — §5.3's warning is that if the two axes are
@@ -324,10 +324,24 @@ def plot(report: dict, path: str) -> Optional[str]:
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     ap = argparse.ArgumentParser(description="present a league report as the curve")
-    ap.add_argument("report", help="logs/league-<run>.json")
-    ap.add_argument("--csv", default=None)
-    ap.add_argument("--png", default=None)
+    ap.add_argument("report", help="runs/<run>/league-<run>.json")
+    ap.add_argument("--csv", default=None,
+                    help="beside the report, as curve-<stem>.csv, unless named")
+    ap.add_argument("--png", default=None,
+                    help="beside the report, as curve-<stem>.png, unless named")
     args = ap.parse_args(argv)
+
+    # ⚠️ Default beside the report rather than into a fixed directory: a curve belongs
+    # to the league that produced it, and the league already lives in the right run's
+    # folder. Naming either flag still overrides.
+    stem = os.path.basename(args.report)
+    stem = stem[len("league-"):] if stem.startswith("league-") else stem
+    stem = os.path.splitext(stem)[0]
+    here = os.path.dirname(args.report) or "."
+    if args.csv is None:
+        args.csv = os.path.join(here, f"curve-{stem}.csv")
+    if args.png is None:
+        args.png = os.path.join(here, f"curve-{stem}.png")
 
     report = load_report(args.report)
     print(format_curve(report))

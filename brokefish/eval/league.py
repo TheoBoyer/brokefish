@@ -48,14 +48,14 @@ upgrade, and `EloFit.predict` is the function it needs; it is not in v1 because 
 needs an online fit and the fixed calendar needs nothing.
 
 **Nothing here may select a checkpoint** (`evaluation.md` §2). This module writes
-to `logs/`; nothing under `brokefish/train/` reads what it writes, and
+to the run's own folder; nothing under `brokefish/train/` reads what it writes, and
 `tests/test_league.py` asserts that rather than trusting it. Keeping the checkpoint
 with the best league rating is distillation through a one-bit channel and it is the
 prohibition most likely to be violated by accident, because it looks like good
 practice.
 
 ⚠️ **`--keep-checkpoints` writes a bare `state_dict`** with no step and no euro
-count in it, so the euro axis is joined from `logs/<run>.jsonl` by step. If that
+count in it, so the euro axis is joined from `runs/<run>/<run>.jsonl` by step. If that
 log is missing, the curve still has an Elo axis and its `euros_spent` is `null` —
 which is honest, and visible, rather than a zero that looks like a measurement.
 """
@@ -88,7 +88,11 @@ SAI_OFFSETS: Tuple[int, ...] = (1, 2, 3, 6, 8, 12)
 RANDOM_NAME = "random"
 ANCHOR_NAME = RANDOM_NAME
 INIT_NAME = "init"
-DEFAULT_ANCHOR_PATH = os.path.join("checkpoints", "anchor.pt")
+from brokefish import paths
+
+#: ⚠️ Shared, not per-run: every Elo scale is anchored to this one file, and a copy
+#: in each run's folder would let two leagues anchor to two different networks.
+DEFAULT_ANCHOR_PATH = paths.ANCHOR_PATH
 
 # §5.1a's bottom rungs: the untrained network at four budgets. These exist to make
 # the zero *estimable* — random play loses 36-0 to anything past the first few
@@ -174,8 +178,15 @@ def anchor_digest(path: str = DEFAULT_ANCHOR_PATH) -> Optional[str]:
 _STEP_RE = re.compile(r"-(\d{6})\.pt$")
 
 
-def discover_checkpoints(run: str, checkpoint_dir: str = "checkpoints") -> List[Tuple[int, str]]:
-    """`(step, path)` for every ``{run}-{step:06d}.pt`` snapshot, in step order."""
+def discover_checkpoints(run: str, checkpoint_dir: Optional[str] = None
+                         ) -> List[Tuple[int, str]]:
+    """`(step, path)` for every ``{run}-{step:06d}.pt`` snapshot, in step order.
+
+    ⚠️ `checkpoint_dir=None` resolves **per run** to `runs/<run>/checkpoints`, which is
+    the whole point of the layout: a league over several runs reads each one's own
+    folder rather than a shared directory that happened to hold them all.
+    """
+    checkpoint_dir = checkpoint_dir or paths.checkpoint_dir(run)
     out = []
     for path in glob.glob(os.path.join(checkpoint_dir, f"{run}-*.pt")):
         m = _STEP_RE.search(os.path.basename(path))
@@ -206,7 +217,7 @@ def subsample(items: Sequence, limit: Optional[int]) -> List:
     return out
 
 
-def build_pool(runs, checkpoint_dir: str = "checkpoints",
+def build_pool(runs, checkpoint_dir: Optional[str] = None,
                anchor_path: str = DEFAULT_ANCHOR_PATH,
                limit: Optional[int] = 32, sims: int = 64,
                ladder: Sequence[int] = DEFAULT_LADDER,
@@ -740,10 +751,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="rate at most this many players **per run**, evenly spaced by step")
     p.add_argument("--anchor-every", type=int, default=4,
                    help="the anchor also plays every Nth checkpoint; 0 for bare SAI")
-    p.add_argument("--checkpoints", default="checkpoints")
+    p.add_argument("--checkpoints", default=None,
+                   help="runs/<run>/checkpoints per run by default")
     p.add_argument("--anchor", default=DEFAULT_ANCHOR_PATH)
     p.add_argument("--train-log", default=None,
-                   help="logs/<run>.jsonl by default; the euro axis is joined from it")
+                   help="runs/<run>/<run>.jsonl by default; the euro axis is joined "
+                        "from it")
     p.add_argument("--impl", default="cuda", help="the fused encoder; 'none' for the torch module")
     p.add_argument("--search-impl", default="cuda", choices=("cuda", "torch"))
     p.add_argument("--device", default="cuda")
@@ -751,7 +764,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prior", type=float, default=1.0,
                    help="drawn games against a phantom at Elo 0, per player")
     p.add_argument("--out", default=None,
-                   help="logs/league-<run>.json, or league-joint-<a>+<b>.json for several")
+                   help="runs/<run>/league-<run>.json. For several runs it lands in "
+                        "the FIRST run's folder as league-joint-<a>+<b>.json")
     return p
 
 
@@ -759,7 +773,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args = build_parser().parse_args(argv)
     runs = list(dict.fromkeys(args.run))
     stem = runs[0] if len(runs) == 1 else "joint-" + "+".join(runs)
-    out_path = args.out or os.path.join("logs", f"league-{stem}.json")
+    # ⚠️ A joint league lands in the **first** run's folder, by the convention
+    # `brokefish/paths.py` documents. The order is the order given on the command line,
+    # so the choice is visible in the invocation rather than decided by sorting.
+    out_path = args.out or paths.artifact(runs[0], f"league-{stem}.json", create=True)
     log = _Log(os.path.splitext(out_path)[0] + ".log")
 
     log(f"league  run={'+'.join(runs)}  {time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -773,11 +790,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             f"offsets cross between them. Ratings from this report are comparable "
             f"across runs; ratings from two separate leagues are not.")
     # ⚠️ One series per run. `--train-log` names a single file and so only makes sense
-    # for a single run; with several, each is joined from logs/<run>.jsonl.
+    # for a single run; with several, each is joined from its own run folder.
     cost = {}
     for run in runs:
         path = args.train_log if (args.train_log and len(runs) == 1) \
-            else os.path.join("logs", f"{run}.jsonl")
+            else paths.train_log(run)
         series = training_series(path)
         if not series:
             log(f"  ⚠️ no training log at {path}; {run}'s cost axis will be null")

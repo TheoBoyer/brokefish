@@ -787,13 +787,17 @@ committed kernel and diffing logits over 1039 positions):
   spare registers against the 128 cap. At one CTA per SM there are ~50 spare and the
   row is 16, so the second read simply goes away. It also collapses the aliasing
   argument from three orderings to one: every read now precedes every write.
+* **The row is loaded as `uint4`.** A lane's sixteen columns per tile are contiguous
+  and 16-byte aligned -- `col_group * 16` halves is 32 B and every row pitch here is
+  528 B = 33 x 16 -- so a tile is two 128-bit loads rather than sixteen 16-bit ones.
 * **Four `fmaxf` accumulators instead of one**, turning a 32-deep dependent chain into
   four of eight. `wait` is the #2 stall in this kernel at 2.17 cycles per issue.
 
 | | quant_a | quant_h | quant group | B=512 ref | B=4096 |
 |---|---:|---:|---:|---:|---:|
 | before | 2.4 % | 7.9 % | 10.3 % | 92.7k | 89 265 (1.323×) |
-| **after** | **1.6 %** | **6.2 %** | **7.8 %** | **101.6k** | **89 499 (1.342×)** |
+| after, one read + 4 accumulators | 1.6 % | 6.2 % | 7.8 % | 101.6k | 89 499 (1.342×) |
+| **after, + `uint4` loads** | | | | | **1.363× fp16** |
 
 ⚠️ **Measured dead ends from the same session, both bit-identical and both slower.**
 Unrolling the quantiser's row loop (`ROWS` as a template parameter) measured **1.341×
@@ -1207,3 +1211,54 @@ measured on random playouts. And the node pool ends every move at exactly
 node.
 
 ---
+
+### QA round and final throughput, 2026-08-14
+
+Everything in this section is the shipping configuration: `--int8`, which selects two
+boards per CTA on its own.
+
+**Bit-identity.** The three optimisations above (`cvt.pack`, one read per row with four
+accumulators, `uint4` loads) are together **bit-identical to `8ffb81b`** -- the
+pre-optimisation two-board kernel was rebuilt and its logits diffed against the current
+one over 1039 positions including the adversarial set: 2 127 872 policy elements,
+132 992 promo, 1039 value, **all equal**. And two boards per CTA remains bit-identical
+to one on every network below.
+
+**Prior space, six networks**, 1034 positions (768 buffer + 255 random playout + the
+adversarial set; the odd count exercises the tail CTA):
+
+| checkpoint | fp8 max \|dp\| | int8 max \|dp\| | ratio | fp8 flip | int8 flip |
+|---|---:|---:|---:|---:|---:|
+| random init | 3.03e-2 | 3.42e-3 | **8.86x** | 9.99 % | 2.32 % |
+| t12h-gumbel-004009 | 4.00e-2 | 1.71e-2 | 2.34x | 4.65 % | 2.03 % |
+| t12h-muong-004009 | 5.03e-2 | 1.69e-2 | 2.99x | 8.14 % | 2.71 % |
+| t24h-muon-008215 | 8.02e-2 | 4.00e-2 | 2.00x | 9.70 % | 4.07 % |
+| t24h-fp8-008416 | 3.52e-2 | 2.73e-2 | **1.29x** | 3.49 % | 2.52 % |
+| t7h-fp8-002206 | 1.47e-2 | 6.35e-3 | 2.31x | 4.17 % | 2.42 % |
+
+int8 wins on both metrics on all six, worst case 1.29x, zero non-finite anywhere.
+
+**Tests.** 553 pass, 21 skipped. `tint8`, `tfp8` and `tdirect` device suites green.
+
+**Throughput.** Encoder path, 4096 boards, 8 interleaved order-balanced rounds:
+
+| arm | ms/call | evals/s | vs fp16 |
+|---|---:|---:|---:|
+| fp16 | 63.325 | 64 682 | 1.000x |
+| e4m3 | 52.864 | 77 481 | 1.198x |
+| int8, 1 board | 51.293 | 79 855 | 1.235x |
+| **int8, 2 boards** | **46.467** | **88 148** | **1.363x** |
+
+**The production MCTS**, `bench_search --n 800 --batch 4096`:
+
+| arm | evals/s | vs fp16 |
+|---|---:|---:|
+| fp16 | 58 021 | 1.000x |
+| e4m3 | 70 367 | 1.213x |
+| **int8, 2 boards** | **78 258** | **1.349x** |
+
+Against Gate 1a's 56 996 that is **1.37x**. 90k was not reached on either path.
+
+⚠️ The absolute numbers drift ~3 % with card temperature -- fp16 measured 64 682 here
+and 67 866 earlier the same day -- which is why only the ratios inside one interleaved
+run are comparable, and why the ledger records ratios.

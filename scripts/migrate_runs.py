@@ -1,7 +1,7 @@
 """Move pre-2026-08-14 artifacts into the `runs/<run>/` layout.
 
-    python tools/migrate_runs.py            # print the plan, move nothing
-    python tools/migrate_runs.py --apply
+    python scripts/migrate_runs.py            # print the plan, move nothing
+    python scripts/migrate_runs.py --apply
 
 `brokefish/paths.py` owns the layout; this only relocates what already exists.
 

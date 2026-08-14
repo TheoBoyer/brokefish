@@ -77,6 +77,9 @@ docs/       three kinds, and the kind is the directory. reference/ is normative 
             measurement. journal/ is dated and append-only: experiments, audits,
             lessons, never edited after the fact. roadmap.md and index.md sit on top
 debugger/   the web viewer, the only part not importable from `brokefish`
+scripts/    one-off operational scripts and campaign chain scripts. ⚠️ It already
+            existed and was missing from this list, which is how a `tools/` got
+            invented beside it on 2026-08-14. There is one directory for this
 data/       cuda_testset (A1's dump), suites.pt (D1), lichess_db_puzzle.csv
 runs/<run>/ **everything one run produces, in one folder** (2026-08-14): the .log and
             .jsonl, checkpoints/, replay/, wandb/, and every league / curve / match it

@@ -118,7 +118,11 @@ __device__ __forceinline__ void quantise_row_int8(uint8_t* dst, int dst_pitch,
         // orderings because its reads and writes interleaved; here **every read
         // happens before every write**, so hazards 2 and 3 cannot arise at all and
         // only hazard 1 -- other lanes still reading while this one writes -- remains.
-        half v[kTiles][kPerLane];
+        // ⚠️ **`uint4`, not scalar halves.** A lane's sixteen columns per tile are
+        // contiguous and 16-byte aligned (`col_group * 16` halves = 32 B, and every row
+        // pitch here is 528 B = 33 x 16), so a tile is two 128-bit loads, not sixteen.
+        static_assert(kPerLane % 8 == 0, "a lane's slice must be whole uint4s");
+        union { uint4 q[kTiles][kPerLane / 8]; half h[kTiles][kPerLane]; } rb;
         // ⚠️ **Four accumulators, not one.** A single `m` makes the amax a 32-long
         // dependent `fmaxf` chain, and `wait` -- fixed-latency dependency stalls -- is
         // the second stall in this kernel's ncu profile at 2.17 cycles per issue.
@@ -128,8 +132,9 @@ __device__ __forceinline__ void quantise_row_int8(uint8_t* dst, int dst_pitch,
 #pragma unroll
         for (int t = 0; t < kTiles; ++t)
 #pragma unroll
-            for (int i = 0; i < kPerLane; ++i)
-                v[t][i] = s[t * kTileK + col_group * kPerLane + i];
+            for (int j = 0; j < kPerLane / 8; ++j)
+                rb.q[t][j] = *reinterpret_cast<const uint4*>(
+                    s + t * kTileK + col_group * kPerLane + j * 8);
 #pragma unroll
         for (int t = 0; t < kTiles; ++t)
 #pragma unroll
@@ -137,7 +142,7 @@ __device__ __forceinline__ void quantise_row_int8(uint8_t* dst, int dst_pitch,
                 // For UNSIGNED the input is post-ReLU, so a plain max is the amax and
                 // a negative can only be a denormal artefact -- the convert saturates
                 // at 0 regardless.
-                const float a = __half2float(v[t][i]);
+                const float a = __half2float(rb.h[t][i]);
                 m[i & 3] = fmaxf(m[i & 3], UNSIGNED ? a : fabsf(a));
             }
         float mm = fmaxf(fmaxf(m[0], m[1]), fmaxf(m[2], m[3]));
@@ -161,8 +166,8 @@ __device__ __forceinline__ void quantise_row_int8(uint8_t* dst, int dst_pitch,
                 // NaN. `cvt.rni.sat` cannot produce a NaN, but it can produce garbage
                 // from one, so the arithmetic upstream of it still has to be clean.
                 *reinterpret_cast<uint32_t*>(d + i) = cvt_int8x4<UNSIGNED>(
-                    __half2float(v[t][i]) * inv, __half2float(v[t][i + 1]) * inv,
-                    __half2float(v[t][i + 2]) * inv, __half2float(v[t][i + 3]) * inv);
+                    __half2float(rb.h[t][i]) * inv, __half2float(rb.h[t][i + 1]) * inv,
+                    __half2float(rb.h[t][i + 2]) * inv, __half2float(rb.h[t][i + 3]) * inv);
             }
         }
     }

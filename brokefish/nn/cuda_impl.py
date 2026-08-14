@@ -107,7 +107,7 @@ class FusedEncoder:
                   "emb_clock", "emb_rep")
 
     def __init__(self, source, acc_dtype: str = "fp16", fp8: bool = False,
-                 int8: bool = False):
+                 int8: bool = False, two_boards: bool | None = None):
         net = source if isinstance(source, BrokefishNet) else None
         encoder = net.encoder if net is not None else source
         layers = encoder.layers
@@ -190,6 +190,19 @@ class FusedEncoder:
         if self.fp8 and self.int8:
             raise ValueError("fp8 and int8 quantise the same two matmuls; pick one")
         self.quant = 2 if self.int8 else (1 if self.fp8 else 0)
+        # ⚠️ Two boards per CTA is an *occupancy* change, not a numerics one: the
+        # logits come out **bit-identical**, because a board's arithmetic cannot depend
+        # on who it shares a CTA with. What it buys is half the L2->SM weight traffic
+        # per board -- measured 1.18x inside the real MCTS.
+        #
+        # It therefore defaults **on** whenever int8 is on, and there is deliberately no
+        # flag for it above this layer: a switch whose two settings produce identical
+        # numbers is not a decision anybody should have to make, and offering it invites
+        # a run configured the slow way for no reason. `two_boards=False` stays
+        # reachable so `tests/test_quant.py` can prove the two agree bit for bit.
+        self.two_boards = bool(self.int8) if two_boards is None else bool(two_boards)
+        if self.two_boards and self.fp8:
+            raise ValueError("two_boards is built for int8 and fp16; int8 dominates fp8")
         self._wq8 = torch.empty(0, dtype=torch.uint8, device="cuda")
         self._sq8 = torch.empty(0, dtype=torch.float, device="cuda")
         if self.fp8:
@@ -369,7 +382,8 @@ class FusedEncoder:
             boards.contiguous(), control.contiguous(), rep.contiguous(),
             self.weights, self.emb, self.tail,
             self.policy_out, self.promo_out, self.value_out, self._empty_h,
-            self.n_layers, self.eps, 0, self._wq8, self._sq8, self.quant)
+            self.n_layers, self.eps, 0, self._wq8, self._sq8, self.quant,
+            int(self.two_boards))
         return self.policy_out, self.promo_out, self.value_out
 
     def forward_stage(self, boards, control, rep, stage: int):
@@ -388,5 +402,6 @@ class FusedEncoder:
             boards.contiguous(), control.contiguous(), rep.contiguous(),
             self.weights, self.emb, self.tail,
             self._empty_h, self._empty_h, self._empty_f, self.state,
-            self.n_layers, self.eps, stage, self._wq8, self._sq8, self.quant)
+            self.n_layers, self.eps, stage, self._wq8, self._sq8, self.quant,
+            int(self.two_boards))
         return self.state

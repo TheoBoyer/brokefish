@@ -115,6 +115,7 @@ class TrainConfig:
     # `docs/journal/2026-08-14-int8-kernel-spec.md`. Off, because no run has used it.
     int8: bool = False
 
+
     # -- §11, playout cap randomisation (KataGo §3.1), `training.md` §11
     #
     # On a proportion `pcr_p` of turns the search runs the full `n_sims` cap and the

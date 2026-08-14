@@ -57,13 +57,38 @@ constexpr int HROW = AROW;          // same row pitch, so hid can alias vbuf
 // 5.4 %. bufA is the one buffer no ldmatrix reads, so it is the one that can
 // drop its row padding -- which is exactly the 512 bytes that buys the fit.
 constexpr int AROWA = Dm;               // bufA is never read by ldmatrix
-constexpr int SM_A = T * AROWA;         // residual stream
-constexpr int SM_B = T * AROW;          // normed input / attention output
-constexpr int SM_S = T * AROW;          // scratch: V transpose, then FFN hidden
-constexpr int SMEM_HALVES = SM_A + SM_B + SM_S;
-static_assert(SMEM_HALVES * sizeof(half) <= 50176,
+
+// Boards per CTA. ⚠️ This is the whole of the two-board design: a CTA holding two
+// boards is just `M = 64` for every weight matmul, because those matmuls are per-token
+// and both boards read the *same* weights. One B-fragment load then feeds twice the
+// arithmetic, which halves L2->SM weight traffic per board -- and that traffic is what
+// `long_scoreboard` (3.62, the top stall since fp8 landed) is measuring. Attention is
+// the exception and stays per board; it is 3.8 % of the budget.
+// docs/journal/2026-08-14-int8-kernel-spec.md.
+template <bool TWOB>
+struct Lay {
+    static constexpr int BPC = TWOB ? 2 : 1;      // boards per CTA
+    static constexpr int TB = BPC * T;            // rows per CTA
+    static constexpr int MT = TB / 16;            // m-tiles per weight GEMM
+    static constexpr int SM_A = TB * AROWA;       // residual stream
+    static constexpr int SM_B = TB * AROW;        // normed input / attention output
+    static constexpr int SM_S = TB * AROW;        // V transpose, then FFN hidden
+    static constexpr int HALVES = SM_A + SM_B + SM_S;
+    static constexpr int BYTES = HALVES * (int)sizeof(half);
+};
+constexpr int SM_A = Lay<false>::SM_A;
+constexpr int SM_B = Lay<false>::SM_B;
+constexpr int SM_S = Lay<false>::SM_S;
+constexpr int SMEM_HALVES = Lay<false>::HALVES;
+static_assert(Lay<false>::BYTES <= 50176,
               "over 50,176 B the block stops fitting twice on an sm89 SM, which "
               "costs more than any use of the extra memory has been worth");
+// ⚠️ Queried, not assumed: `cudaDevAttrMaxSharedMemoryPerBlockOptin` is 101,376 B on
+// sm89 -- 99 KB, not the 102,400 of `MaxSharedMemoryPerMultiprocessor`. Two boards
+// need 100,352, so they fit with 1,024 B to spare. The 2026-08-09 retrospective read
+// that ceiling as the requirement and concluded this was blocked. It is not.
+static_assert(Lay<true>::BYTES <= 101376,
+              "two boards must fit one CTA's opt-in shared memory");
 
 // §fp8. A parallel weight slab for the FFN only, in e4m3, plus its 128x128 block
 // scales. docs/journal/2026-08-04-fp8-encoder.md measured 1.70x on the ff1 shape and
@@ -219,8 +244,12 @@ __device__ __forceinline__ uint32_t a_frag_addr(const half* base, int row0, int 
 // with a runtime trip count ptxas keeps it rolled, which serialises each
 // iteration's B loads behind the previous iteration's mma instead of letting
 // them overlap. Every call site knows its depth at compile time.
-template <int K32N, int NK32>
-__device__ __forceinline__ void gemm_direct(uint32_t acc[2][4][2], const half* a_base,
+// ⚠️ `MT` is **deduced from the accumulator** rather than passed, and that is safety
+// rather than convenience: the same helpers serve a 32-row and a 64-row buffer in the
+// same kernel, and a call looping four m-tiles over a two-tile array would read and
+// write past it while staying inside shared memory and finite.
+template <int K32N, int NK32, int MT>
+__device__ __forceinline__ void gemm_direct(uint32_t (&acc)[MT][4][2], const half* a_base,
                                             int a_stride, const half* w, int n8_0,
                                             int k32_0, int lane) {
     // Base pointer for (p=0, j=0). NK32 (the packed matrix's row pitch in
@@ -241,9 +270,9 @@ __device__ __forceinline__ void gemm_direct(uint32_t acc[2][4][2], const half* a
     for (int j = 0; j < K32N; j += 2) {
 #pragma unroll
         for (int u = 0; u < 2; ++u) {
-            uint32_t af[2][2][4];
+            uint32_t af[MT][2][4];
 #pragma unroll
-            for (int m = 0; m < 2; ++m)
+            for (int m = 0; m < MT; ++m)
 #pragma unroll
                 for (int kk = 0; kk < 2; ++kk)
                     ldmatrix_x4(af[m][kk],
@@ -260,7 +289,7 @@ __device__ __forceinline__ void gemm_direct(uint32_t acc[2][4][2], const half* a
                 uint32_t b0[2] = {pre[u][p].x, pre[u][p].y};
                 uint32_t b1[2] = {pre[u][p].z, pre[u][p].w};
 #pragma unroll
-                for (int m = 0; m < 2; ++m) {
+                for (int m = 0; m < MT; ++m) {
                     mma_f16(acc[m][p], af[m][0], b0);
                     mma_f16(acc[m][p], af[m][1], b1);
                 }
@@ -294,7 +323,7 @@ __device__ __forceinline__ void gemm_direct(uint32_t acc[2][4][2], const half* a
 /// ⚠️ Only the *body* folds. `tail_epilogue`'s `norm_f` would need a bias vector added
 /// to the three heads, which have none, so it keeps `AFFINE = true` -- it runs once per
 /// board against the body's sixteen, and buying it would cost a new slab field.
-template <bool AFFINE>
+template <bool AFFINE, int ROWS>
 __device__ __forceinline__ void layernorm(half* dst, const half* src, const half* gamma,
                                           const half* beta, float eps, int warp, int lane) {
     // One 128-bit load each instead of eight scalar LDG.E.U16: a lane's eight
@@ -310,7 +339,7 @@ __device__ __forceinline__ void layernorm(half* dst, const half* src, const half
     const half* gv = reinterpret_cast<const half*>(&graw);
     const half* bv = reinterpret_cast<const half*>(&braw);
 #pragma unroll
-    for (int i = 0; i < T / NWARPS; ++i) {
+    for (int i = 0; i < ROWS / NWARPS; ++i) {
         int row = warp + i * NWARPS;
         const half* p = src + ai_idx(row, lane * 8);
         uint4 raw = *reinterpret_cast<const uint4*>(p);
@@ -352,14 +381,15 @@ __device__ __forceinline__ void layernorm(half* dst, const half* src, const half
 // Add a bias to a [2][4] block of D fragments. Element (m, n) of the fragment
 // covers rows 16m + {g, g+8} and columns 8n + {2t, 2t+1}; the bias depends only
 // on the column, so both halves of both registers take the same pair.
-__device__ __forceinline__ void add_bias(uint32_t acc[2][4][2], const half* bias, int col0,
-                                         int lane) {
+template <int MT>
+__device__ __forceinline__ void add_bias(uint32_t (&acc)[MT][4][2], const half* bias,
+                                         int col0, int lane) {
     int t = lane & 3;
 #pragma unroll
     for (int n = 0; n < 4; ++n) {
         __half2 b = *reinterpret_cast<const __half2*>(bias + col0 + n * 8 + t * 2);
 #pragma unroll
-        for (int m = 0; m < 2; ++m) {
+        for (int m = 0; m < MT; ++m) {
             acc[m][n][0] = u32(__hadd2(h2(acc[m][n][0]), b));
             acc[m][n][1] = u32(__hadd2(h2(acc[m][n][1]), b));
         }
@@ -368,11 +398,13 @@ __device__ __forceinline__ void add_bias(uint32_t acc[2][4][2], const half* bias
 
 // Scatter a [2][4] D-fragment block into an SMEM activation buffer at column
 // offset col0.
-__device__ __forceinline__ void store_frags(half* dst, int stride, uint32_t acc[2][4][2],
+template <int MT>
+__device__ __forceinline__ void store_frags(half* dst, int stride,
+                                            const uint32_t (&acc)[MT][4][2],
                                             int col0, int lane) {
     int g = lane >> 2, t = lane & 3;
 #pragma unroll
-    for (int m = 0; m < 2; ++m)
+    for (int m = 0; m < MT; ++m)
 #pragma unroll
         for (int n = 0; n < 4; ++n) {
             int c = col0 + n * 8 + t * 2;
@@ -390,9 +422,10 @@ __device__ __forceinline__ void store_frags(half* dst, int stride, uint32_t acc[
 // warp against 32, with no conflicts. It needs no extra barrier either: every
 // row of bufA belongs to exactly one warp, so the add and the LayerNorm that
 // reads it back are warp-local.
+template <int ROWS>
 __device__ __forceinline__ void residual_rows(half* x, const half* src, int warp, int lane) {
 #pragma unroll
-    for (int i = 0; i < T / NWARPS; ++i) {
+    for (int i = 0; i < ROWS / NWARPS; ++i) {
         int row = warp + i * NWARPS;
         half* dst = x + ai_idx(row, lane * 8);
         uint4 a = *reinterpret_cast<uint4*>(dst);
@@ -405,9 +438,10 @@ __device__ __forceinline__ void residual_rows(half* x, const half* src, int warp
     }
 }
 
-__device__ __forceinline__ void zero_frags(uint32_t acc[2][4][2]) {
+template <int MT>
+__device__ __forceinline__ void zero_frags(uint32_t (&acc)[MT][4][2]) {
 #pragma unroll
-    for (int m = 0; m < 2; ++m)
+    for (int m = 0; m < MT; ++m)
 #pragma unroll
         for (int n = 0; n < 4; ++n) acc[m][n][0] = acc[m][n][1] = 0;
 }
@@ -420,8 +454,21 @@ __device__ __forceinline__ void zero_frags(uint32_t acc[2][4][2]) {
 // fragments are picked out of K's registers. V does need one, and takes the
 // only memory round trip in the block -- warp-private, so __syncwarp() rather
 // than a CTA barrier.
-__device__ __forceinline__ void attention(uint32_t o[2][4][2], const uint32_t q[2][4][2],
-                                          const uint32_t k[2][4][2], uint32_t v[2][4][2],
+// One board's two m-tiles out of a CTA's `MT`. ⚠️ Attention mixes tokens *within* a
+// board -- its score matrix is [32,32] per head -- so it is the one stage that cannot
+// see 64 rows as one taller problem. The cast is on a pointer to the correct sub-block
+// and yields a properly sized array reference, so the helpers inside `attention` still
+// deduce two m-tiles and still cannot run off the end.
+template <int MT>
+__device__ __forceinline__ uint32_t (&board_tiles(uint32_t (&a)[MT][4][2], int bb))[2][4][2] {
+    static_assert(MT % 2 == 0, "m-tiles come in pairs, one board each");
+    return *reinterpret_cast<uint32_t (*)[2][4][2]>(&a[2 * bb]);
+}
+
+__device__ __forceinline__ void attention(uint32_t (&o)[2][4][2],
+                                          const uint32_t (&q)[2][4][2],
+                                          const uint32_t (&k)[2][4][2],
+                                          const uint32_t (&v)[2][4][2],
                                           half* vbuf, int vcol0, uint32_t alive, int lane) {
     // Warp w writes its head into columns [32w, 32w+32) of the shared scratch
     // buffer. Pitch AROW = 264 halves keeps the eight rows of an ldmatrix in
@@ -611,7 +658,7 @@ __device__ __noinline__ void tail_epilogue(half* bufA, half* bufB, half* scratch
     // 512 B is what bought the second CTA per SM -- so a head GEMM reading it
     // through ldmatrix would collide eight ways. The norm lands the stream in
     // bufB, which is padded, and both problems go away at once.
-    layernorm<true>(bufB, bufA, tail + TailOff::lnf_w, tail + TailOff::lnf_b, eps,
+    layernorm<true, T>(bufB, bufA, tail + TailOff::lnf_w, tail + TailOff::lnf_b, eps,
                     warp, lane);
     __syncthreads();
     if (!policy) return;
@@ -770,8 +817,13 @@ struct Timer {
 // laid out identically and a runtime switch between them would be invisible: int8
 // bytes read as e4m3 stay in range and produce plausible logits.
 // docs/journal/2026-08-14-int8-kernel-spec.md.
-template <bool FP8, bool INT8, bool PROF = false>
-__global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
+// ⚠️ `TWOB` carries its own `__launch_bounds__`: two boards need 100,352 B of shared
+// memory, which is one CTA per SM, and at one CTA the register file divides by 256
+// threads instead of 512 -- 255 per thread against 128. That is what pays for the s32
+// accumulator int8 needs, and it is why the format change and the occupancy change are
+// one design. Step 0 measured the combination at 223 registers with **zero spill**.
+template <bool FP8, bool INT8, bool TWOB, bool PROF = false>
+__global__ __launch_bounds__(THREADS, TWOB ? 1 : 2) void encoder_kernel(
     half* __restrict__ y, const half* __restrict__ weights,
     const uint8_t* __restrict__ wq8, const float* __restrict__ sq8,
     const int8_t* __restrict__ alive_ptr,
@@ -789,46 +841,58 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
     const uint8_t* __restrict__ rep_ptr, const half* __restrict__ emb,
     const half* __restrict__ tail, half* __restrict__ policy,
     half* __restrict__ promo, float* __restrict__ value,
-    int n_layers, float eps, int debug_stage) {
+    int n_layers, float eps, int debug_stage, int n_boards) {
     static_assert(!(FP8 && INT8), "the FFN is quantised once, in one format");
     // Both quantised paths read the same byte slab and the same scale slab.
     constexpr bool Q8 = FP8 || INT8;
+    using L = Lay<TWOB>;
+    constexpr int BPC = L::BPC, TB = L::TB, MT = L::MT;
     extern __shared__ half smem[];
-    half* bufA = smem;                    // residual stream
-    half* bufB = bufA + SM_A;             // normed input, then attention output
+    half* bufA = smem;                    // residual stream, TB rows
+    half* bufB = bufA + L::SM_A;          // normed input, then attention output
     // One scratch buffer serves both roles: the V transpose during attention
     // and the FFN hidden chunk afterwards. Their lifetimes do not overlap, and
     // sharing the allocation is what brings the block down to 49.5 KB.
-    half* scratch = bufB + SM_B;
+    half* scratch = bufB + L::SM_B;
     half* hid = scratch;
     half* vbuf = scratch;
 
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    const int board = blockIdx.x;
+    const int b0 = blockIdx.x * BPC;
+    // ⚠️ An odd batch leaves the last CTA with one real board. The spare slot reads
+    // board `b0` again -- a duplicate is harmless arithmetic -- and its outputs are
+    // simply never written. Clamping the *input* rather than skipping the work keeps
+    // the whole kernel branch-free below this point, which matters because every
+    // barrier in it is a full-CTA barrier.
+    const int nb = min(BPC, n_boards - b0);
 
-    // Declared before the first goto: jumping over an initialised declaration in
-    // the same scope does not compile, and the debug stages jump to `dump`.
-    half* gy = y ? y + (size_t)board * T * Dm : nullptr;
-    prof::Timer<PROF> tm(board, warp, lane);
+    // Declared before the first goto: jumping over an initialised declaration in the
+    // same scope does not compile, and the debug stages jump to `dump`.
+    prof::Timer<PROF> tm(b0, warp, lane);
 
-    // One 32-bit word says which slots hold a live piece (spec 7.3). Dead keys
-    // leave the softmax as -inf; dead rows are computed and never read.
-    uint32_t alive = 0xffffffffu;
-
-    if (boards) {
-        alive = embed_board(bufA, boards, control, rep_ptr, emb, board, warp, lane);
-    } else {
-        if (alive_ptr) {
-            // One coalesced byte per lane and a ballot, not 32 scalar loads per
-            // thread. T == warpSize is what makes the ballot the whole reduction.
-            alive = __ballot_sync(0xffffffffu, alive_ptr[(size_t)board * T + lane] != 0);
-        }
-        // Board in: [T][Dm] contiguous, one uint4 per lane per row.
+    // One 32-bit word per board says which slots hold a live piece (spec 7.3). Dead
+    // keys leave the softmax as -inf; dead rows are computed and never read.
+    uint32_t alive[BPC];
 #pragma unroll
-        for (int i = 0; i < T / NWARPS; ++i) {
-            int row = warp + i * NWARPS;
-            *reinterpret_cast<uint4*>(bufA + ai_idx(row, lane * 8)) =
-                *reinterpret_cast<const uint4*>(gy + row * Dm + lane * 8);
+    for (int bb = 0; bb < BPC; ++bb) {
+        const int gb = b0 + (bb < nb ? bb : 0);
+        half* aB = bufA + (size_t)bb * T * AROWA;
+        if (boards) {
+            alive[bb] = embed_board(aB, boards, control, rep_ptr, emb, gb, warp, lane);
+        } else {
+            alive[bb] = 0xffffffffu;
+            if (alive_ptr)
+                // One coalesced byte per lane and a ballot, not 32 scalar loads per
+                // thread. T == warpSize is what makes the ballot the whole reduction.
+                alive[bb] = __ballot_sync(0xffffffffu,
+                                          alive_ptr[(size_t)gb * T + lane] != 0);
+            const half* g = y + (size_t)gb * T * Dm;
+#pragma unroll
+            for (int i = 0; i < T / NWARPS; ++i) {
+                int row = warp + i * NWARPS;
+                *reinterpret_cast<uint4*>(aB + ai_idx(row, lane * 8)) =
+                    *reinterpret_cast<const uint4*>(g + row * Dm + lane * 8);
+            }
         }
     }
     __syncthreads();
@@ -842,7 +906,7 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
 
         // The affine slots hold ones and zeros: gamma lives in w_qkv's input axis and
         // beta in b_qkv, folded there by `FusedEncoder._fold_norm`.
-        layernorm<false>(bufB, bufA, W + Off::ln1_w, W + Off::ln1_b, eps, warp, lane);
+        layernorm<false, TB>(bufB, bufA, W + Off::ln1_w, W + Off::ln1_b, eps, warp, lane);
 
         if (debug_stage == 1) { __syncthreads(); goto dump; }
         // Cross-warp handoff. layernorm writes bufB by row (warp w owns rows
@@ -853,7 +917,7 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
         __syncthreads();
         tm.mark(prof::kLn1);
 
-        uint32_t q[2][4][2], k[2][4][2], v[2][4][2];
+        uint32_t q[MT][4][2], k[MT][4][2], v[MT][4][2];
         zero_frags(q);
         zero_frags(k);
         zero_frags(v);
@@ -878,8 +942,12 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
             goto dump;
         }
 
-        uint32_t o[2][4][2];
-        attention(o, q, k, v, vbuf, warp * DH, alive, lane);
+        uint32_t o[MT][4][2];
+#pragma unroll
+        for (int bb = 0; bb < BPC; ++bb)
+            attention(board_tiles(o, bb), board_tiles(q, bb), board_tiles(k, bb),
+                      board_tiles(v, bb), vbuf + (size_t)bb * T * AROW, warp * DH,
+                      alive[bb], lane);
         tm.mark(prof::kAttention);
 
         __syncthreads();
@@ -888,7 +956,7 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
         __syncthreads();
         tm.mark(prof::kAttnStore);
 
-        uint32_t proj[2][4][2];
+        uint32_t proj[MT][4][2];
         zero_frags(proj);
         gemm_direct<NK, NK>(proj, bufB, AROW, W + Off::w_o, warp * 4, 0, lane);
         tm.mark(prof::kProjGemm);
@@ -898,15 +966,15 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
         store_frags(scratch, AROW, proj, warp * DH, lane);
         __syncthreads();
         tm.mark(prof::kProjEpi);
-        residual_rows(bufA, scratch, warp, lane);
+        residual_rows<TB>(bufA, scratch, warp, lane);
 
         if (debug_stage == 2) goto dump;
-        layernorm<false>(bufB, bufA, W + Off::ln2_w, W + Off::ln2_b, eps, warp, lane);
+        layernorm<false, TB>(bufB, bufA, W + Off::ln2_w, W + Off::ln2_b, eps, warp, lane);
         if (debug_stage == 3) { __syncthreads(); goto dump; }
         __syncthreads();
         tm.mark(prof::kRes1Ln2);
 
-        uint32_t ff[2][4][2];
+        uint32_t ff[MT][4][2];
         zero_frags(ff);
         if constexpr (Q8) {
             // Quantise the normed input **in place**, once for all four chunks: one
@@ -917,22 +985,22 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
             // than of the format.
             uint8_t* aq = reinterpret_cast<uint8_t*>(bufB);
             float* as = reinterpret_cast<float*>(aq + fp8cfg::kScaleOff);
-            const int r0 = warp * (T / NWARPS);
+            const int r0 = warp * (TB / NWARPS);
             if constexpr (INT8)
                 int8q::quantise_row_int8<Dm, /*UNSIGNED=*/false>(
                     aq + (size_t)r0 * fp8cfg::kAPitch, fp8cfg::kAPitch,
                     as + (size_t)r0 * fp8cfg::kScaleStride, fp8cfg::kScaleStride,
-                    bufB + (size_t)r0 * AROW, AROW, T / NWARPS, lane);
+                    bufB + (size_t)r0 * AROW, AROW, TB / NWARPS, lane);
             else
                 fp8::quantise_row<Dm>(aq + (size_t)r0 * fp8cfg::kAPitch, fp8cfg::kAPitch,
                                       as + (size_t)r0 * fp8cfg::kScaleStride,
                                       fp8cfg::kScaleStride,
-                                      bufB + (size_t)r0 * AROW, AROW, T / NWARPS, lane);
+                                      bufB + (size_t)r0 * AROW, AROW, TB / NWARPS, lane);
             __syncthreads();
             tm.mark(prof::kQuantA);
         }
         for (int c = 0; c < DFF / HCHUNK; ++c) {
-            uint32_t hacc[2][4][2];
+            uint32_t hacc[MT][4][2];
             // ff1 is [1024][256]: chunk c starts at n-tile 32c.
             if constexpr (INT8) {
                 // A is the normed input, which is signed.
@@ -987,19 +1055,19 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
                 // quantised, only 256 of the 1024 hidden units being resident.
                 uint8_t* hq = reinterpret_cast<uint8_t*>(hid);
                 float* hs = reinterpret_cast<float*>(hq + fp8cfg::kScaleOff);
-                const int r0 = warp * (T / NWARPS);
+                const int r0 = warp * (TB / NWARPS);
                 if constexpr (INT8)
                     int8q::quantise_row_int8<HCHUNK, /*UNSIGNED=*/true>(
                         hq + (size_t)r0 * fp8cfg::kAPitch, fp8cfg::kAPitch,
                         hs + (size_t)r0 * fp8cfg::kScaleStride, fp8cfg::kScaleStride,
-                        hid + (size_t)r0 * HROW, HROW, T / NWARPS, lane);
+                        hid + (size_t)r0 * HROW, HROW, TB / NWARPS, lane);
                 else
                     fp8::quantise_row<HCHUNK>(hq + (size_t)r0 * fp8cfg::kAPitch,
                                               fp8cfg::kAPitch,
                                               hs + (size_t)r0 * fp8cfg::kScaleStride,
                                               fp8cfg::kScaleStride,
                                               hid + (size_t)r0 * HROW, HROW,
-                                              T / NWARPS, lane);
+                                              TB / NWARPS, lane);
                 __syncthreads();
                 tm.mark(prof::kQuantH);
                 // ⚠️ The weight is addressed globally from `k32_0 = 8c`; the activation
@@ -1030,14 +1098,24 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
         store_frags(bufB, AROW, ff, warp * DH, lane);
         __syncthreads();
         tm.mark(prof::kFf2Epi);
-        residual_rows(bufA, bufB, warp, lane);
+        residual_rows<TB>(bufA, bufB, warp, lane);
         tm.mark(prof::kRes2);
     }
 
     // --- B2 epilogue: the final LayerNorm, then the three heads -------------
-    if (policy || debug_stage == 8)
-        tail_epilogue(bufA, bufB, scratch, tail, control, policy, promo, value, eps,
-                      board, warp, lane, tid);
+    if (policy || debug_stage == 8) {
+#pragma unroll
+        for (int bb = 0; bb < BPC; ++bb) {
+            // ⚠️ Guarded, unlike the prologue: a duplicated board may be *computed*
+            // but must never be *written*, or an odd batch would have the last board's
+            // logits stored twice and the tail of `policy` would look plausible.
+            if (bb < nb)
+                tail_epilogue(bufA + (size_t)bb * T * AROWA, bufB + (size_t)bb * T * AROW,
+                              scratch + (size_t)bb * T * AROW, tail, control, policy,
+                              promo, value, eps, b0 + bb, warp, lane, tid);
+            __syncthreads();
+        }
+    }
     tm.mark(prof::kEpilogue);
     if (debug_stage == 8) goto dump;
     if (policy) return;
@@ -1045,14 +1123,23 @@ __global__ __launch_bounds__(THREADS, 2) void encoder_kernel(
 dump:
     if (!y) return;
 #pragma unroll
-    for (int i = 0; i < T / NWARPS; ++i) {
-        int row = warp + i * NWARPS;
-        // Stage 9 is the embedding gather, which lands in bufA; 8 is the final
-        // norm, which lands in bufB like the other post-norm stages.
-        bool fromB = (debug_stage == 1 || debug_stage == 3
-                      || (debug_stage >= 4 && debug_stage <= 8));
-        const half* srcbuf = fromB ? bufB + a_idx(row, lane * 8) : bufA + ai_idx(row, lane * 8);
-        *reinterpret_cast<uint4*>(gy + row * Dm + lane * 8) = *reinterpret_cast<const uint4*>(srcbuf);
+    for (int bb = 0; bb < BPC; ++bb) {
+        if (bb >= nb) break;
+        half* g = y + (size_t)(b0 + bb) * T * Dm;
+        const half* aB = bufA + (size_t)bb * T * AROWA;
+        const half* bB = bufB + (size_t)bb * T * AROW;
+#pragma unroll
+        for (int i = 0; i < T / NWARPS; ++i) {
+            int row = warp + i * NWARPS;
+            // Stage 9 is the embedding gather, which lands in bufA; 8 is the final
+            // norm, which lands in bufB like the other post-norm stages.
+            bool fromB = (debug_stage == 1 || debug_stage == 3
+                          || (debug_stage >= 4 && debug_stage <= 8));
+            const half* srcbuf = fromB ? bB + a_idx(row, lane * 8)
+                                       : aB + ai_idx(row, lane * 8);
+            *reinterpret_cast<uint4*>(g + row * Dm + lane * 8) =
+                *reinterpret_cast<const uint4*>(srcbuf);
+        }
     }
 }
 
@@ -1074,18 +1161,20 @@ T* ptr_or_null(const torch::Tensor& t) {
 // spill the one every number in perf.md was measured on. `PROF=false` is the shipped
 // kernel; `csrc/tests/README.md` records the ptxas report that proves it.
 bool g_profile = false;
-template <bool FP8, bool INT8, bool PROF>
+template <bool FP8, bool INT8, bool TWOB, bool PROF>
 void launch_one(int n_boards, size_t smem, half* y, const half* weights,
                 const uint8_t* wq8, const float* sq8, const int8_t* alive,
                 const uint16_t* boards, const int16_t* control, const uint8_t* rep,
                 const half* emb, const half* tail, half* policy, half* promo,
                 float* value, int n_layers, float eps, int debug_stage) {
     constexpr bool Q8 = FP8 || INT8;
-    cudaFuncSetAttribute(brokefish::encoder_kernel<FP8, INT8, PROF>,
+    constexpr int BPC = brokefish::Lay<TWOB>::BPC;
+    const int grid = (n_boards + BPC - 1) / BPC;
+    cudaFuncSetAttribute(brokefish::encoder_kernel<FP8, INT8, TWOB, PROF>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-    brokefish::encoder_kernel<FP8, INT8, PROF><<<n_boards, brokefish::THREADS, smem>>>(
+    brokefish::encoder_kernel<FP8, INT8, TWOB, PROF><<<grid, brokefish::THREADS, smem>>>(
         y, weights, Q8 ? wq8 : nullptr, Q8 ? sq8 : nullptr, alive, boards, control,
-        rep, emb, tail, policy, promo, value, n_layers, eps, debug_stage);
+        rep, emb, tail, policy, promo, value, n_layers, eps, debug_stage, n_boards);
 }
 
 // `quant`: 0 = fp16, 1 = e4m3, 2 = int8. ⚠️ An explicit mode rather than a property of
@@ -1093,28 +1182,39 @@ void launch_one(int n_boards, size_t smem, half* y, const half* weights,
 // int8 bytes read as e4m3 stay in range and produce plausible logits, so a
 // pointer-derived switch would fail silently. The fp16/quantised distinction keeps its
 // old all-or-nothing pointer check on top.
-void launch(int n_boards, int quant, half* y, const half* weights, const uint8_t* wq8,
+void launch(int n_boards, int quant, bool twob, half* y, const half* weights,
+            const uint8_t* wq8,
             const float* sq8, const int8_t* alive,
             const uint16_t* boards, const int16_t* control, const uint8_t* rep,
             const half* emb, const half* tail, half* policy, half* promo, float* value,
             int n_layers, float eps, int debug_stage) {
-    size_t smem = brokefish::SMEM_HALVES * sizeof(half);
+    const size_t smem = twob ? brokefish::Lay<true>::BYTES : brokefish::Lay<false>::BYTES;
     const bool have_slab = (wq8 != nullptr) && (sq8 != nullptr);
     TORCH_CHECK(quant == 0 || have_slab,
                 "quant mode ", quant, " needs both the byte slab and the scale slab; "
                 "half a slab reads the wrong matrix and stays in range");
-#define BROKEFISH_LAUNCH(F, I, P)                                                     \
-    launch_one<F, I, P>(n_boards, smem, y, weights, wq8, sq8, alive, boards, control,  \
-                        rep, emb, tail, policy, promo, value, n_layers, eps, debug_stage)
-    if (quant == 2) {
-        if (g_profile) BROKEFISH_LAUNCH(false, true, true);
-        else           BROKEFISH_LAUNCH(false, true, false);
+    // ⚠️ Only the combinations that exist are instantiated. e4m3 has no two-board
+    // variant: int8 is better on both axes, so a two-board e4m3 kernel would be a
+    // configuration nobody would run, paid for in compile time on every build.
+#define BROKEFISH_LAUNCH(F, I, W, P)                                                   \
+    launch_one<F, I, W, P>(n_boards, smem, y, weights, wq8, sq8, alive, boards,        \
+                           control, rep, emb, tail, policy, promo, value, n_layers,    \
+                           eps, debug_stage)
+    if (quant == 2 && twob) {
+        if (g_profile) BROKEFISH_LAUNCH(false, true, true, true);
+        else           BROKEFISH_LAUNCH(false, true, true, false);
+    } else if (quant == 2) {
+        if (g_profile) BROKEFISH_LAUNCH(false, true, false, true);
+        else           BROKEFISH_LAUNCH(false, true, false, false);
     } else if (quant == 1) {
-        if (g_profile) BROKEFISH_LAUNCH(true, false, true);
-        else           BROKEFISH_LAUNCH(true, false, false);
+        if (g_profile) BROKEFISH_LAUNCH(true, false, false, true);
+        else           BROKEFISH_LAUNCH(true, false, false, false);
+    } else if (twob) {
+        if (g_profile) BROKEFISH_LAUNCH(false, false, true, true);
+        else           BROKEFISH_LAUNCH(false, false, true, false);
     } else {
-        if (g_profile) BROKEFISH_LAUNCH(false, false, true);
-        else           BROKEFISH_LAUNCH(false, false, false);
+        if (g_profile) BROKEFISH_LAUNCH(false, false, false, true);
+        else           BROKEFISH_LAUNCH(false, false, false, false);
     }
 #undef BROKEFISH_LAUNCH
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -1134,7 +1234,7 @@ void encoder_forward(torch::Tensor y, torch::Tensor weights, torch::Tensor alive
     TORCH_CHECK(weights.is_cuda() && weights.scalar_type() == torch::kHalf);
     // No fp8 here on purpose: this entry point is the A/B control against Triton and
     // the eleven tests of tests/test_model.py, so it stays the fp16 kernel exactly.
-    launch((int)y.size(0), /*quant=*/0, ptr_or_null<half>(y),
+    launch((int)y.size(0), /*quant=*/0, /*twob=*/false, ptr_or_null<half>(y),
            ptr_or_null<const half>(weights), nullptr, nullptr,
            ptr_or_null<const int8_t>(alive), nullptr, nullptr, nullptr, nullptr, nullptr,
            nullptr, nullptr, nullptr, (int)n_layers, (float)eps, (int)debug_stage);
@@ -1148,7 +1248,7 @@ void model_forward(torch::Tensor boards, torch::Tensor control, torch::Tensor re
                    torch::Tensor weights, torch::Tensor emb, torch::Tensor tail,
                    torch::Tensor policy, torch::Tensor promo, torch::Tensor value,
                    torch::Tensor y, int64_t n_layers, double eps, int64_t debug_stage,
-                   torch::Tensor wq8, torch::Tensor sq8, int64_t quant) {
+                   torch::Tensor wq8, torch::Tensor sq8, int64_t quant, int64_t twob) {
     TORCH_CHECK(boards.is_cuda() && boards.scalar_type() == torch::kShort
                 && boards.is_contiguous() && boards.dim() == 2
                 && boards.size(1) == brokefish::T,
@@ -1207,7 +1307,10 @@ void model_forward(torch::Tensor boards, torch::Tensor control, torch::Tensor re
     }
 
     TORCH_CHECK(quant >= 0 && quant <= 2, "quant is 0 fp16, 1 e4m3, 2 int8; got ", quant);
-    launch((int)n, (int)quant, ptr_or_null<half>(y), ptr_or_null<const half>(weights),
+    TORCH_CHECK(!twob || quant == 0 || quant == 2,
+                "two boards per CTA is built for int8 and fp16 only, got quant ", quant);
+    launch((int)n, (int)quant, twob != 0, ptr_or_null<half>(y),
+           ptr_or_null<const half>(weights),
            ptr_or_null<const uint8_t>(wq8), ptr_or_null<const float>(sq8), nullptr,
            ptr_or_null<const uint16_t>(boards), ptr_or_null<const int16_t>(control),
            ptr_or_null<const uint8_t>(rep), ptr_or_null<const half>(emb),
@@ -1259,7 +1362,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("boards"), py::arg("control"), py::arg("rep"), py::arg("weights"),
           py::arg("emb"), py::arg("tail"), py::arg("policy"), py::arg("promo"),
           py::arg("value"), py::arg("y"), py::arg("n_layers"), py::arg("eps"),
-          py::arg("debug_stage"), py::arg("wq8"), py::arg("sq8"), py::arg("quant") = 0);
+          py::arg("debug_stage"), py::arg("wq8"), py::arg("sq8"), py::arg("quant") = 0,
+          py::arg("twob") = 0);
     m.def("int8_q_max", []() {
         return std::pair<double, double>{(double)brokefish::int8q::kQMaxS,
                                          (double)brokefish::int8q::kQMaxU};

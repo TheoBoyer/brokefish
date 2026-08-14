@@ -392,6 +392,50 @@ def test_int8_inside_a_real_search():
     assert int(s.edge_N[:, 0].sum(-1).min()) > 0
 
 
+@pytest.mark.parametrize("n", [1, 2, 3, 4, 31, 32, 33, 127, 128, 257])
+def test_two_boards_per_cta_is_bit_identical_to_one(n):
+    """Two boards per CTA is an **occupancy** change, so the logits must not move.
+
+    ⚠️ This is the strongest statement available about the rework and it is stronger
+    than a tolerance: a board's arithmetic cannot depend on who it shares a CTA with,
+    so anything other than bit-equality means the two boards are interfering — through
+    the shared-memory split, the per-board attention slice, or the odd-batch tail
+    guard. The odd sizes are the guard: at n = 3 the last CTA holds one real board and
+    one duplicate, whose outputs must be computed and never written."""
+    net = BrokefishNet().cuda().half().eval()
+    one = FusedEncoder(copy.deepcopy(net), int8=True, two_boards=False)
+    two = FusedEncoder(copy.deepcopy(net), int8=True)
+    b, c, r = random_positions(n, plies=20, seed=n)
+    with torch.no_grad():
+        p1, q1, v1 = (t.clone() for t in one.forward_full(b, c, r))
+        p2, q2, v2 = two.forward_full(b, c, r)
+    assert torch.isfinite(p2).all() and torch.isfinite(v2).all()
+    assert torch.equal(p1, p2), "policy logits moved"
+    assert torch.equal(q1, q2), "promo logits moved"
+    assert torch.equal(v1, v2), "value moved"
+
+
+def test_two_boards_rejects_fp8():
+    """Not instantiated: int8 dominates e4m3 on both axes, so a two-board e4m3 kernel
+    is a configuration nobody would run, paid for in compile time on every build."""
+    net = BrokefishNet().cuda().half().eval()
+    with pytest.raises(ValueError, match="int8 dominates"):
+        FusedEncoder(net, fp8=True, two_boards=True)
+
+
+def test_two_boards_runs_the_debug_stages():
+    net = BrokefishNet().cuda().half().eval()
+    one = FusedEncoder(copy.deepcopy(net), int8=True, two_boards=False)
+    two = FusedEncoder(copy.deepcopy(net), int8=True)
+    b, c, r = random_positions(33, plies=20, seed=11)
+    with torch.no_grad():
+        for stage in (9, 1, 2, 3, 8):
+            a = one.forward_stage(b, c, r, stage).clone()
+            z = two.forward_stage(b, c, r, stage)
+            assert torch.isfinite(z).all(), f"stage {stage} not finite"
+            assert torch.equal(a, z), f"stage {stage} moved"
+
+
 def test_the_shipping_weight_scale_covers_the_whole_reduction():
     """⚠️ `_pack_fp8` must pass `tile_k = K`, and getting it wrong is silent.
 

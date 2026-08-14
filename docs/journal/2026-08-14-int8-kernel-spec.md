@@ -257,6 +257,47 @@ hazards are all inside torch's own `reduce_kernel`), but a clean racecheck on co
 code does not prove it would flag the broken version. **That hazard is guarded by a
 comment and by nothing else, on both the e4m3 and the int8 path.**
 
+## Built: two boards per CTA
+
+⚠️ The entry above says "two boards per CTA is **not** built". It is now, same day, and
+this section supersedes that sentence.
+
+**Bit-identical to one board.** That is the strongest correctness statement available
+here and it is stronger than any tolerance: a board's arithmetic cannot depend on who
+it shares a CTA with, so anything other than bit-equality would mean the two boards
+interfere — through the shared-memory split, the per-board attention slice, or the
+odd-batch tail guard. Checked at eleven batch sizes including 1, 3, 33, 127 and 257
+(the odd ones exercise the tail CTA, which holds one real board and one duplicate whose
+outputs are computed and never written), and on five networks including random init.
+`tests/test_quant.py` pins it.
+
+**Throughput** (`perf.md` has the tables): **1.310×** fp16 on the encoder path,
+**76 462 evals/s in the real MCTS** against 58 545 for fp16 and 64 876 for int8 alone.
+
+⚠️ **Two things measured that I did not predict.**
+
+The two-board gain is **larger inside the MCTS (1.179×) than in the encoder bench
+(1.055×)**, and I have no explanation — only a hypothesis about the search not feeding
+full batches. And the occupancy axis alone is worth 1.117× on fp16 but only 1.055× on
+top of int8, which *is* explicable: int8 already halved the FFN's weight bytes, so
+there is less traffic left for a second board to save.
+
+**The prefetch is a dead end for a reason that is not registers.** `fp8_gemm.cuh`
+attributes its 1.147× → 0.835× regression to the 128-register cap. At **255 registers
+with zero spill** the same change still costs 88 204 → 72 704 (two-board) and
+84 163 → 59 427 (one-board). Whatever it is, it is not the register budget, and that
+correction matters because the register argument is the one this project has been
+using to explain it.
+
+**90k was not reached.** The encoder path is at ~88k against the 90k the phase
+decomposition set, and the MCTS is at 76.5k. The remaining measured item is the
+**ff1 → ff2 handoff at 11.3 %**, which is a data-movement fix and not a precision one.
+
+There is **no `--two-boards` flag**, deliberately: a switch whose two settings produce
+identical numbers is not a decision, and offering it invites a run configured the slow
+way for nothing. `--int8` selects the whole configuration; `two_boards=False` stays
+reachable in `FusedEncoder` only so the test can prove the two agree.
+
 ## What is not established
 
 - **No flip-risk number anywhere in this week's work has been converted to Elo.** Not

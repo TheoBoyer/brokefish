@@ -75,6 +75,9 @@ class PackedWeights:
         """
         if fp8 and int8:
             raise ValueError("fp8 and int8 quantise the same two matmuls; pick one")
+        # `int8` alone selects the whole int8 configuration, two boards per CTA
+        # included: that part is bit-identical (`tests/test_quant.py` pins it at ten
+        # batch sizes) and only ever faster, so it is not a separate choice.
         kw = {"fp8": True} if fp8 else ({"int8": True} if int8 else {})
         if (fp8 or int8) and impl != "cuda":
             raise ValueError(

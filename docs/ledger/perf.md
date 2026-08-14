@@ -699,6 +699,46 @@ once cost 27 %. The prediction was therefore a small *regression*; it measured
 unpacking two packed halves — and the quantise is dearer, four `cvt.rni.sat` against
 two `cvt.rn.satfinite.e4m3x2`; which dominates has not been measured.
 
+### Two boards per CTA: bit-identical, and the largest gain is inside the MCTS
+
+Landed 2026-08-14. `--int8` now selects it automatically — the outputs are **bit
+identical** to one board at every batch size tested (1, 2, 3, 4, 31, 32, 33, 127, 128,
+257, 1024, and 1034 positions across five networks), so it is not a choice anybody
+should have to make. 198-204 registers, **no spill**, 100 352 B of shared memory.
+
+Full boards-to-logits path, 4096 boards, 6 interleaved order-balanced rounds:
+
+| arm | evals/s | vs fp16 |
+|---|---:|---:|
+| fp16 | 67 339 | 1.000× |
+| e4m3 | 82 496 | 1.225× |
+| int8, 1 board | 84 163 | 1.250× |
+| **int8, 2 boards** | **88 204** | **1.310×** |
+| fp16, 2 boards | 75 245 | 1.117× |
+
+**The real MCTS**, `bench_search --n 800 --batch 4096`:
+
+| arm | evals/s | vs fp16 |
+|---|---:|---:|
+| fp16 | 58 545 | 1.000× |
+| int8, 1 board | 64 876 | 1.108× |
+| **int8, 2 boards** | **76 462** | **1.306×** |
+
+⚠️ **The two-board gain is larger inside the MCTS than in the encoder bench** — 1.179×
+against 1.055×. Unexplained. The encoder bench feeds one full 4096 batch; the search
+does not, and halving per-board weight traffic should matter more the less arithmetic
+there is to hide it behind, but that is a hypothesis and nobody has profiled it.
+
+⚠️ And the occupancy axis alone (fp16, 2 boards) is worth **1.117×** where it is worth
+only **1.055×** on top of int8 — consistent, since int8 already halved the FFN's weight
+bytes and there is less traffic left to save.
+
+**Dead end, measured twice now.** A ping-pong prefetch of the next k-group's weights in
+`gemm_s8_row` — the one `fp8_gemm.cuh` records as taking the e4m3 encoder from 1.147×
+to 0.835× at 128 registers — is **still a large regression at 255 registers with no
+spill**: 88 204 → 72 704 evals/s two-board, 84 163 → 59 427 one-board. The register
+budget was not what made it lose. `#pragma unroll 2` on the same loop is inside noise.
+
 ### The register budget under int8 and two boards per CTA
 
 `nvcc -c -O3 -arch=sm_89 -Xptxas -v` on `csrc/encoder.cu`, reading the shipping

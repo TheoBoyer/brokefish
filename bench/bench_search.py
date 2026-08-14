@@ -161,6 +161,11 @@ def main() -> None:
                         help="comma-separated values of n to sweep instead of --n")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log", type=str, default="")
+    parser.add_argument("--int8", action="store_true",
+                        help="int8 FFN instead of e4m3: faster and 2.6x more accurate")
+    parser.add_argument("--one-board", action="store_true",
+                        help="one board per CTA. Only for the A/B -- int8 selects two "
+                             "boards on its own and the two are bit-identical")
     parser.add_argument("--fp8", action="store_true",
                         help="the e4m3 FFN of csrc/fp8_gemm.cuh, which is what "
                              "self-play ships with (train.loop --fp8)")
@@ -181,12 +186,20 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     net = BrokefishNet().cuda().half().eval()
-    model = encoder_impl("cuda")(net, **({"fp8": True} if args.fp8 else {}))
+    kw = {}
+    if args.fp8:
+        kw["fp8"] = True
+    if args.int8:
+        kw["int8"] = True
+    if args.one_board:
+        kw["two_boards"] = False
+    model = encoder_impl("cuda")(net, **kw)
     boards, control, n_live = build_batch(args.batch, args.plies, args.seed)
 
     free, total = torch.cuda.mem_get_info()
     log(f"brokefish Gate 1a: the whole of docs/mcts.md §6 on device")
-    log(f"  encoder: {'e4m3 FFN (fp8)' if args.fp8 else 'fp16'}")
+    log(f"  encoder: {'int8 FFN' if args.int8 else ('e4m3 FFN (fp8)' if args.fp8 else 'fp16')}"
+        f"{', 1 board/CTA' if args.one_board else ''}")
     log(f"  B = {args.batch} games at {args.plies} random plies "
         f"({n_live} distinct live positions), {args.rounds} interleaved rounds")
     log(f"  {torch.cuda.get_device_name(0)}, {(total - free) / 2**30:.2f} of "

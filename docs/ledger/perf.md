@@ -739,6 +739,44 @@ to 0.835× at 128 registers — is **still a large regression at 255 registers w
 spill**: 88 204 → 72 704 evals/s two-board, 84 163 → 59 427 one-board. The register
 budget was not what made it lose. `#pragma unroll 2` on the same loop is inside noise.
 
+### `cvt.pack` for the int8 convert, and the handoff restructure that did not work
+
+**Kept: `cvt.pack.sat.{s8,u8}.s32.b32`.** `cvt_int8x4` converted one value at a time
+and assembled the word with shifts and ors — ~10 instructions, against the e4m3 twin's
+3, which is why quantisation measured 10.3 % of this kernel and 6.8 % of the fp8 one.
+Two values per instruction takes it to 6. **Bit-identical** to the previous kernel over
+1039 positions including the adversarial set.
+
+| | encoder path | real MCTS |
+|---|---:|---:|
+| int8 + 2 boards, before | 88 204 (1.310×) | 76 462 |
+| **+ `cvt.pack`** | **89 265 (1.323×)** | **79 625** |
+
+Phase effect: `quant_a` **2.4 % → 1.9 %**.
+
+⚠️ **`srcB` lands in byte 0 and `srcA` in byte 1**, reversed from the operand order and
+stated nowhere in the instruction's name. Pinned by `tint8.cu` against a host
+converter, exactly as the e4m3 byte order is.
+
+**Reverted: quantising the FFN hidden from registers.** The plan was to delete
+`hid_store` (2.4 %) and most of `quant_h` (7.9 %) by exchanging eight partial row
+maxima per row (16 B) instead of the whole fp16 hidden (512 B), then converting
+straight out of the D fragments. It was **bit-identical and slower**:
+
+| | before | after |
+|---|---:|---:|
+| `hid_store` | 2.4 % | 1.8 % |
+| **`quant_h`** | **7.9 %** | **8.8 %** |
+| reference throughput, B = 512 | 92.6k | 90.6k |
+
+⚠️ **The cost was never the fp16 data movement — it is the fragment→row-major
+transpose, and shared memory is the cheap way to do it.** `quantise_row_int8` writes
+**16 contiguous bytes per lane**; the D-fragment layout gives a lane two bytes at a
+stride of eight, so the register-side version can only issue **32 scattered 2-byte
+stores** where the old path issued four 4-byte ones. Every estimate that treated the
+11.5 % as pure data movement was wrong for this reason, and the same reasoning would
+mispredict any other "keep it in registers" rewrite of a fragment-to-row-major step.
+
 ### The register budget under int8 and two boards per CTA
 
 `nvcc -c -O3 -arch=sm_89 -Xptxas -v` on `csrc/encoder.cu`, reading the shipping

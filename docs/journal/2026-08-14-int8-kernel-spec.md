@@ -298,6 +298,26 @@ identical numbers is not a decision, and offering it invites a run configured th
 way for nothing. `--int8` selects the whole configuration; `two_boards=False` stays
 reachable in `FusedEncoder` only so the test can prove the two agree.
 
+## Two more optimisations: one kept, one refuted
+
+Both were proposed from the phase budget of the shipping kernel and both were
+**bit-identical by construction**, so the only question either could answer was speed.
+
+**`cvt.pack` is kept**: 89 265 evals/s on the encoder path (1.323× fp16) and **79 625
+in the real MCTS**, from 88 204 / 76 462.
+
+**Quantising the hidden from registers is refuted**, and the reason generalises.
+`quant_h` went **7.9 % → 8.8 %** — the change that was supposed to delete most of it
+made it worse. ⚠️ I estimated it at 8-9 points by treating the 11.5 % handoff as data
+movement. It is not: it is a **fragment→row-major transpose**, and shared memory is the
+cheap way to perform one. `quantise_row_int8` writes 16 contiguous bytes per lane;
+the D-fragment layout gives a lane 2 bytes at a stride of 8, so the register-side
+version issues 32 scattered 2-byte stores against the old path's four 4-byte ones.
+
+That is now the second time this week an estimate built on "remove the memory traffic"
+has been wrong, after the ping-pong prefetch. Both times the register/traffic argument
+was the wrong model and the instruction-issue pattern was the real one.
+
 ## What is not established
 
 - **No flip-risk number anywhere in this week's work has been converted to Elo.** Not

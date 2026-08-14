@@ -160,7 +160,8 @@ def main() -> int:
                          "which fills the machine without making the counters a "
                          "contention benchmark")
     ap.add_argument("--reps", type=int, default=4)
-    ap.add_argument("--impl", default="both", choices=("fp8", "fp16", "both"))
+    ap.add_argument("--impl", default="both",
+                    choices=("fp8", "fp16", "int8", "both"))
     ap.add_argument("--checkpoint", default=None)
     a = ap.parse_args()
 
@@ -179,10 +180,11 @@ def main() -> int:
     print(f"net: {src}\nboards per launch: {a.boards}")
 
     boards, control, rep = _positions(a.boards)
-    arms = [("fp16", False), ("fp8", True)] if a.impl == "both" \
-        else [(a.impl, a.impl == "fp8")]
-    for label, fp8 in arms:
-        fused = FusedEncoder(copy.deepcopy(net), fp8=fp8)
+    KW = {"fp16": {}, "fp8": {"fp8": True}, "int8": {"int8": True}}
+    arms = [("fp16", KW["fp16"]), ("fp8", KW["fp8"])] if a.impl == "both" \
+        else [(a.impl, KW[a.impl])]
+    for label, kw in arms:
+        fused = FusedEncoder(copy.deepcopy(net), **kw)
         counts, t_off, t_on = profile(fused, ext, boards, control, rep, a.reps)
         report(label, counts, names, a.boards, t_off, t_on, a.boards / t_off)
     return 0

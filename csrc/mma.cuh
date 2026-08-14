@@ -176,21 +176,51 @@ __device__ __forceinline__ void mma_u8s8(int32_t (&d)[4], const uint32_t (&a)[4]
 // `cvt_e4m3x4`. `cvt.rni.sat` clamps rather than wrapping, which matters: a value a
 // hair past 127 from a rounding division would otherwise become -128 and change sign.
 // ⚠️ Unlike e4m3 there is no NaN to make here, because there is no NaN encoding.
+// ⚠️ Two values per instruction, via `cvt.pack`, and that matters more than it looks.
+// The e4m3 twin converts two at a time (`cvt.rn.satfinite.e4m3x2.f16x2`) and this one
+// used to convert **one**, then assemble the word by hand with shifts and ors --
+// ~10 instructions against e4m3's 3. That asymmetry is why quantisation measured
+// **10.3 %** of the int8 kernel against fp8's 6.8 %. This is 4 `cvt.rni` + 2 packs.
+//
+// ⚠️ **`srcB` lands in byte 0 and `srcA` in byte 1 -- reversed from the operand
+// order**, and nothing in the instruction's name says so. Measured on the card, and
+// `tint8.cu` pins it, exactly as `tfp8.cu` pins the e4m3 convert's byte order for the
+// same reason: a swapped pair still assembles, still produces bytes in range, and is
+// wrong by something that reads as quantisation error.
+//
+// ⚠️ `__float2int_rn` is unsaturated where `cvt.rni.sat.s8.f32` was; the saturation
+// now happens inside the pack, which is where 300 -> 255 and -200 -> -128 come from.
+// The inputs cannot be out of range by construction (`x * inv` is bounded by `q_max`
+// because `inv` is built from that row's own amax), so the only behaviour that changed
+// is on a NaN, which the fp32 scaling upstream already precludes.
 template <bool UNSIGNED>
 __device__ __forceinline__ uint32_t cvt_int8x4(float a, float b, float c, float d) {
-    uint32_t x, y, z, w;
+    const int ia = __float2int_rn(a), ib = __float2int_rn(b);
+    const int ic = __float2int_rn(c), id = __float2int_rn(d);
+    uint32_t lo, out;
     if constexpr (UNSIGNED) {
-        asm("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(x) : "f"(a));
-        asm("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(y) : "f"(b));
-        asm("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(z) : "f"(c));
-        asm("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(w) : "f"(d));
+        asm("cvt.pack.sat.u8.s32.b32 %0, %2, %1, 0;" : "=r"(lo) : "r"(ic), "r"(id));
+        asm("cvt.pack.sat.u8.s32.b32 %0, %2, %1, %3;"
+            : "=r"(out) : "r"(ia), "r"(ib), "r"(lo));
     } else {
-        asm("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(x) : "f"(a));
-        asm("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(y) : "f"(b));
-        asm("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(z) : "f"(c));
-        asm("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(w) : "f"(d));
+        asm("cvt.pack.sat.s8.s32.b32 %0, %2, %1, 0;" : "=r"(lo) : "r"(ic), "r"(id));
+        asm("cvt.pack.sat.s8.s32.b32 %0, %2, %1, %3;"
+            : "=r"(out) : "r"(ia), "r"(ib), "r"(lo));
     }
-    return (x & 0xffu) | ((y & 0xffu) << 8) | ((z & 0xffu) << 16) | ((w & 0xffu) << 24);
+    return out;
+}
+
+// Two scaled halves to two packed bytes -- the tail of the above, for the register-side
+// quantiser, which has a `__half2` in hand and wants a 16-bit store.
+template <bool UNSIGNED>
+__device__ __forceinline__ uint32_t cvt_int8x2(float a, float b) {
+    const int ia = __float2int_rn(a), ib = __float2int_rn(b);
+    uint32_t out;
+    if constexpr (UNSIGNED)
+        asm("cvt.pack.sat.u8.s32.b32 %0, %2, %1, 0;" : "=r"(out) : "r"(ia), "r"(ib));
+    else
+        asm("cvt.pack.sat.s8.s32.b32 %0, %2, %1, 0;" : "=r"(out) : "r"(ia), "r"(ib));
+    return out;
 }
 
 // ---------------------------------------------------------------------------

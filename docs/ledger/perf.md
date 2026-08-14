@@ -777,6 +777,31 @@ stores** where the old path issued four 4-byte ones. Every estimate that treated
 11.5 % as pure data movement was wrong for this reason, and the same reasoning would
 mispredict any other "keep it in registers" rewrite of a fragment-to-row-major step.
 
+### The quantiser: read the row once, and break the amax chain
+
+Two changes to `quantise_row_int8`, both **bit-identical** (verified by rebuilding the
+committed kernel and diffing logits over 1039 positions):
+
+* **The row is held in registers across both passes.** The e4m3 original reads every
+  element **twice** -- once for the amax, again for the convert -- because it had eight
+  spare registers against the 128 cap. At one CTA per SM there are ~50 spare and the
+  row is 16, so the second read simply goes away. It also collapses the aliasing
+  argument from three orderings to one: every read now precedes every write.
+* **Four `fmaxf` accumulators instead of one**, turning a 32-deep dependent chain into
+  four of eight. `wait` is the #2 stall in this kernel at 2.17 cycles per issue.
+
+| | quant_a | quant_h | quant group | B=512 ref | B=4096 |
+|---|---:|---:|---:|---:|---:|
+| before | 2.4 % | 7.9 % | 10.3 % | 92.7k | 89 265 (1.323×) |
+| **after** | **1.6 %** | **6.2 %** | **7.8 %** | **101.6k** | **89 499 (1.342×)** |
+
+⚠️ **Measured dead ends from the same session, both bit-identical and both slower.**
+Unrolling the quantiser's row loop (`ROWS` as a template parameter) measured **1.341×
+against 1.353×** — two rows in flight means two sets of sixteen held halves, and this
+loop already spends its registers holding one. And fusing `residual_rows` into the
+following `layernorm` to drop a `bufA` re-read was **+0.2 %, inside noise**, for a
+duplicated LayerNorm body — so the residual/LN pair is not load-bound.
+
 ### The register budget under int8 and two boards per CTA
 
 `nvcc -c -O3 -arch=sm_89 -Xptxas -v` on `csrc/encoder.cu`, reading the shipping

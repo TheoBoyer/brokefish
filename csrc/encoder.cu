@@ -987,10 +987,10 @@ __global__ __launch_bounds__(THREADS, TWOB ? 1 : 2) void encoder_kernel(
             float* as = reinterpret_cast<float*>(aq + fp8cfg::kScaleOff);
             const int r0 = warp * (TB / NWARPS);
             if constexpr (INT8)
-                int8q::quantise_row_int8<Dm, /*UNSIGNED=*/false>(
+                int8q::quantise_row_int8<Dm, /*UNSIGNED=*/false, TB / NWARPS>(
                     aq + (size_t)r0 * fp8cfg::kAPitch, fp8cfg::kAPitch,
                     as + (size_t)r0 * fp8cfg::kScaleStride, fp8cfg::kScaleStride,
-                    bufB + (size_t)r0 * AROW, AROW, TB / NWARPS, lane);
+                    bufB + (size_t)r0 * AROW, AROW, lane);
             else
                 fp8::quantise_row<Dm>(aq + (size_t)r0 * fp8cfg::kAPitch, fp8cfg::kAPitch,
                                       as + (size_t)r0 * fp8cfg::kScaleStride,
@@ -1057,10 +1057,10 @@ __global__ __launch_bounds__(THREADS, TWOB ? 1 : 2) void encoder_kernel(
                 float* hs = reinterpret_cast<float*>(hq + fp8cfg::kScaleOff);
                 const int r0 = warp * (TB / NWARPS);
                 if constexpr (INT8)
-                    int8q::quantise_row_int8<HCHUNK, /*UNSIGNED=*/true>(
+                    int8q::quantise_row_int8<HCHUNK, /*UNSIGNED=*/true, TB / NWARPS>(
                         hq + (size_t)r0 * fp8cfg::kAPitch, fp8cfg::kAPitch,
                         hs + (size_t)r0 * fp8cfg::kScaleStride, fp8cfg::kScaleStride,
-                        hid + (size_t)r0 * HROW, HROW, TB / NWARPS, lane);
+                        hid + (size_t)r0 * HROW, HROW, lane);
                 else
                     fp8::quantise_row<HCHUNK>(hq + (size_t)r0 * fp8cfg::kAPitch,
                                               fp8cfg::kAPitch,

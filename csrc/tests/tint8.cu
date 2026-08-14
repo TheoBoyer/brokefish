@@ -175,11 +175,11 @@ constexpr int QPITCH = QK * (int)sizeof(__half);          // the fp16 row pitch,
 __global__ void quant_kernel(__half* buf, float* scale, int unsigned_) {
     uint8_t* dst = reinterpret_cast<uint8_t*>(buf);
     if (unsigned_)
-        int8q::quantise_row_int8<QK, true>(dst, QPITCH, scale, 1, buf, QK, QM,
-                                           threadIdx.x & 31);
+        int8q::quantise_row_int8<QK, true, QM>(dst, QPITCH, scale, 1, buf, QK,
+                                               threadIdx.x & 31);
     else
-        int8q::quantise_row_int8<QK, false>(dst, QPITCH, scale, 1, buf, QK, QM,
-                                            threadIdx.x & 31);
+        int8q::quantise_row_int8<QK, false, QM>(dst, QPITCH, scale, 1, buf, QK,
+                                                threadIdx.x & 31);
 }
 
 int test_quantise(int unsigned_) {

@@ -87,11 +87,11 @@ static_assert(kQMaxU * kQMaxS * kRowK < 2147483647.0f,
 ///
 /// `UNSIGNED` is for the post-ReLU hidden: the amax is then a plain max, the scale is
 /// `amax/255`, and the operand carries 256 levels instead of 127.
-template <int WIDTH, bool UNSIGNED>
+template <int WIDTH, bool UNSIGNED, int ROWS>
 __device__ __forceinline__ void quantise_row_int8(uint8_t* dst, int dst_pitch,
                                                   float* scale, int scale_stride,
                                                   const half* src, int src_stride,
-                                                  int rows, int lane) {
+                                                  int lane) {
     static_assert(WIDTH % kTileK == 0, "the row must be whole 128-element tiles");
     constexpr int kTiles = WIDTH / kTileK;
     constexpr int kPerLane = kTileK / 8;      // sixteen columns per lane per tile
@@ -100,42 +100,59 @@ __device__ __forceinline__ void quantise_row_int8(uint8_t* dst, int dst_pitch,
     const int row_step = 32 / 8;              // four rows in flight per warp pass
     const int row0 = lane / 8;
 
-    for (int r = row0; r < rows; r += row_step) {
+    // ⚠️ **Rolled, deliberately.** `ROWS` is a template parameter only so the bound is
+    // known; unrolling it measured **1.341x against 1.353x** because two rows in flight
+    // means two sets of sixteen held halves, and this loop already spends its registers
+    // on holding one row across both passes.
+#pragma unroll 1
+    for (int r = row0; r < ROWS; r += row_step) {
         const half* s = src + (size_t)r * src_stride;
 
-        float m = 0.0f;                        // hazard 1: read-only pass
+        // ⚠️ **The whole of this lane's row, held in registers across both passes.**
+        // The e4m3 original reads every element **twice** -- once to find the amax and
+        // again to convert -- because it only had eight registers to spare against the
+        // 128-register cap. At one CTA per SM there are ~50 free, and `kTiles *
+        // kPerLane` halves is 16 of them, so the second read simply goes away.
+        //
+        // It also collapses the aliasing argument. The original needed three separate
+        // orderings because its reads and writes interleaved; here **every read
+        // happens before every write**, so hazards 2 and 3 cannot arise at all and
+        // only hazard 1 -- other lanes still reading while this one writes -- remains.
+        half v[kTiles][kPerLane];
+        // ⚠️ **Four accumulators, not one.** A single `m` makes the amax a 32-long
+        // dependent `fmaxf` chain, and `wait` -- fixed-latency dependency stalls -- is
+        // the second stall in this kernel's ncu profile at 2.17 cycles per issue.
+        // Four independent chains of eight cost three extra `fmaxf` at the end and are
+        // **bit-identical**, because max is associative and commutative and exact.
+        float m[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
-        for (int t = 0; t < kTiles; ++t) {
+        for (int t = 0; t < kTiles; ++t)
 #pragma unroll
-            for (int i = 0; i < kPerLane; i += 2) {
-                const __half2 v = *reinterpret_cast<const __half2*>(
-                    s + t * kTileK + col_group * kPerLane + i);
-                const float a = __half2float(__low2half(v));
-                const float b = __half2float(__high2half(v));
+            for (int i = 0; i < kPerLane; ++i)
+                v[t][i] = s[t * kTileK + col_group * kPerLane + i];
+#pragma unroll
+        for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+            for (int i = 0; i < kPerLane; ++i) {
                 // For UNSIGNED the input is post-ReLU, so a plain max is the amax and
-                // a negative can only be a denormal artefact -- fmaxf against 0 below
-                // handles it and the convert saturates at 0 regardless.
-                m = fmaxf(m, UNSIGNED ? a : fabsf(a));
-                m = fmaxf(m, UNSIGNED ? b : fabsf(b));
+                // a negative can only be a denormal artefact -- the convert saturates
+                // at 0 regardless.
+                const float a = __half2float(v[t][i]);
+                m[i & 3] = fmaxf(m[i & 3], UNSIGNED ? a : fabsf(a));
             }
-        }
+        float mm = fmaxf(fmaxf(m[0], m[1]), fmaxf(m[2], m[3]));
 #pragma unroll
         for (int off = 1; off < 8; off <<= 1)
-            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+            mm = fmaxf(mm, __shfl_xor_sync(0xffffffffu, mm, off));
 
-        const float sc = (m > 0.0f) ? m / kQMax : 1.0f;
+        const float sc = (mm > 0.0f) ? mm / kQMax : 1.0f;
         const float inv = 1.0f / sc;
         if (col_group == 0) scale[(size_t)r * scale_stride] = sc;
 
-        __syncwarp();                          // hazard 1
+        __syncwarp();                          // hazard 1, and now the only one
 
-#pragma unroll 1
-        for (int t = 0; t < kTiles; ++t) {     // hazard 3: ascending, no barrier
-            const half* st = s + t * kTileK + col_group * kPerLane;
-            half v[kPerLane];                  // hazard 2: the reads outlive the writes
 #pragma unroll
-            for (int i = 0; i < kPerLane; ++i) v[i] = st[i];
-
+        for (int t = 0; t < kTiles; ++t) {
             uint8_t* d = dst + (size_t)r * dst_pitch + t * kTileK + col_group * kPerLane;
 #pragma unroll
             for (int i = 0; i < kPerLane; i += 4) {
@@ -144,8 +161,8 @@ __device__ __forceinline__ void quantise_row_int8(uint8_t* dst, int dst_pitch,
                 // NaN. `cvt.rni.sat` cannot produce a NaN, but it can produce garbage
                 // from one, so the arithmetic upstream of it still has to be clean.
                 *reinterpret_cast<uint32_t*>(d + i) = cvt_int8x4<UNSIGNED>(
-                    __half2float(v[i]) * inv, __half2float(v[i + 1]) * inv,
-                    __half2float(v[i + 2]) * inv, __half2float(v[i + 3]) * inv);
+                    __half2float(v[t][i]) * inv, __half2float(v[t][i + 1]) * inv,
+                    __half2float(v[t][i + 2]) * inv, __half2float(v[t][i + 3]) * inv);
             }
         }
     }

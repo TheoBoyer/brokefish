@@ -94,18 +94,31 @@ static_assert(Lay<true>::BYTES <= 101376,
 // scales. docs/journal/2026-08-04-fp8-encoder.md measured 1.70x on the ff1 shape and
 // 0.66 % max prior-space error for FFN-only quantisation; the other two matmuls stay
 // fp16 because that is where three quarters of the error came from.
-struct Fp8Off {                                  // bytes, per layer
+// ⚠️ `QATT` changes the **stride**, not just what is appended, so the host packer and
+// the kernel must agree on it or layer 1's `w_ff1` lands on layer 0's tail -- bytes
+// that are all in range and produce plausible logits. `cuda_impl._pack_int8` is the
+// only writer and it takes the same flag.
+template <bool QATT>
+struct Fp8OffT {                                 // bytes, per layer
     static constexpr int w_ff1 = 0;              // [DFF][D], packed B-fragment order
     static constexpr int w_ff2 = w_ff1 + DFF * Dm;
-    static constexpr int stride = w_ff2 + Dm * DFF;
+    static constexpr int w_qkv = w_ff2 + Dm * DFF;   // [3D][D], QATT only
+    static constexpr int w_o = w_qkv + 3 * Dm * Dm;  // [D][D],  QATT only
+    static constexpr int stride = QATT ? w_o + Dm * Dm : w_qkv;
 };
-struct Fp8SOff {                                 // floats, per layer
+template <bool QATT>
+struct Fp8SOffT {                                // floats, per layer
     // One scale per 128 output columns, covering the **whole** reduction -- the fp16
     // accumulator runs the full 256-deep GEMM, so every k-group must share a scale.
     static constexpr int s_ff1 = 0;              // [DFF/128]
     static constexpr int s_ff2 = s_ff1 + DFF / 128;
-    static constexpr int stride = s_ff2 + Dm / 128;
+    static constexpr int s_qkv = s_ff2 + Dm / 128;
+    static constexpr int s_o = s_qkv + 3 * Dm / 128;
+    static constexpr int stride = QATT ? s_o + Dm / 128 : s_qkv;
 };
+using Fp8Off = Fp8OffT<false>;
+using Fp8SOff = Fp8SOffT<false>;
+
 
 // The quantised activations are written **over** the fp16 row that produced them, so
 // they cost no shared memory -- which they had to, because SMEM_HALVES is already at
@@ -124,6 +137,37 @@ static_assert(kAPitch % sizeof(float) == 0 && kScaleOff % sizeof(float) == 0,
               "the scales must land 4-byte aligned inside the row");
 static_assert(HCHUNK == Dm, "the ff2 activation chunk reuses ff1's row geometry");
 }  // namespace fp8cfg
+
+/// Quantise a `[ROWS_TOTAL][WIDTH]` half buffer to int8 **in place**, one scale a row.
+///
+/// The three int8 GEMM inputs -- the normed layer input, the attention output and the
+/// post-ReLU hidden chunk -- have identical `[rows][256]` geometry, so they share this
+/// one call site rather than three transcriptions of it. `AROW`'s row padding holds the
+/// scale; `quantise_row_int8` owns the in-place aliasing rules.
+///
+/// ⚠️ The caller supplies the `__syncthreads()` afterwards. Each warp quantises its own
+/// rows, and every GEMM below reads *all* rows.
+template <int WIDTH, bool UNSIGNED, int ROWS_TOTAL, int NW>
+__device__ __forceinline__ void quantise_buf_int8(half* buf, int warp, int lane) {
+    constexpr int ROWS = ROWS_TOTAL / NW;
+    static_assert(ROWS * NW == ROWS_TOTAL, "the rows must divide over the warps");
+    uint8_t* aq = reinterpret_cast<uint8_t*>(buf);
+    float* as = reinterpret_cast<float*>(aq + fp8cfg::kScaleOff);
+    const int r0 = warp * ROWS;
+    int8q::quantise_row_int8<WIDTH, UNSIGNED, ROWS>(
+        aq + (size_t)r0 * fp8cfg::kAPitch, fp8cfg::kAPitch,
+        as + (size_t)r0 * fp8cfg::kScaleStride, fp8cfg::kScaleStride,
+        buf + (size_t)r0 * AROW, AROW, lane);
+}
+
+/// The `(bytes, scales)` pair `gemm_s8_row` wants, from a buffer `quantise_buf_int8`
+/// has just written. Two casts that are easy to get subtly wrong and appear five times.
+__device__ __forceinline__ const uint8_t* qbytes(const half* buf) {
+    return reinterpret_cast<const uint8_t*>(buf);
+}
+__device__ __forceinline__ const float* qscales(const half* buf) {
+    return reinterpret_cast<const float*>(qbytes(buf) + fp8cfg::kScaleOff);
+}
 
 // Weight buffer offsets, in halves, within one layer's slab.
 struct Off {
@@ -734,10 +778,12 @@ namespace prof {
 enum Phase {
     kPrologue = 0,  // entry, embedding gather or activation load, first barrier
     kLn1,           // LayerNorm 1 and the cross-warp handoff barrier
+    kQuantQ,        // quantise_row over the normed input          (QATT only)
     kQkvGemm,       // three [32,256]x[256,256]
     kQkvBias,       // three add_bias over the fragments
     kAttention,     // V transpose, scores, softmax, AV -- warp-local, no barrier
     kAttnStore,     // store_frags(o) between two barriers
+    kQuantO,        // quantise_row over the attention output      (QATT only)
     kProjGemm,      // out_proj [32,256]x[256,256]
     kProjEpi,       // its bias and the staged store
     kRes1Ln2,       // residual add and LayerNorm 2
@@ -822,7 +868,23 @@ struct Timer {
 // threads instead of 512 -- 255 per thread against 128. That is what pays for the s32
 // accumulator int8 needs, and it is why the format change and the occupancy change are
 // one design. Step 0 measured the combination at 223 registers with **zero spill**.
-template <bool FP8, bool INT8, bool TWOB, bool PROF = false>
+// `QATT` extends `INT8` from the FFN's two matmuls to all four, adding packed QKV and
+// the attention output projection. Measured in emulation on three networks before a
+// line of it was written (`nn/quant.py --targets attn --format e4m3 int8`): e4m3 costs
+// 6.8e-2 max |dp| at that site against int8's 2.3e-2, so this is an integer path and
+// there is no fp8 variant of it. All four matmuls in int8 measure 2.8e-2 / 3.1 % flip,
+// **below** the e4m3 FFN-only path we trained `t24h-fp8` on (4.0e-2 / 4.8 %).
+// The two extra quantisations are free of new shared memory: the normed input and the
+// attention output have the same [TB][256] geometry the FFN's input already has, so
+// `fp8cfg`'s row layout is reused verbatim and both quantise in place.
+// ⚠️ `QOUT` is separate from `QATT` because the two matmuls are not the same trade.
+// QKV is **25 %** of the body's FLOPs and out_proj is **8.3 %**, while out_proj costs
+// its own quantisation pass of the attention output -- so the question "is out_proj
+// worth its precision" is a real one and is answered by measuring both, not by
+// assuming the FLOP share carries over. `QOUT` implies `QATT`: quantising the
+// projection while leaving QKV in fp16 is the strictly worse half of the trade.
+template <bool FP8, bool INT8, bool TWOB, bool PROF = false, bool QATT = false,
+          bool QOUT = QATT>
 __global__ __launch_bounds__(THREADS, TWOB ? 1 : 2) void encoder_kernel(
     half* __restrict__ y, const half* __restrict__ weights,
     const uint8_t* __restrict__ wq8, const float* __restrict__ sq8,
@@ -843,8 +905,15 @@ __global__ __launch_bounds__(THREADS, TWOB ? 1 : 2) void encoder_kernel(
     half* __restrict__ promo, float* __restrict__ value,
     int n_layers, float eps, int debug_stage, int n_boards) {
     static_assert(!(FP8 && INT8), "the FFN is quantised once, in one format");
+    static_assert(!QATT || INT8, "QKVO quantisation is int8 only; e4m3 was measured "
+                                 "3x worse at that site before it was built");
+    static_assert(!QOUT || QATT, "out_proj in int8 with QKV in fp16 is the worse half "
+                                 "of the trade: a third of the FLOPs for its own "
+                                 "quantisation pass");
     // Both quantised paths read the same byte slab and the same scale slab.
     constexpr bool Q8 = FP8 || INT8;
+    using QOff = Fp8OffT<QATT>;
+    using QSOff = Fp8SOffT<QATT>;
     using L = Lay<TWOB>;
     constexpr int BPC = L::BPC, TB = L::TB, MT = L::MT;
     extern __shared__ half smem[];
@@ -901,8 +970,8 @@ __global__ __launch_bounds__(THREADS, TWOB ? 1 : 2) void encoder_kernel(
 
     for (int layer = 0; layer < n_layers; ++layer) {
         const half* W = weights + (size_t)layer * Off::stride;
-        const uint8_t* Wq = Q8 ? wq8 + (size_t)layer * Fp8Off::stride : nullptr;
-        const float* Sq = Q8 ? sq8 + (size_t)layer * Fp8SOff::stride : nullptr;
+        const uint8_t* Wq = Q8 ? wq8 + (size_t)layer * QOff::stride : nullptr;
+        const float* Sq = Q8 ? sq8 + (size_t)layer * QSOff::stride : nullptr;
 
         // The affine slots hold ones and zeros: gamma lives in w_qkv's input axis and
         // beta in b_qkv, folded there by `FusedEncoder._fold_norm`.
@@ -925,9 +994,30 @@ __global__ __launch_bounds__(THREADS, TWOB ? 1 : 2) void encoder_kernel(
         // V 64..95, and warp w takes four consecutive n-tiles of each.
         const half* wq = W + Off::w_qkv;
         constexpr int NK = Dm / 32;                  // 8 k-groups of 32
-        gemm_direct<NK, NK>(q, bufB, AROW, wq, warp * 4,      0, lane);
-        gemm_direct<NK, NK>(k, bufB, AROW, wq, 32 + warp * 4, 0, lane);
-        gemm_direct<NK, NK>(v, bufB, AROW, wq, 64 + warp * 4, 0, lane);
+        if constexpr (QATT) {
+            // The normed input is signed and is read by nothing else, so it is
+            // quantised over the top of itself exactly as the FFN's input is. One
+            // scale for the whole 256-wide row serves all three of Q, K and V --
+            // they contract the same row, so there is one A operand, not three.
+            quantise_buf_int8<Dm, /*UNSIGNED=*/false, TB, NWARPS>(bufB, warp, lane);
+            __syncthreads();
+            tm.mark(prof::kQuantQ);
+            const uint2* wqi = reinterpret_cast<const uint2*>(Wq + QOff::w_qkv);
+            const float* sqi = Sq + QSOff::s_qkv;
+            int8q::gemm_s8_row<NK, NK, /*ADD=*/false, /*UNSIGNED_A=*/false>(
+                q, qbytes(bufB), fp8cfg::kAPitch, qscales(bufB),
+                fp8cfg::kScaleStride, wqi, sqi, warp * 4, 0, lane);
+            int8q::gemm_s8_row<NK, NK, false, false>(
+                k, qbytes(bufB), fp8cfg::kAPitch, qscales(bufB),
+                fp8cfg::kScaleStride, wqi, sqi, 32 + warp * 4, 0, lane);
+            int8q::gemm_s8_row<NK, NK, false, false>(
+                v, qbytes(bufB), fp8cfg::kAPitch, qscales(bufB),
+                fp8cfg::kScaleStride, wqi, sqi, 64 + warp * 4, 0, lane);
+        } else {
+            gemm_direct<NK, NK>(q, bufB, AROW, wq, warp * 4,      0, lane);
+            gemm_direct<NK, NK>(k, bufB, AROW, wq, 32 + warp * 4, 0, lane);
+            gemm_direct<NK, NK>(v, bufB, AROW, wq, 64 + warp * 4, 0, lane);
+        }
         tm.mark(prof::kQkvGemm);
         add_bias(q, W + Off::b_qkv, warp * DH, lane);
         add_bias(k, W + Off::b_qkv + Dm, warp * DH, lane);
@@ -958,7 +1048,21 @@ __global__ __launch_bounds__(THREADS, TWOB ? 1 : 2) void encoder_kernel(
 
         uint32_t proj[MT][4][2];
         zero_frags(proj);
-        gemm_direct<NK, NK>(proj, bufB, AROW, W + Off::w_o, warp * 4, 0, lane);
+        if constexpr (QOUT) {
+            // ⚠️ The attention output is signed, unlike the FFN's post-ReLU hidden.
+            // `dot(p, v)` is a convex combination of V rows and V is signed, so the
+            // unsigned path would clamp every negative channel to zero -- a wrong
+            // answer that stays finite and looks like a bad checkpoint.
+            quantise_buf_int8<Dm, /*UNSIGNED=*/false, TB, NWARPS>(bufB, warp, lane);
+            __syncthreads();
+            tm.mark(prof::kQuantO);
+            int8q::gemm_s8_row<NK, NK, /*ADD=*/false, /*UNSIGNED_A=*/false>(
+                proj, qbytes(bufB), fp8cfg::kAPitch, qscales(bufB),
+                fp8cfg::kScaleStride, reinterpret_cast<const uint2*>(Wq + QOff::w_o),
+                Sq + QSOff::s_o, warp * 4, 0, lane);
+        } else {
+            gemm_direct<NK, NK>(proj, bufB, AROW, W + Off::w_o, warp * 4, 0, lane);
+        }
         tm.mark(prof::kProjGemm);
         add_bias(proj, W + Off::b_o, warp * DH, lane);
         // scratch is dead here (it held the V transpose, and every warp passed
@@ -1161,7 +1265,8 @@ T* ptr_or_null(const torch::Tensor& t) {
 // spill the one every number in perf.md was measured on. `PROF=false` is the shipped
 // kernel; `csrc/tests/README.md` records the ptxas report that proves it.
 bool g_profile = false;
-template <bool FP8, bool INT8, bool TWOB, bool PROF>
+template <bool FP8, bool INT8, bool TWOB, bool PROF, bool QATT = false,
+          bool QOUT = QATT>
 void launch_one(int n_boards, size_t smem, half* y, const half* weights,
                 const uint8_t* wq8, const float* sq8, const int8_t* alive,
                 const uint16_t* boards, const int16_t* control, const uint8_t* rep,
@@ -1170,9 +1275,10 @@ void launch_one(int n_boards, size_t smem, half* y, const half* weights,
     constexpr bool Q8 = FP8 || INT8;
     constexpr int BPC = brokefish::Lay<TWOB>::BPC;
     const int grid = (n_boards + BPC - 1) / BPC;
-    cudaFuncSetAttribute(brokefish::encoder_kernel<FP8, INT8, TWOB, PROF>,
+    cudaFuncSetAttribute(brokefish::encoder_kernel<FP8, INT8, TWOB, PROF, QATT, QOUT>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-    brokefish::encoder_kernel<FP8, INT8, TWOB, PROF><<<grid, brokefish::THREADS, smem>>>(
+    brokefish::encoder_kernel<FP8, INT8, TWOB, PROF, QATT, QOUT>
+        <<<grid, brokefish::THREADS, smem>>>(
         y, weights, Q8 ? wq8 : nullptr, Q8 ? sq8 : nullptr, alive, boards, control,
         rep, emb, tail, policy, promo, value, n_layers, eps, debug_stage, n_boards);
 }
@@ -1200,7 +1306,23 @@ void launch(int n_boards, int quant, bool twob, half* y, const half* weights,
     launch_one<F, I, W, P>(n_boards, smem, y, weights, wq8, sq8, alive, boards,        \
                            control, rep, emb, tail, policy, promo, value, n_layers,    \
                            eps, debug_stage)
-    if (quant == 2 && twob) {
+#define BROKEFISH_LAUNCH_Q(F, I, W, P, O)                                              \
+    launch_one<F, I, W, P, true, O>(n_boards, smem, y, weights, wq8, sq8, alive,       \
+                                    boards, control, rep, emb, tail, policy, promo,    \
+                                    value, n_layers, eps, debug_stage)
+    // quant 3 is quant 2 plus both attention matmuls, quant 4 is quant 2 plus QKV
+    // alone. Both exist only at two boards per CTA, because that is the only occupancy
+    // int8's s32 accumulators fit at and a one-board arm is a configuration nobody
+    // would run. They share a slab: mode 4 carries `w_o`'s slot unused, 64 KB a layer,
+    // which is the price of one stride instead of two.
+    if (quant == 3 || quant == 4) {
+        TORCH_CHECK(twob, "quant ", quant, " is built for two boards per CTA");
+        const bool qout = quant == 3;
+        if (g_profile) { if (qout) BROKEFISH_LAUNCH_Q(false, true, true, true, true);
+                         else      BROKEFISH_LAUNCH_Q(false, true, true, true, false); }
+        else           { if (qout) BROKEFISH_LAUNCH_Q(false, true, true, false, true);
+                         else      BROKEFISH_LAUNCH_Q(false, true, true, false, false); }
+    } else if (quant == 2 && twob) {
         if (g_profile) BROKEFISH_LAUNCH(false, true, true, true);
         else           BROKEFISH_LAUNCH(false, true, true, false);
     } else if (quant == 2) {
@@ -1297,17 +1419,26 @@ void model_forward(torch::Tensor boards, torch::Tensor control, torch::Tensor re
                 "sq8 must be empty or contiguous float32 on CUDA");
     TORCH_CHECK((wq8.numel() == 0) == (sq8.numel() == 0),
                 "pass both the fp8 weight slab and its scales, or neither");
+    TORCH_CHECK(quant >= 0 && quant <= 4,
+                "quant is 0 fp16, 1 e4m3, 2 int8 FFN, 3 int8 all four, 4 int8 FFN+QKV; "
+                "got ", quant);
+    // ⚠️ The stride is a function of the mode, and this check is the only thing that
+    // catches a mismatch: mode 3 reading a mode-2 slab would find layer 1's weights a
+    // third of a layer early, every byte in range, and produce plausible logits.
     if (wq8.numel()) {
-        TORCH_CHECK(wq8.numel() == n_layers * (int64_t)brokefish::Fp8Off::stride,
-                    "wq8 must be [n_layers * ", brokefish::Fp8Off::stride, "] bytes, got ",
-                    wq8.numel());
-        TORCH_CHECK(sq8.numel() == n_layers * (int64_t)brokefish::Fp8SOff::stride,
-                    "sq8 must be [n_layers * ", brokefish::Fp8SOff::stride, "] floats, got ",
-                    sq8.numel());
+        const int64_t wstride = quant >= 3 ? brokefish::Fp8OffT<true>::stride
+                                           : brokefish::Fp8Off::stride;
+        const int64_t sstride = quant >= 3 ? brokefish::Fp8SOffT<true>::stride
+                                           : brokefish::Fp8SOff::stride;
+        TORCH_CHECK(wq8.numel() == n_layers * wstride,
+                    "at quant ", quant, " wq8 must be [n_layers * ", wstride,
+                    "] bytes, got ", wq8.numel());
+        TORCH_CHECK(sq8.numel() == n_layers * sstride,
+                    "at quant ", quant, " sq8 must be [n_layers * ", sstride,
+                    "] floats, got ", sq8.numel());
     }
 
-    TORCH_CHECK(quant >= 0 && quant <= 2, "quant is 0 fp16, 1 e4m3, 2 int8; got ", quant);
-    TORCH_CHECK(!twob || quant == 0 || quant == 2,
+    TORCH_CHECK(!twob || quant != 1,
                 "two boards per CTA is built for int8 and fp16 only, got quant ", quant);
     launch((int)n, (int)quant, twob != 0, ptr_or_null<half>(y),
            ptr_or_null<const half>(weights),
@@ -1353,7 +1484,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("read_profile", &read_profile, "[2][kNumPhases] cycles: all warps, warp 0");
     m.def("profile_phases", []() {
         return std::vector<std::string>{
-            "prologue", "ln1", "qkv_gemm", "qkv_bias", "attention", "attn_store",
+            "prologue", "ln1", "quant_q", "qkv_gemm", "qkv_bias", "attention",
+            "attn_store", "quant_o",
             "proj_gemm", "proj_epi", "res1_ln2", "quant_a", "ff1_gemm", "ff1_epi",
             "hid_store", "quant_h", "ff2_gemm", "ff2_epi", "res2", "epilogue"};
     }, "phase names, in slot order");

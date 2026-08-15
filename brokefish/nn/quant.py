@@ -116,6 +116,11 @@ class QuantConfig:
     different reasons and the fixes are different.
     """
 
+    #: `"e4m3"` or `"int8"`. ⚠️ int8 ignores `q_max` and `tile_k`: its accumulator is
+    #: s32 and exact, so there is no range to trade away and no reason to descale more
+    #: often than once per `ROW_K`. Selecting it makes `weights`/`activations`/`acc16`
+    #: redundant as well -- the integer path quantises both operands or neither.
+    fmt: str = "e4m3"
     weights: bool = False
     activations: bool = False
     #: Round the accumulator to fp16 every `MMA_K` products, as the hardware does.
@@ -133,15 +138,19 @@ class QuantConfig:
 
     @property
     def any(self) -> bool:
-        return self.weights or self.activations or self.acc16
+        return self.fmt == "int8" or self.weights or self.activations or self.acc16
 
     def label(self) -> str:
+        if self.fmt == "int8":
+            return "int8"
         bits = [n for n, on in (("W", self.weights), ("A", self.activations),
                                 ("acc16", self.acc16)) if on]
         tail = f"@{self.q_max:g}/k{self.tile_k}" if self.any else ""
         return "+".join(bits or ["off"]) + tail
 
     def __post_init__(self) -> None:
+        if self.fmt not in ("e4m3", "int8"):
+            raise ValueError(f"fmt = {self.fmt!r}, expected 'e4m3' or 'int8'")
         if self.tile_k % MMA_K:
             raise ValueError(
                 f"tile_k = {self.tile_k} is not a multiple of the mma's k = {MMA_K}. "
@@ -393,6 +402,9 @@ def fp8_linear(x: torch.Tensor, w: torch.Tensor, bias: Optional[torch.Tensor],
 MATMULS = ("qkv", "out", "ffn1", "ffn2")
 FLOP_SHARE = {"qkv": 6 / 24, "out": 2 / 24, "ffn1": 8 / 24, "ffn2": 8 / 24}
 FFN = ("ffn1", "ffn2")
+#: The two *weight* matmuls of attention. ⚠️ Not `QK^T` and `AV`: those contract two
+#: activations, have no weight for `F.linear` to key on, and are 2 % of the FLOPs.
+ATTN = ("qkv", "out")
 
 
 def body_weights(net, which: Optional[Sequence[str]] = None) -> List[torch.Tensor]:
@@ -403,16 +415,28 @@ def body_weights(net, which: Optional[Sequence[str]] = None) -> List[torch.Tenso
     quantising them buys nothing and risks the parts of the network with the widest
     dynamic range.
     """
+    return list(body_weight_names(net, which).values())
+
+
+def body_weight_names(net, which: Optional[Sequence[str]] = None) -> dict:
+    """`{id(weight): matmul name}` for the selected matmuls of every encoder layer.
+
+    The name is load-bearing for int8 and not for e4m3: `ffn2`'s A operand is the
+    post-ReLU hidden, which is provably non-negative and therefore goes through the
+    **unsigned** path (`Q_MAX_U8`, one extra bit). Dispatching on the weight's identity
+    is the only handle `F.linear` gives us -- it sees a tensor, not a module.
+    """
     which = tuple(which) if which is not None else MATMULS
     unknown = [w for w in which if w not in MATMULS]
     if unknown:
         raise ValueError(f"unknown matmul {unknown}, expected some of {MATMULS}")
-    out = []
+    out = {}
     for layer in net.encoder.layers:
         by_name = {"qkv": layer.self_attn.in_proj_weight,
                    "out": layer.self_attn.out_proj.weight,
                    "ffn1": layer.linear1.weight, "ffn2": layer.linear2.weight}
-        out += [by_name[w] for w in which]
+        for w in which:
+            out[id(by_name[w])] = w
     return out
 
 
@@ -432,7 +456,7 @@ def fake_fp8(net, cfg: QuantConfig, expect_calls: Optional[int] = None,
     Yields the call-count list so a caller can assert on it; `expect_calls` asserts on
     exit, which is the cheaper habit.
     """
-    targets = {id(w) for w in body_weights(net, which)}
+    targets = body_weight_names(net, which)
     if not targets:
         raise ValueError("no encoder-body weights found; is this a BrokefishNet?")
     calls: list = [0]
@@ -440,9 +464,12 @@ def fake_fp8(net, cfg: QuantConfig, expect_calls: Optional[int] = None,
     was_enabled = torch.backends.mha.get_fastpath_enabled()
 
     def patched(inp, weight, bias=None):
-        if id(weight) not in targets:
+        name = targets.get(id(weight))
+        if name is None:
             return original(inp, weight, bias)
         calls[0] += 1
+        if cfg.fmt == "int8":
+            return int8_linear(inp, weight, bias, unsigned=(name == "ffn2"))
         return fp8_linear(inp, weight, bias, cfg)
 
     torch.backends.mha.set_fastpath_enabled(False)
@@ -494,7 +521,9 @@ def main() -> int:
     p.add_argument("--q-max", type=float, nargs="*", default=[16.0])
     p.add_argument("--tile-k", type=int, nargs="*", default=[128, 64, 32])
     p.add_argument("--targets", nargs="*", default=["ffn", "all"],
-                   help="'ffn', 'all', or an explicit matmul name")
+                   help="'ffn', 'attn', 'all', or an explicit matmul name")
+    p.add_argument("--format", nargs="*", default=["e4m3"], choices=["e4m3", "int8"],
+                   help="which numeric format the selected matmuls run in")
     a = p.parse_args()
 
     parts = []
@@ -512,7 +541,7 @@ def main() -> int:
     net32 = copy.deepcopy(net16).float()
 
     def resolve(name):
-        return {"ffn": FFN, "all": MATMULS}.get(name, (name,))
+        return {"ffn": FFN, "attn": ATTN, "all": MATMULS}.get(name, (name,))
 
     # `off` runs the whole tiled path with nothing quantised: the self-check that every
     # number under it is a cost of e4m3 and not a bug in the tiling.
@@ -520,11 +549,17 @@ def main() -> int:
     for tgt in a.targets:
         which = resolve(tgt)
         share = sum(FLOP_SHARE[m] for m in which)
-        for q in a.q_max:
-            for k in a.tile_k:
-                cfg = QuantConfig(weights=True, activations=True, acc16=True,
-                                  q_max=q, tile_k=k, block_n=min(128, k * 4))
-                ladder.append((f"{tgt}/k{k}@{q:g}", cfg, which))
+        for fmt in a.format:
+            if fmt == "int8":
+                # No sweep: the s32 accumulator is exact, so `q_max` has nothing to
+                # trade and `tile_k` is pinned at `ROW_K` by `gemm_s8_row`.
+                ladder.append((f"{tgt}/int8", QuantConfig(fmt="int8"), which))
+                continue
+            for q in a.q_max:
+                for k in a.tile_k:
+                    cfg = QuantConfig(weights=True, activations=True, acc16=True,
+                                      q_max=q, tile_k=k, block_n=min(128, k * 4))
+                    ladder.append((f"{tgt}/k{k}@{q:g}", cfg, which))
         print(f"  {tgt:>4}: {len(which)} matmuls, {100 * share:.1f} % of body FLOPs, "
               f"ideal speedup {1 / (1 - share + share / 1.83):.2f}x at 1.83x arithmetic")
 

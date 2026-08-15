@@ -578,15 +578,17 @@ def main() -> int:
         import copy as _copy
 
         from brokefish.nn.cuda_impl import FusedEncoder
-        bad_q = [q for q in quant if q not in ("fp8", "int8")]
+        # `int8a` is int8 on all four matmuls, not just the FFN's two.
+        kwargs = {"fp8": {"fp8": True}, "int8": {"int8": True}}
+        bad_q = [q for q in quant if q not in kwargs]
         if bad_q:
-            print(f"unknown quant mode {bad_q}, expected fp8 and/or int8")
+            print(f"unknown quant mode {bad_q}, expected some of {sorted(kwargs)}")
             return 1
         net, _src = load_net(a.checkpoint, device)
         # ⚠️ Built from the same module the oracle is, per `validate`'s own contract:
         # letting it construct a second random net would compare two unrelated
         # networks and report a delta that is the gap between them.
-        forwards = {q: FusedEncoder(_copy.deepcopy(net), **{q: True}).forward_full
+        forwards = {q: FusedEncoder(_copy.deepcopy(net), **kwargs[q]).forward_full
                     for q in quant}
         impls = impls + quant
 

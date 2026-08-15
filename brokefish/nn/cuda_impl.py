@@ -90,6 +90,32 @@ def _fold_norm(w: torch.Tensor, b: torch.Tensor, norm):
     return w * g[None, :], b + w @ e
 
 
+#: Which matmuls `--int8` quantises, by kernel mode. Ordered by how much of the
+#: encoder they cover; the number is `csrc/encoder.cu`'s `quant` argument.
+SCHEMES = {"ffn": 2, "ffn+qkv": 4, "all": 3}
+
+#: **What `--int8` means.** One name, decided once, measured before it was chosen --
+#: there is deliberately no way to spell a scheme in any CLI, because a switch whose
+#: settings differ by 2.8 % of the clock and a decimal place of rounding error is not
+#: a decision to hand to whoever is launching a run.
+#:
+#: `"all"` is the FFN's two matmuls plus packed QKV plus out_proj, measured
+#: 2026-08-16 over 8 checkpoints x 775 positions:
+#:
+#:     scheme     worst max|dp|   encoder    real MCTS
+#:     ffn          1.20e-2       1.379x     78 890/s
+#:     ffn+qkv      2.14e-2       1.525x     ~90 100/s
+#:     all          2.38e-2       1.567x     92 639/s
+#:
+#: ⚠️ The worst column **excludes `t24h-muon-008215`**, on Theo's call 2026-08-16: it
+#: is the endpoint of the un-decayed muon run whose weight norm reached 3.8x every
+#: other network's, and it is the worst checkpoint for every format including e4m3
+#: (7.72e-2). Including it the three numbers are 1.84e-2 / 3.02e-2 / 5.08e-2, and the
+#: choice between the last two would go the other way. That exclusion is the whole
+#: argument, so it is recorded here and not only in the journal.
+SCHEME = "all"
+
+
 class FusedEncoder:
     """Inference-only fused forward, in CUDA C++. See the Triton twin for the
     contract; the differences are internal."""
@@ -107,7 +133,8 @@ class FusedEncoder:
                   "emb_clock", "emb_rep")
 
     def __init__(self, source, acc_dtype: str = "fp16", fp8: bool = False,
-                 int8: bool = False, two_boards: bool | None = None):
+                 int8: bool = False, two_boards: bool | None = None,
+                 int8_scheme: str = SCHEME):
         net = source if isinstance(source, BrokefishNet) else None
         encoder = net.encoder if net is not None else source
         layers = encoder.layers
@@ -140,7 +167,7 @@ class FusedEncoder:
             )
 
         scale = self.d_head ** -0.5
-        packed, ff1_folded = [], []
+        packed, ff1_folded, qkv_folded = [], [], []
         for lay in layers:
             w_qkv = lay.self_attn.in_proj_weight.detach().float().clone()
             b_qkv = lay.self_attn.in_proj_bias.detach().float().clone()
@@ -151,6 +178,11 @@ class FusedEncoder:
             w_qkv, b_qkv = _fold_norm(w_qkv, b_qkv, lay.norm1)
             w_ff1, b_ff1 = _fold_norm(w_ff1, b_ff1, lay.norm2)
             ff1_folded.append(w_ff1)
+            # ⚠️ Post-`1/sqrt(d_head)` **and** post-fold, i.e. exactly the matrix the
+            # kernel's fp16 path multiplies by. Both rescalings move a 128-output
+            # block's amax, so quantising `in_proj_weight` itself would be a different
+            # network rather than a different rounding.
+            qkv_folded.append(w_qkv)
             # ⚠️ Ones and zeros, not the real affine. The kernel's `layernorm<false>`
             # does not read these, and writing the true values back would leave a slab
             # that is wrong for anything that does. Writing the identity means a path
@@ -189,7 +221,15 @@ class FusedEncoder:
         self.int8 = bool(int8)
         if self.fp8 and self.int8:
             raise ValueError("fp8 and int8 quantise the same two matmuls; pick one")
-        self.quant = 2 if self.int8 else (1 if self.fp8 else 0)
+        # ⚠️ **`int8_scheme` is not a decision anybody should be making.** `--int8`
+        # selects `SCHEME` and that is the whole interface; this argument exists so a
+        # bench or a test can hold two schemes side by side in one process, which is
+        # the only way an interleaved A/B on this card is valid. See `SCHEME`.
+        if int8_scheme not in SCHEMES:
+            raise ValueError(f"int8_scheme must be one of {sorted(SCHEMES)}, "
+                             f"got {int8_scheme!r}")
+        self.int8_scheme = int8_scheme
+        self.quant = SCHEMES[int8_scheme] if self.int8 else (1 if self.fp8 else 0)
         # ⚠️ Two boards per CTA is an *occupancy* change, not a numerics one: the
         # logits come out **bit-identical**, because a board's arithmetic cannot depend
         # on who it shares a CTA with. What it buys is half the L2->SM weight traffic
@@ -203,12 +243,15 @@ class FusedEncoder:
         self.two_boards = bool(self.int8) if two_boards is None else bool(two_boards)
         if self.two_boards and self.fp8:
             raise ValueError("two_boards is built for int8 and fp16; int8 dominates fp8")
+        if self.quant >= 3 and not self.two_boards:
+            raise ValueError(f"the {self.int8_scheme!r} scheme is instantiated at two "
+                             f"boards per CTA only")
         self._wq8 = torch.empty(0, dtype=torch.uint8, device="cuda")
         self._sq8 = torch.empty(0, dtype=torch.float, device="cuda")
         if self.fp8:
             self._pack_fp8(layers, ff1_folded)
         elif self.int8:
-            self._pack_int8(layers, ff1_folded)
+            self._pack_int8(layers, ff1_folded, qkv_folded)
 
         self._empty = torch.empty(0, dtype=torch.int8, device="cuda")
         self._empty_h = torch.empty(0, dtype=torch.half, device="cuda")
@@ -220,6 +263,17 @@ class FusedEncoder:
         self.net = net
         if net is not None:
             self._pack_tail(net)
+
+    @property
+    def label(self) -> str:
+        """What this instance actually runs, for a bench header or a run log.
+
+        Derived from `quant`, not from the constructor arguments, so a default that
+        moves (`two_boards`, `SCHEME`) cannot leave a log describing the old one.
+        """
+        base = {0: "fp16", 1: "e4m3 FFN", 2: "int8 FFN", 3: "int8 FFN+QKV+out_proj",
+                4: "int8 FFN+QKV"}[self.quant]
+        return base + (", 2 boards/CTA" if self.two_boards else ", 1 board/CTA")
 
     def _pack_fp8(self, layers, ff1_folded) -> None:
         """The FFN weights in e4m3, in `Fp8Off`/`Fp8SOff` order.
@@ -257,8 +311,8 @@ class FusedEncoder:
         self._wq8 = torch.cat(blobs).contiguous().cuda()
         self._sq8 = torch.cat(scales).float().contiguous().cuda()
 
-    def _pack_int8(self, layers, ff1_folded) -> None:
-        """The FFN weights in int8, in the same `Fp8Off`/`Fp8SOff` order.
+    def _pack_int8(self, layers, ff1_folded, qkv_folded) -> None:
+        """The quantised weights in int8, in `Fp8OffT<QATT>`/`Fp8SOffT<QATT>` order.
 
         ⚠️ **`pack_b_fp8` is reused verbatim and that is correct, not lazy.** The
         m16n8k32 B-fragment map is a property of the element *width*: eight bytes per
@@ -274,8 +328,14 @@ class FusedEncoder:
         from brokefish.nn.quant import pack_b_fp8, quantise_weights_int8_bytes
 
         blobs, scales = [], []
-        for lay, w_ff1 in zip(layers, ff1_folded):
-            for w in (w_ff1, lay.linear2.weight.detach()):
+        for lay, w_ff1, w_qkv in zip(layers, ff1_folded, qkv_folded):
+            # ⚠️ Order is `Fp8OffT`'s and a permutation is silent -- every byte stays in
+            # range. The two attention matrices are appended *after* the FFN's so that
+            # `w_ff1`/`w_ff2` keep their offsets and only the stride moves.
+            mats = [w_ff1, lay.linear2.weight.detach()]
+            if self.quant >= 3:
+                mats += [w_qkv, lay.self_attn.out_proj.weight.detach()]
+            for w in mats:
                 # No `q_max` argument, and none exists: int8 has no accumulator squeeze
                 # to co-ordinate across two languages. `Q_MAX`'s cross-language pin was
                 # a day's debugging; this path cannot have that bug.

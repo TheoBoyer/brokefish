@@ -357,7 +357,7 @@ def sai_pairings(n: int, offsets: Sequence[int] = SAI_OFFSETS,
 # --------------------------------------------------------------------------- #
 
 def load_engine(path: str, impl: Optional[str] = "cuda",
-                device: str = "cuda") -> Callable:
+                device: str = "cuda", quant: Optional[str] = None) -> Callable:
     """An evaluator for one checkpoint: ``(boards, control, rep) -> logits``.
 
     ⚠️ The master network is built and loaded on the **CPU** and only the packed
@@ -365,6 +365,18 @@ def load_engine(path: str, impl: Optional[str] = "cuda",
     fp32 masters is a gigabyte of an eight-gigabyte card that is also driving the
     display. `FusedEncoder` does its own `.half()` on what it packs, so an fp32 CPU
     module is a perfectly good source.
+
+    ``quant`` is ``"int8"`` or ``"fp8"`` -- the same two names the training CLI
+    uses, and ``"int8"`` means whatever `cuda_impl.SCHEME` currently is.
+
+    ⚠️ **It defaults to ``None`` -- fp16 -- and that default is load-bearing, not
+    laziness.** Every rating this project has ever produced, including the frozen
+    anchor that pins the scale at Elo 0, was measured with every player in fp16.
+    Precision is a property of the *player*, exactly as the search budget is
+    (`evaluation.md` §5.1a), so flipping this default silently rebases every scale
+    and makes new numbers incomparable to the whole ledger. Turning it on is a
+    decision to re-rate, and the cost of doing so is the fp16-vs-quantised head to
+    head, which is a measurement and not an assumption.
     """
     from brokefish.nn.model import BrokefishNet
 
@@ -378,7 +390,13 @@ def load_engine(path: str, impl: Optional[str] = "cuda",
         return lambda b, c, r: net(b, c, r)
     from brokefish.nn import encoder_impl
 
-    return encoder_impl(impl)(net).forward_full
+    kw = {"fp8": {"fp8": True}, "int8": {"int8": True}}.get(quant or "", {})
+    if quant and not kw:
+        raise ValueError(f"unknown quant {quant!r}, expected fp8 or int8")
+    if kw and impl != "cuda":
+        raise ValueError(f"quant={quant!r} is a property of the CUDA kernel, "
+                         f"but impl={impl!r}")
+    return encoder_impl(impl)(net, **kw).forward_full
 
 
 # --------------------------------------------------------------------------- #
@@ -514,6 +532,7 @@ def run_league(pool: Sequence[PoolEntry], games: int = 36, n_sims: int = 64,
                offsets: Sequence[int] = SAI_OFFSETS, anchor_every: int = 4,
                anchor_span: Optional[int] = None,
                impl: Optional[str] = "cuda", search_impl: str = "cuda",
+               quant: Optional[str] = None,
                device: str = "cuda", seed: int = 0, prior: float = 1.0,
                cost=None,
                log: Optional[Callable[[str], None]] = None,
@@ -567,7 +586,8 @@ def run_league(pool: Sequence[PoolEntry], games: int = 36, n_sims: int = 64,
         f"+-{elo_half_width(games, 0.5):.0f} at d = 0.5 (arithmetic, evaluation.md §9)")
     log("")
 
-    loader = engine_loader or (lambda path: load_engine(path, impl=impl, device=device))
+    loader = engine_loader or (
+        lambda path: load_engine(path, impl=impl, device=device, quant=quant))
     engines: Dict[object, Callable] = {}
 
     def _refuse(*_a, **_k):
@@ -630,6 +650,10 @@ def run_league(pool: Sequence[PoolEntry], games: int = 36, n_sims: int = 64,
                    "budget_edges": len(ladder_pairs), "endpoint_edges": len(end_pairs),
                    "pairing_equivalents": units,
                    "impl": impl, "search_impl": search_impl, "seed": seed,
+                   # ⚠️ Recorded in the report because it is part of the scale. A
+                   # league fitted at one precision cannot be joined to one fitted at
+                   # another, and without this field nothing downstream could tell.
+                   "quant": quant,
                    "prior": prior, "pairings": len(pairs),
                    "games_played": sum(e.games for e in edges),
                    "seconds": seconds},
@@ -758,6 +782,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="runs/<run>/<run>.jsonl by default; the euro axis is joined "
                         "from it")
     p.add_argument("--impl", default="cuda", help="the fused encoder; 'none' for the torch module")
+    p.add_argument("--quant", default=None, choices=("fp8", "int8"),
+                   help="rate the players on a quantised kernel. ⚠️ This is part of "
+                        "the Elo scale: a league run with it cannot be joined to the "
+                        "existing ones, which are all fp16. Default off for that "
+                        "reason, not because it is slow")
     p.add_argument("--search-impl", default="cuda", choices=("cuda", "torch"))
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=0)
@@ -805,7 +834,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         pool, games=args.games, n_sims=args.sims, opening_plies=args.opening_plies,
         max_plies=args.max_plies, anchor_every=args.anchor_every,
         anchor_span=args.anchor_span,
-        impl=None if args.impl == "none" else args.impl,
+        impl=None if args.impl == "none" else args.impl, quant=args.quant,
         search_impl=args.search_impl, device=args.device, seed=args.seed,
         prior=args.prior, cost=cost or None, log=log)
 

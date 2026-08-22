@@ -378,12 +378,19 @@ def load_engine(path: str, impl: Optional[str] = "cuda",
     decision to re-rate, and the cost of doing so is the fp16-vs-quantised head to
     head, which is a measurement and not an assumption.
     """
-    from brokefish.nn.model import BrokefishNet
+    from brokefish.nn.model import net_for_state
 
     from .layer0 import load_net_state
 
-    net = BrokefishNet()
-    net.load_state_dict(load_net_state(path, device="cpu"))
+    # ⚠️ **Sized from the file, not from the constructor's defaults.** A checkpoint is
+    # a bare `state_dict` and carries no architecture, so the value head's width is
+    # read back off `value.weight`. That is what lets a scalar-head checkpoint from
+    # August and a win/draw/loss one sit in the *same* Bradley-Terry fit -- and the
+    # shared `checkpoints/anchor.pt`, which every Elo scale anchors to, is a
+    # scalar-head net that must keep loading forever.
+    state = load_net_state(path, device="cpu")
+    net = net_for_state(state)
+    net.load_state_dict(state)
     net.eval()
     if impl is None:
         net = net.to(device)
@@ -536,7 +543,8 @@ def run_league(pool: Sequence[PoolEntry], games: int = 36, n_sims: int = 64,
                device: str = "cuda", seed: int = 0, prior: float = 1.0,
                cost=None,
                log: Optional[Callable[[str], None]] = None,
-               engine_loader: Callable[[str], Callable] = None) -> dict:
+               engine_loader: Callable[[str], Callable] = None,
+               search_kw: Optional[dict] = None) -> dict:
     """Play the calendar, fit the ratings, return the whole record.
 
     `games` is the number of games **per pairing** and must be even: the unit of
@@ -621,7 +629,8 @@ def run_league(pool: Sequence[PoolEntry], games: int = 36, n_sims: int = 64,
         result = play_match(engine(a), engine(b), openings, opening_control,
                             n_sims=n_sims, max_plies=max_plies,
                             sims_a=a.sims, sims_b=b.sims,
-                            search_impl=search_impl, device=device, seed=seed)
+                            search_impl=search_impl, device=device, seed=seed,
+                            search_kw=search_kw)
         edges.append(Edge(a=a.name, b=b.name, a_wins=result.a_wins,
                           draws=result.draws, b_wins=result.b_wins))
         raw.append({"a": a.name, "b": b.name, **result.as_dict(),
@@ -650,6 +659,14 @@ def run_league(pool: Sequence[PoolEntry], games: int = 36, n_sims: int = 64,
                    "budget_edges": len(ladder_pairs), "endpoint_edges": len(end_pairs),
                    "pairing_equivalents": units,
                    "impl": impl, "search_impl": search_impl, "seed": seed,
+                   # ⚠️ **Part of the scale, like `quant`.** Until 2026-08-22 every
+                   # league rated under plain PUCT with no terminal collapse, because
+                   # `SearchConfig` defaults both off and `eval_config` never set
+                   # them -- while every run since `t12h-gumbel` was *trained* under
+                   # `--gumbel --gumbel-m 16 --terminal-collapse`. Ratings from a
+                   # Gumbel league and a PUCT league are **not** joinable, and without
+                   # this field nothing downstream could tell them apart.
+                   "search_kw": dict(search_kw or {}),
                    # ⚠️ Recorded in the report because it is part of the scale. A
                    # league fitted at one precision cannot be joined to one fitted at
                    # another, and without this field nothing downstream could tell.
@@ -790,12 +807,40 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--search-impl", default="cuda", choices=("cuda", "torch"))
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--gumbel", action="store_true",
+                   help="rate under Gumbel MuZero root selection instead of PUCT. "
+                        "⚠️ This is the protocol every run since t12h-gumbel was "
+                        "TRAINED under; the league has always rated under PUCT. "
+                        "gumbel_scale stays 0 (eval_config), so it is deterministic "
+                        "sequential halving over the top-m prior actions, ranked by "
+                        "completed Q. Not joinable with a PUCT league.")
+    p.add_argument("--gumbel-m", type=int, default=16,
+                   help="root actions considered under --gumbel. 16 is mctx's default "
+                        "and what training used")
+    p.add_argument("--terminal-collapse", action="store_true",
+                   help="§6.6a's collapse onto proved-winning edges, as training ran "
+                        "it. ⚠️ Also off in every league before 2026-08-22")
     p.add_argument("--prior", type=float, default=1.0,
                    help="drawn games against a phantom at Elo 0, per player")
     p.add_argument("--out", default=None,
                    help="runs/<run>/league-<run>.json. For several runs it lands in "
                         "the FIRST run's folder as league-joint-<a>+<b>.json")
     return p
+
+
+def _search_kw(args) -> dict:
+    """The non-default search settings, as a dict for `SearchConfig`.
+
+    Empty when neither flag is given, so a league run without them is byte-identical
+    to every league before 2026-08-22 and the old ratings stay valid.
+    """
+    kw = {}
+    if getattr(args, "gumbel", False):
+        kw["gumbel"] = True
+        kw["gumbel_m"] = int(args.gumbel_m)
+    if getattr(args, "terminal_collapse", False):
+        kw["terminal_collapse"] = True
+    return kw
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
@@ -836,6 +881,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         anchor_span=args.anchor_span,
         impl=None if args.impl == "none" else args.impl, quant=args.quant,
         search_impl=args.search_impl, device=args.device, seed=args.seed,
+        search_kw=_search_kw(args),
         prior=args.prior, cost=cost or None, log=log)
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)

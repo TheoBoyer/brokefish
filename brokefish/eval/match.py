@@ -242,7 +242,8 @@ def play_match(eval_a: Callable, eval_b: Callable,
                n_sims: int = 64, max_plies: int = 512,
                search_impl: str = "cuda", device: str | torch.device = "cuda",
                seed: int = 0, adjudicate: bool = True,
-               sims_a: Optional[int] = None, sims_b: Optional[int] = None) -> MatchResult:
+               sims_a: Optional[int] = None, sims_b: Optional[int] = None,
+               search_kw: Optional[dict] = None) -> MatchResult:
     """Play every opening twice, colours swapped, and score it for A.
 
     ``eval_a`` and ``eval_b`` are evaluators in the sense of
@@ -266,6 +267,22 @@ def play_match(eval_a: Callable, eval_b: Callable,
     ⚠️ **`no_grad` is not optional here.** `CLAUDE.md`: evaluation under autograd
     builds a graph across the run and takes the card out. It is on the function so
     a caller cannot forget it.
+
+    ⚠️ **``search_kw`` is how the protocol stops being PUCT.** `runner.eval_config`
+    builds a `SearchConfig` whose `gumbel` and `terminal_collapse` both default to
+    **off**, so until 2026-08-22 every league in this repository rated every network
+    under plain PUCT -- including networks *trained* under `--gumbel --gumbel-m 16
+    --terminal-collapse`, which is every run since `t12h-gumbel`. That is not a bug
+    (both arms of a pairing are rated identically, so the delta is fair) but it is a
+    protocol fact that was nowhere written down, and it matters most for exactly the
+    thing a value-head experiment is testing: Gumbel ranks its root candidates by
+    **completed Q**, so the value head chooses the move, while PUCT lets the prior
+    drive the exploration.
+
+    ⚠️ Pass `gumbel=True` **without** touching `gumbel_scale`: `eval_config` pins it
+    to 0, which is what keeps evaluation deterministic. Gumbel at scale 0 is
+    sequential halving over the top-m prior actions with no noise -- the diversity
+    still comes from the random openings alone, exactly as the header requires.
     """
     if openings.shape[0] != control.shape[0]:
         raise ValueError(f"openings {tuple(openings.shape)} and control "
@@ -280,7 +297,7 @@ def play_match(eval_a: Callable, eval_b: Callable,
         half = _play_half(eval_a, eval_b, a_is_white, openings, control,
                           n_sims=n_sims, max_plies=max_plies,
                           search_impl=search_impl, device=device, seed=seed,
-                          sims_a=sims_a, sims_b=sims_b)
+                          sims_a=sims_a, sims_b=sims_b, search_kw=search_kw)
         _accumulate(out, half, a_is_white, adjudicate=adjudicate)
     return out
 
@@ -319,7 +336,8 @@ def _play_half(eval_a: Callable, eval_b: Callable, a_is_white: bool,
                n_sims: int, max_plies: int, search_impl: str,
                device: str | torch.device, seed: int,
                sims_a: Optional[int] = None,
-               sims_b: Optional[int] = None) -> HalfResult:
+               sims_b: Optional[int] = None,
+               search_kw: Optional[dict] = None) -> HalfResult:
     """One colour assignment, `P` games in one batch, played to the end."""
     P = int(openings.shape[0])
     device = torch.device(device)
@@ -331,7 +349,7 @@ def _play_half(eval_a: Callable, eval_b: Callable, a_is_white: bool,
     # `n + 1` and the path arrays at `n`, and `self_play_move(sims=k)` may only go
     # down from it. `max(..., 1)` because a pool of zero nodes is not a thing even
     # when both players are random.
-    cfg = eval_config(max(sims_a, sims_b, 1), P)
+    cfg = eval_config(max(sims_a, sims_b, 1), P, **(search_kw or {}))
     # The evaluator is replaced before every move; the constructor argument only
     # has to be callable, and `_swap_evaluator` sets the right one before the
     # first search runs.

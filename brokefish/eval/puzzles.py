@@ -510,6 +510,147 @@ def score_puzzles_line(puzzles: PuzzleSet, net, impl: Optional[str] = None,
     return out
 
 
+# ⚠️ `no_grad` on the function, not on the caller. `CLAUDE.md`'s fourth trap: an
+# evaluation that forgets it builds an autograd graph over the fp32 master weights and
+# OOMs the card -- here after ~200 puzzles, inside the FFN, asking for 128 MiB while
+# holding 7.5 GiB. `score_puzzles_line` is safe only because `PuzzleProbe.run` happens to
+# be decorated; these two carry their own guarantee.
+@torch.no_grad()
+def value_pick(evaluate, boards: torch.Tensor, control: torch.Tensor,
+               chunk: int = 8192):
+    """``argmax_m -v(child(m))`` per position: the value head used as logits over moves.
+
+    Every legal move is played, every resulting position is evaluated, and the move
+    chosen is the one that leaves the **opponent** worst off. That is the value head
+    graded as a move-chooser, which is what a search at ``n >= 64`` actually uses it for.
+
+    ⚠️ **The value head answers, and nothing else does.** No terminal collapse, no
+    rules override, no search. An earlier version pinned terminal children to what the
+    rules say — mate ``-1``, draw ``0`` — on the argument that `search.md` §6.3 discards
+    those evaluations in play too. That is an argument about fidelity to the engine, and
+    this is not a measurement of the engine. Measured 2026-08-19 over 20 000 puzzles, the
+    pin was worth **+0.079 to +0.108 pass@1**, and it was worth *more the worse the head
+    was* — so it did not merely inflate the score, it compressed the differences between
+    checkpoints, which is the one thing a diagnostic must not do.
+
+    The engine is still used to enumerate the legal moves and to play them, because there
+    is no way to score a move without the position it leads to. It is not consulted about
+    the *value* of anything.
+    """
+    # ⚠️ **`cuda_impl`, not this module's `env`.** `puzzles.py` binds `env` to
+    # `torch_impl`, which is the *reference* engine: correct, and it materialises
+    # intermediates per board. One puzzle expands to ~28 children, so a batch of 200
+    # positions is 5 600 boards through movegen and the reference path OOMs an 8 GiB
+    # card on that. The fused engine is the one that scales here.
+    from ..env import cuda_impl as cenv
+    from .probe import enumerate_moves
+
+    game, label = enumerate_moves(boards, control)
+    kids_b, kids_c, _, _ = cenv.play(boards[game], control[game],
+                                     label & 0x7FF, promo=(label >> 11) & 0b11)
+
+    v = torch.empty(kids_b.shape[0], dtype=torch.float32, device=boards.device)
+    rep = torch.zeros(chunk, dtype=torch.uint8, device=boards.device)
+    for lo in range(0, kids_b.shape[0], chunk):
+        hi = min(lo + chunk, kids_b.shape[0])
+        v[lo:hi] = evaluate(kids_b[lo:hi], kids_c[lo:hi],
+                            rep[:hi - lo])[2].float().reshape(-1)
+    return _argmax_move(-v, label, game, boards.shape[0])
+
+
+def _argmax_move(score: torch.Tensor, label: torch.Tensor, game: torch.Tensor,
+                 n: int):
+    """Best-scoring move per position, ties broken by the lowest label.
+
+    ⚠️ ``index_copy``/indexed assignment with **duplicate indices** has no defined
+    ordering in torch, so "sort then let the last write win" is a race. Two
+    ``scatter_reduce`` passes instead -- the best score, then the lowest label achieving
+    it -- which is the lowest-index tie-break of `search.md` §6.4.
+    """
+    NONE = torch.iinfo(torch.int64).max
+    best_score = torch.full((n,), -1e9, device=score.device).scatter_reduce(
+        0, game, score, reduce="amax", include_self=True)
+    cand = torch.where(score >= best_score[game], label, torch.full_like(label, NONE))
+    best = torch.full((n,), NONE, dtype=torch.int64,
+                      device=score.device).scatter_reduce(
+        0, game, cand, reduce="amin", include_self=True)
+    return torch.where(best == NONE, torch.full_like(best, -1), best), best_score
+
+
+@torch.no_grad()
+def score_puzzles_value(puzzles: PuzzleSet, net, impl: Optional[str] = None,
+                        chunk: int = 8192, batch: int = 4096, bin_width: int = 200,
+                        device: str = "cuda") -> dict:
+    """The puzzle line scored through the **value** head, as a one-ply search.
+
+    `score_puzzles_line` grades one head and one head only — the policy, at
+    ``n_sims = 0``. This grades the other. Games at ``n >= 64`` are decided by the value
+    head (Gumbel proposes 16 candidates from the prior and then *ranks them by
+    completed-Q*), so a policy-only probe cannot see the thing that decides the game.
+
+    ⚠️ **This exists because its absence hid a regression for three runs.** Measured
+    2026-08-17: `t12h-muon9-int8` beat `t12h-gumbel` by +0.061 policy pass@1 and **lost to
+    it 62-45-93 at n = 128**; on this metric it scores 0.414 against 0.486, which is the
+    right way round. Neither run logged it, so nothing saw it until both had finished.
+
+    ⚠️ ``impl`` selects the fused encoder. The packed weights are built inside
+    `make_evaluator` on every call, so they cannot go stale the way `CLAUDE.md`'s third
+    trap describes — but a fused score is **not comparable** with an unfused one, because
+    the packing is fp16 (or int8) against fp32 master weights. Do not mix them in one
+    series without measuring the offset.
+
+    ⚠️ **Evaluation only** (`evaluation.md` §2).
+    """
+    from .suites import _evaluator
+
+    if not puzzles.has_lines:
+        raise ValueError("this PuzzleSet was built before line support; reload it")
+    evaluate = _evaluator(net, impl)
+    n, S = len(puzzles), puzzles.step_answer.shape[1]
+    lens = puzzles.step_len.to(device)
+    hit = torch.zeros((n, S), dtype=torch.bool, device=device)
+
+    for j in range(S):
+        rows = (lens > j).nonzero(as_tuple=True)[0]
+        if rows.numel() == 0:
+            break
+        for lo in range(0, rows.numel(), batch):
+            r = rows[lo:lo + batch]
+            best, _ = value_pick(evaluate, puzzles.step_boards[r, j].to(device),
+                                 puzzles.step_control[r, j].to(device), chunk=chunk)
+            hit[r, j] = best == puzzles.step_answer[r, j].to(device).to(torch.int64)
+
+    valid = torch.arange(S, device=device)[None, :] < lens[:, None]
+    solved = (hit | ~valid).all(-1)
+    n_turns = int(valid.sum())
+
+    bins = []
+    r_cpu, hit_cpu = puzzles.rating.cpu(), hit.cpu()
+    valid_cpu, solved_cpu = valid.cpu(), solved.cpu()
+    lo_edge = int(r_cpu.min()) // bin_width * bin_width
+    hi_edge = int(r_cpu.max()) // bin_width * bin_width + bin_width
+    for edge in range(lo_edge, hi_edge, bin_width):
+        sel = (r_cpu >= edge) & (r_cpu < edge + bin_width)
+        m = int(sel.sum())
+        if m == 0:
+            continue
+        t = int(valid_cpu[sel].sum())
+        sv = int(solved_cpu[sel].sum())
+        j = int((hit_cpu[sel] & valid_cpu[sel]).sum())
+        bins.append({"rating_lo": edge, "rating_hi": edge + bin_width, "n": m,
+                     "n_turns": t, "solved": sv, "solve_rate": sv / m,
+                     "ci95": list(_wilson(sv, m)),
+                     "value_pass@1": j / t if t else 0.0,
+                     "value_pass@1_ci95": list(_wilson(j, t))})
+
+    sv, j = int(solved.sum()), int((hit & valid).sum())
+    return {"n_puzzles": n, "n_turns": n_turns,
+            "value_pass@1": j / n_turns if n_turns else 0.0,
+            "value_pass@1_ci95": list(_wilson(j, n_turns)),
+            "solve_rate": sv / n if n else 0.0, "ci95": list(_wilson(sv, n)),
+            "bins": bins}
+
+
 def uniform_baseline(puzzles: PuzzleSet) -> float:
     """What a net that picks uniformly among the legal moves would score.
 
@@ -528,7 +669,7 @@ def main() -> None:
 
     import torch
 
-    from brokefish.nn.model import BrokefishNet
+    from brokefish.nn.model import BrokefishNet, net_for_state
 
     ap = argparse.ArgumentParser(description="the §8.2 solve-rate-versus-rating curve")
     ap.add_argument("checkpoint", nargs="?", help="a torch state_dict; random init if absent")
@@ -551,7 +692,9 @@ def main() -> None:
 
     net = BrokefishNet().to(args.device)
     if args.checkpoint:
-        net.load_state_dict(torch.load(args.checkpoint, map_location=args.device))
+        state = torch.load(args.checkpoint, map_location=args.device)
+        net = net_for_state(state).to(args.device)
+        net.load_state_dict(state)
     net.eval()
 
     puzzles = load_puzzles(path=args.puzzles, limit=args.limit,

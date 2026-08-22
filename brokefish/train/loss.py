@@ -59,6 +59,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import torch
+import torch.nn.functional as F
 
 # spec §3: a move is 11 bits and the promotion choice rides above it, so one
 # int16 carries a whole edge label. Same constants as the search, restated rather
@@ -104,7 +105,12 @@ class LossParts:
     value: torch.Tensor
     entropy: torch.Tensor      # H(pi), the target's own; CE's floor
     kl: torch.Tensor           # CE - H(pi), which goes to zero at a perfect fit
-    value_pred: torch.Tensor   # [N], for the calibration scalars
+    value_pred: torch.Tensor   # [N] in [-1, 1], for the calibration scalars
+    #: How many rows the value head that produced this has: 1 = scalar tanh + MSE,
+    #: 3 = win/draw/loss + cross-entropy. ⚠️ `value` is **not comparable across the
+    #: two** -- an MSE against z in {-1, 0, 1} starts near 1.0 and a 3-class CE starts
+    #: at ln 3 = 1.0986, and they are different quantities that happen to look alike.
+    n_value: int = 1
 
 
 def decode_labels(policy_move: torch.Tensor):
@@ -161,7 +167,21 @@ def az_loss(net, batch: TrainBatch, strict: bool = True,
             value_weight: float = 1.0) -> LossParts:
     """AZ eq. (1) without the L2 term, for one (micro-)batch.
 
-    ``value_weight`` scales the squared-error term against the policy
+    ⚠️ **The value term has two forms and the network picks which.** At
+    ``net.n_value == 1`` it is AZ's ``(z - v)^2`` on the scalar tanh head, unchanged
+    and bit-identical to every run on the ledger. At ``net.n_value == 3`` it is a
+    3-class cross-entropy on a win/draw/loss classifier, which is what KataGo and
+    Leela train, with the stored outcome ``z in {-1, 0, +1}`` as the class index
+    ``z + 1``. Nothing else in the loss moves, and nothing outside it moves at all:
+    the head still hands the search a scalar (`nn/model.py:wdl_to_scalar`).
+
+    ⚠️ **``value_weight`` does not mean the same thing on the two branches.** The MSE
+    on ``z in {-1, 0, 1}`` starts near 1.0 and falls to ~0.3; the CE starts at
+    ``ln 3 = 1.0986``. 1.0 is AlphaZero's number for the squared error and is *not*
+    a calibrated number for the cross-entropy -- it is the untuned default, and that
+    is a thing this run will be measuring rather than a thing it has settled.
+
+    ``value_weight`` scales the value term against the policy
     cross-entropy. **1.0 is AlphaZero's and this project's**, and is the default, so
     nothing measured before it moves.
 
@@ -183,7 +203,9 @@ def az_loss(net, batch: TrainBatch, strict: bool = True,
     ``_expand``'s — for that there is :func:`audit_labels` and, definitively, §12
     check 3's comparison against a live search.
     """
-    policy_logits, promo_logits, value_pred = net(batch.board, batch.control, batch.rep)
+    policy_logits, promo_logits, value_pred, value_logits = net(
+        batch.board, batch.control, batch.rep, with_logits=True)
+    n_value = value_logits.shape[-1]
 
     # The loss is computed outside autocast on purpose (§8.2): it is a reduction
     # over <= K_POLICY logits and one position, so bf16 saves nothing measurable and
@@ -213,11 +235,27 @@ def az_loss(net, batch: TrainBatch, strict: bool = True,
         policy_loss = -(pi * logp).sum(-1).mean()
         entropy = -(pi * pi.clamp(min=torch.finfo(torch.float32).tiny).log()).sum(-1).mean()
         v = value_pred.float()
-        value_loss = value_weight * ((batch.value - v) ** 2).mean()
+        if n_value == 1:
+            value_loss = value_weight * ((batch.value - v) ** 2).mean()
+        else:
+            # ⚠️ `batch.value` is exactly {-1, 0, +1} by construction -- `buffer.py:253`
+            # writes `-result * s_rec * s_end` and every factor is a sign -- so `+1` is
+            # an exact class index and not a rounding. `round()` is here so that a
+            # future bootstrapped target fails the check below rather than silently
+            # truncating toward a class it does not mean.
+            cls = (batch.value + 1.0).round()
+            if not bool(((cls - (batch.value + 1.0)).abs() < 1e-6).all()):
+                raise AssertionError(
+                    "a value target is not in {-1, 0, +1}, so it has no class index. "
+                    "The win/draw/loss head is trained on the game outcome (§4); a "
+                    "bootstrapped or averaged target needs a soft-label loss, not this "
+                    "one")
+            value_loss = value_weight * F.cross_entropy(
+                value_logits.float(), cls.long(), reduction="mean")
 
     return LossParts(total=policy_loss + value_loss, policy=policy_loss,
                      value=value_loss, entropy=entropy, kl=policy_loss - entropy,
-                     value_pred=v.detach())
+                     value_pred=v.detach(), n_value=n_value)
 
 
 def _check(batch: TrainBatch, valid: torch.Tensor, logit: torch.Tensor) -> None:

@@ -43,6 +43,57 @@ N_SQUARE, N_TYPE_SPECIAL, N_COLOR_TURN, N_CLOCK, N_REP = 64, 12, 4, 101, 3
 KING_SLOT_WHITE, KING_SLOT_BLACK = 15, 31
 N_POLICY, N_PROMO = 64, 4
 
+#: How many rows the value head has. ``1`` is the scalar ``tanh`` regression head of
+#: spec §7.4 and of every number on the ledger before 2026-08-21; ``3`` is the
+#: win/draw/loss classifier (KataGo's and Leela's shape).
+#:
+#: ⚠️ **The class order is normative and the CUDA epilogue depends on it**: row 0 is
+#: *loss*, row 1 is *draw*, row 2 is *win*, all from the side to move, so the class
+#: index of a stored outcome ``z in {-1, 0, +1}`` is ``z + 1``.
+N_VALUE_SCALAR, N_VALUE_WDL = 1, 3
+VALUE_CLASSES = (N_VALUE_SCALAR, N_VALUE_WDL)
+
+
+def wdl_to_scalar(logits: torch.Tensor) -> torch.Tensor:
+    """``[N, 3]`` logits to the ``[N]`` scalar in ``[-1, 1]`` every consumer expects.
+
+    ``p(win) - p(loss)``, which is the expected result under a 1/0.5/0 scoring with
+    the draw mass dropping out. It is what keeps this an *option* rather than a
+    rewrite: the search (`search.cuh:1076`), the terminal collapse, the value-head
+    puzzle probe and the Elo pipeline all consume a single fp32 in ``[-1, 1]`` and
+    none of them can tell which head produced it.
+
+    ⚠️ It also throws information away on purpose. A draw-aware search — KataGo's
+    utility with a separate draw term — is a **different** knob and would move the
+    search as well as the head; one variable at a time.
+    """
+    p = torch.softmax(logits, dim=-1)
+    return p[..., 2] - p[..., 0]
+
+
+def n_value_of(state: dict) -> int:
+    """How many value rows a ``state_dict`` was trained with.
+
+    ⚠️ **This is the whole of the retro-compatibility story.** Checkpoints are bare
+    ``state_dict``s with the architecture hardcoded in the constructor
+    (`eval/league.py:157`), so nothing in a file says which head it has except the
+    shape of ``value.weight`` — and every checkpoint on the ledger, `anchor.pt`
+    included, carries ``[1, 256]``. Reading the width back out is what lets an old
+    checkpoint and a new one sit in the same Bradley-Terry fit.
+    """
+    w = state.get("value.weight")
+    if w is None:
+        raise KeyError(
+            "no `value.weight` in this state_dict, so its value head cannot be sized. "
+            "Pass the network's weights, not a training checkpoint (see "
+            "`brokefish.eval.layer0.load_net_state`)")
+    return int(w.shape[0])
+
+
+def net_for_state(state: dict, **kw) -> "BrokefishNet":
+    """An empty net shaped to hold ``state``. Load into it; do not skip the load."""
+    return BrokefishNet(n_value=n_value_of(state), **kw)
+
 
 def decode_boards(boards: torch.Tensor):
     """Unpack the 12-bit piece word of spec 2.1.
@@ -70,9 +121,14 @@ class BrokefishNet(nn.Module):
     """
 
     def __init__(self, d_model: int = D_MODEL, n_layers: int = N_LAYERS,
-                 n_heads: int = N_HEADS, d_ff: int = D_FF, eps: float = 1e-5):
+                 n_heads: int = N_HEADS, d_ff: int = D_FF, eps: float = 1e-5,
+                 n_value: int = N_VALUE_SCALAR):
         super().__init__()
-        self.d_model, self.n_layers = d_model, n_layers
+        if n_value not in VALUE_CLASSES:
+            raise ValueError(f"n_value must be one of {VALUE_CLASSES} "
+                             f"(1 = the scalar tanh head, 3 = win/draw/loss), "
+                             f"got {n_value}")
+        self.d_model, self.n_layers, self.n_value = d_model, n_layers, n_value
 
         self.emb_square = nn.Embedding(N_SQUARE, d_model)
         self.emb_type_special = nn.Embedding(N_TYPE_SPECIAL, d_model)
@@ -93,7 +149,7 @@ class BrokefishNet(nn.Module):
 
         self.policy = nn.Linear(d_model, N_POLICY, bias=False)
         self.promo = nn.Linear(d_model, N_PROMO, bias=False)
-        self.value = nn.Linear(d_model, 1, bias=False)
+        self.value = nn.Linear(d_model, n_value, bias=False)
 
         # muP-ish: one scale, 1/sqrt(d), for every table and every readout. Real
         # muP treats embeddings and readouts differently and that is a training
@@ -139,7 +195,8 @@ class BrokefishNet(nn.Module):
 
     # -- stage 3 -----------------------------------------------------------
 
-    def heads(self, h: torch.Tensor, control: torch.Tensor):
+    def heads(self, h: torch.Tensor, control: torch.Tensor,
+              with_logits: bool = False):
         """``[N, 32, d]`` normed tokens to (policy_logits, promo, value).
 
         ``h`` must already be through ``norm_f``. ``policy_logits`` is raw --
@@ -148,6 +205,14 @@ class BrokefishNet(nn.Module):
         The value comes from the side-to-move king's token, slots 15 and 31,
         which spec 2.5 guarantees are never captured. That is a row select with
         no reduction, and it arrives from the mover's point of view for free.
+
+        ⚠️ **Two heads live behind that row select and only one is the default.**
+        ``n_value == 1`` is spec §7.4's scalar: one logit through ``tanh``, trained
+        against ``z`` with a squared error. ``n_value == 3`` is a win/draw/loss
+        classifier trained with a cross-entropy, collapsed here by
+        :func:`wdl_to_scalar`. Both return the *same* ``[N]`` fp32 in ``[-1, 1]``, so
+        the choice is invisible to the search, to the collapse and to the league --
+        it is visible only to the loss and to the packed head matrix.
         ``promo`` stays per-token because a position can have more than one pawn
         on the seventh rank, and the head is indexed by the *moving slot* of the
         move -- a promoted queen keeps its pawn slot, so a slot in 0-7 does not
@@ -155,18 +220,34 @@ class BrokefishNet(nn.Module):
         """
         king = torch.where(control < 0, KING_SLOT_BLACK, KING_SLOT_WHITE).long()
         hk = h[torch.arange(h.shape[0], device=h.device), king]
-        value = torch.tanh(self.value(hk).float()).squeeze(-1)
+        # ⚠️ The scalar branch is written so that `n_value == 1` is the *same*
+        # sequence of ops it always was -- one `.float()`, one `tanh`, one squeeze --
+        # because every Elo number on the ledger was produced by it and a reordering
+        # in fp16 is a different number (`docs/ledger/perf.md`).
+        raw = self.value(hk).float()
+        value = torch.tanh(raw).squeeze(-1) if self.n_value == 1 else wdl_to_scalar(raw)
+        if with_logits:
+            return self.policy(h), self.promo(h), value, raw
         return self.policy(h), self.promo(h), value
 
     # -- the whole thing ---------------------------------------------------
 
-    def forward(self, boards: torch.Tensor, control: torch.Tensor, rep: torch.Tensor):
+    def forward(self, boards: torch.Tensor, control: torch.Tensor, rep: torch.Tensor,
+                with_logits: bool = False):
+        """The 3-tuple ``(policy, promo, value)`` -- ``value`` is ``[N]`` fp32 in
+        ``[-1, 1]`` whatever the head is, which is why nothing downstream changed.
+
+        ``with_logits`` appends the raw ``[N, n_value]`` head output as a fourth
+        element. Only the loss wants it, and only because a classifier is trained on
+        logits while the search is fed a scalar.
+        """
         x, alive = self.embed(boards, control, rep)
         h = self.encoder(x, src_key_padding_mask=~alive)
-        return self.heads(self.norm_f(h), control)
+        return self.heads(self.norm_f(h), control, with_logits=with_logits)
 
 
-def full_forward_via_backbone(net: BrokefishNet, backbone, boards, control, rep):
+def full_forward_via_backbone(net: BrokefishNet, backbone, boards, control, rep,
+                              with_logits: bool = False):
     """The full model with only the encoder stack fused.
 
     This is how the Triton implementation gets a complete forward: the gather,
@@ -178,4 +259,4 @@ def full_forward_via_backbone(net: BrokefishNet, backbone, boards, control, rep)
     """
     x, alive = net.embed(boards, control, rep)
     h = backbone(x, alive)
-    return net.heads(net.norm_f(h), control)
+    return net.heads(net.norm_f(h), control, with_logits=with_logits)

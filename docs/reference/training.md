@@ -71,6 +71,45 @@ distribution, and importing it here would be reproducing the wrong experiment.
 
 `c = 10⁻⁴`, AGZ Methods. §7.1 says where it is applied.
 
+### 3.0a The value term has a second form, off by default
+
+⚠️ Added 2026-08-21, as an **option**: `--value-classes 3` replaces the squared error
+with a **3-class cross-entropy** on a win/draw/loss head (`spec.md` §7.4). Nothing
+above changes at the default `--value-classes 1`, which is the arithmetic every Elo
+number on the ledger was produced by.
+
+$$l_v = -\log \hat{p}(\text{class}(z)), \qquad \text{class}(z) = z + 1$$
+
+Why it is worth a run. The value head is the one part of this network that has not
+been observed to train: across four 12-hour runs the held-out value-puzzle probe moved
+`0.3530 -> 0.3480` (×0.99) while the policy probe moved ×4.8, and that was independent
+of the schedule, the sample reuse and the search budget. Three mechanisms make a
+classifier a candidate rather than a cosmetic change:
+
+1. **A `tanh` saturates and a softmax does not saturate the same way.** The documented
+   death of the value head at `lr = 0.2` was `value_saturated_frac -> 1.0` with
+   `grad_value_head -> 0.000` (`journal/2026-07-31-value-collapse.md`); the squared
+   error through a `tanh` has a gradient that vanishes as `|x|` grows *whether or not
+   the prediction is right*, and a cross-entropy's does not.
+2. **A draw is a class, not a coincidence at zero.** Under the scalar head, "draw" is
+   whatever pre-image of 0 the head finds; under the classifier it is a target with its
+   own mass. Our leagues are draw-heavy (2 % to 100 % depending on the pairing).
+3. **It is what the field does.** KataGo and Leela both train win/draw/loss, and
+   KataGo's `c_value = 1.5` exists precisely because the classifier's scale is not the
+   squared error's.
+
+⚠️ **Against it**, stated plainly: nothing above is a measurement, this is the same
+class of hypothesis as `--value-weight 2.0` (which cost a 12-hour run and came back
+−231 Elo), and the head is *cheap* to change but not free to evaluate — a run is 12
+hours plus a league.
+
+⚠️ **`--value-weight` is not calibrated for it.** The squared error against
+`z in {-1, 0, 1}` starts near 1.0; the cross-entropy starts at `ln 3 = 1.0986` and has
+a floor of 0 rather than of the target's own entropy. `gradient/value` is therefore
+**not comparable across the two branches**, and neither is `value_saturated_frac`,
+which keeps its name and comes to mean "a confident classifier" instead of "a
+saturated tanh". The 1:1 weighting is inherited, not justified, on this branch.
+
 ### 3.1 What the target is
 
 `π` is the **root visit distribution**, `π(a) = N(a) / n` over the root's edges —
@@ -234,6 +273,11 @@ Closed by the paper, not open. AZ p.3:
 So: **the final game result, one number per game, written into every record of that
 game, from the point of view of the side to move in that record's position.** No
 bootstrapping, no mixing with the search's root value, no discounting by ply.
+
+⚠️ This is what makes §3.0a's classifier legal at all: `z` is *exactly* `{-1, 0, +1}`,
+so `z + 1` is a class index and not a rounding. `az_loss` asserts it rather than
+assuming it — a bootstrapped or averaged target would need a soft-label loss, and
+rounding one into a class would train a confident wrong answer.
 
 This closes the "value target" row of `spec.md` §11. The row was open because KataGo
 reports an Elo gain from mixing in the search value; that remains a legitimate later

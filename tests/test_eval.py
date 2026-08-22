@@ -426,6 +426,72 @@ class TestPuzzles:
         # with field 0 -- which is what a non-promotion label holds anyway.
         assert torch.equal(back.to(torch.int64), first)
 
+    def test_value_pick_asks_the_value_head_and_nothing_else(self):
+        """The pick is `argmax -v(child)` on the head's own numbers, with no override.
+
+        ⚠️ An earlier version pinned terminal children to the rules' value, so a mate was
+        found whatever the network said. That made the metric partly a measurement of
+        `terminal.cuh`: worth +0.079 to +0.108 pass@1 over 20 000 puzzles, and worth
+        *more the worse the head was*. This asserts the override is gone -- an evaluator
+        that reports every child identically must produce the lowest-label tie-break of
+        `search.md` §6.4, not the mate.
+        """
+        from brokefish.env import cuda_impl as cuda_env, torch_impl as tenv
+        from brokefish.eval.puzzles import value_pick
+
+        # Black king on g8 behind f7/g7/h7; Ra8 is mate in one.
+        boards, control = tenv.from_fen("6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1")
+        boards, control = boards.to(DEVICE), control.to(DEVICE)
+
+        def hostile(b, c, r):
+            return None, None, torch.full((b.shape[0],), 0.99, device=b.device)
+
+        best, bestv = value_pick(hostile, boards, control)
+        # Every child scores -0.99: the head's own number, with the mate given no
+        # special treatment whatsoever.
+        assert float(bestv[0]) == pytest.approx(-0.99, abs=1e-3)
+        assert _to_move(boards, int(best[0])) != "a1a8"
+
+        # And a head that actually likes the mating child picks it, on its own.
+        def prefers_mate(b, c, r):
+            # the mated position has no legal reply -- score it best for us
+            mask, _ = cuda_env.movegen(b, c)
+            dead = (mask == 0).all(-1)
+            return None, None, torch.where(dead, torch.full((b.shape[0],), -1.0,
+                                                            device=b.device),
+                                           torch.zeros(b.shape[0], device=b.device))
+
+        best2, v2 = value_pick(prefers_mate, boards, control)
+        assert _to_move(boards, int(best2[0])) == "a1a8"
+        assert float(v2[0]) == pytest.approx(1.0)
+
+    def test_value_probe_agrees_with_itself_across_the_fused_encoder(self):
+        """The fused path is the default in `PuzzleProbe`; it must not move the metric.
+
+        Measured 2026-08-19 on the full 20 000 puzzles: 0.5207 fused against 0.5206 on the
+        fp32 master weights, a gap twenty times inside the binomial standard error. This
+        keeps that true on a small set, which is what makes the series comparable with
+        every number scored before the switch.
+        """
+        if DEVICE != "cuda":
+            pytest.skip("the fused encoder is CUDA only")
+        from brokefish.nn import available
+        if "cuda" not in available():
+            pytest.skip("the fused CUDA encoder is not built here")
+        from brokefish.eval.puzzles import load_puzzles, score_puzzles_value
+        from brokefish.nn.model import BrokefishNet
+
+        try:
+            puzzles = load_puzzles(limit=256, device=DEVICE)
+        except FileNotFoundError:
+            pytest.skip("the puzzle CSV is not present")
+        torch.manual_seed(0)
+        net = BrokefishNet().to(DEVICE).eval()
+        a = score_puzzles_value(puzzles, net, impl=None, chunk=1024, batch=256)
+        b = score_puzzles_value(puzzles, net, impl="cuda", chunk=1024, batch=256)
+        assert a["n_turns"] == b["n_turns"] > 0
+        assert abs(a["value_pass@1"] - b["value_pass@1"]) < 0.02
+
     def test_a_missing_file_says_where_to_get_it(self):
         from brokefish.eval.puzzles import load_puzzles
         with pytest.raises(FileNotFoundError, match="database.lichess.org"):

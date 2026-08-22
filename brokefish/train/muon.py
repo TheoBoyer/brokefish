@@ -98,7 +98,7 @@ against AdamW. NorMuon is implemented and off; momentum warmup is not implemente
 from __future__ import annotations
 
 import math
-from typing import Iterable, List, Sequence, Tuple
+from typing import Optional, Iterable, List, Sequence, Tuple
 
 import torch
 
@@ -234,7 +234,10 @@ def is_muon_param(name: str, p: torch.Tensor) -> bool:
     which is Jordan's rule (*"the input and output layers should be optimized by a
     standard method such as AdamW"*). It matters more here than usual because
     `value.weight` is `(1, 256)`, and the nearest semi-orthogonal matrix to a single
-    row is that row's direction with its magnitude discarded.
+    row is that row's direction with its magnitude discarded. Under
+    `--value-classes 3` it is `(3, 256)` -- three rows instead of one, still nothing
+    worth orthogonalising, and the name-suffix rule below keeps it on AdamW either
+    way without needing to know which head it is.
     """
     return p.ndim == 2 and (
         name.endswith("in_proj_weight")
@@ -246,7 +249,7 @@ def is_muon_param(name: str, p: torch.Tensor) -> bool:
 def muon_param_groups(net: torch.nn.Module, *, lr: float, aux_lr: float, wd: float,
                       n_heads: int = 8, qkv_split: bool = True, head_group: int = 8,
                       betas: Tuple[float, float] = (0.9, 0.95), momentum: float = 0.95,
-                      eps: float = 1e-8) -> List[dict]:
+                      eps: float = 1e-8, aux_wd: Optional[float] = None) -> List[dict]:
     """Three groups: Muon matrices, AdamW matrices, AdamW flats.
 
     `aux_lr` is carried as `lr_scale` rather than as an absolute rate, so
@@ -273,12 +276,32 @@ def muon_param_groups(net: torch.nn.Module, *, lr: float, aux_lr: float, wd: flo
         else:
             aux_flat.append(p)
 
+    # ⚠️ **`aux_wd` decouples the AdamW matrices from the Muon ones, and the default
+    # keeps them tied only for reproducibility.** The `aux_decay` group is not "a bit of
+    # AdamW on the side": it is the five embedding tables **and all three readout
+    # heads**, including `value.weight`, which is a single row of 256. Running one `wd`
+    # across both meant `--adam-wd 0.09` shrank the value head at the same rate as a
+    # 256x1024 trunk matrix.
+    #
+    # ⚠️ `aux_lr/lr` is **not** a meaningful ratio: `aux_lr` is an AdamW rate and `lr`
+    # is a Muon rate, and Muon's update is spectrally normalised while AdamW's is
+    # sign-like. The heads run AdamW at 1e-3 in the muon chains and AdamW at 1e-3 in
+    # the `t12h-int8` control -- same optimiser, same number. `weight_decay` is the
+    # only knob that actually differs on them (0.09 vs the 0.01 default).
+    #
+    # Measured 2026-08-17: across `t12h-gumbel` (AdamW, no aux group) and the two muon
+    # arms, `grad_policy_head` is identical (0.127-0.131) while `grad_value_head` falls
+    # 0.290 -> 0.174-0.223, and the value head's puzzle accuracy falls with it
+    # (value_pass@1 0.486 -> 0.403-0.414) even as the policy's rises. Three muon runs
+    # were scored against an AdamW control whose value head carried none of this decay,
+    # so `--adam-wd` was never separable from the optimiser in those comparisons.
+    aux_wd = wd if aux_wd is None else aux_wd
     scale = (aux_lr / lr) if lr else 1.0
     return [
         {"params": muon, "use_muon": True, "chunks": specs, "lr": lr,
          "lr_scale": 1.0, "weight_decay": wd, "momentum": momentum, "nesterov": True},
         {"params": aux_decay, "use_muon": False, "lr": aux_lr, "lr_scale": scale,
-         "weight_decay": wd, "betas": betas, "eps": eps},
+         "weight_decay": aux_wd, "betas": betas, "eps": eps},
         {"params": aux_flat, "use_muon": False, "lr": aux_lr, "lr_scale": scale,
          "weight_decay": 0.0, "betas": betas, "eps": eps},
     ]

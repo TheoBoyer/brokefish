@@ -127,8 +127,18 @@ class FusedEncoder:
     ACC_DTYPES = ("fp16", "fp32")
 
     # The head matrix the kernel wants: policy in rows 0-63, promo in 64-67,
-    # value in 68, zeros to 96 so the aux tile is a whole four-n-tile group.
+    # value in 68 (or 68-70 for win/draw/loss), zeros to 96 so the aux tile is a
+    # whole four-n-tile group. ⚠️ `VALUE_ROW` and the class order are pinned to
+    # `csrc/encoder.cu`'s `VALUE_COL`; the kernel reads these rows by index and a
+    # permutation here would be silent -- three real logits in the wrong order give a
+    # plausible value.
     NHEAD = 96
+    VALUE_ROW = N_POLICY + N_PROMO
+    # ⚠️ A class attribute and not only an instance one: `_pack_tail` is the only
+    # writer and it runs only when this is built from a whole `BrokefishNet`. The
+    # backbone-only construction never has a value head at all, and an attribute that
+    # exists in one arm and not the other is the shape of CLAUDE.md's third trap.
+    n_value = 1
     EMB_TABLES = ("emb_square", "emb_type_special", "emb_color_turn",
                   "emb_clock", "emb_rep")
 
@@ -362,7 +372,10 @@ class FusedEncoder:
         head = torch.zeros(self.NHEAD, self.D, dtype=torch.half, device="cuda")
         head[:N_POLICY] = net.policy.weight.detach().half()
         head[N_POLICY:N_POLICY + N_PROMO] = net.promo.weight.detach().half()
-        head[N_POLICY + N_PROMO] = net.value.weight.detach().half()[0]
+        # 1 row for the scalar tanh head, 3 for win/draw/loss. The rest of the aux
+        # tile stays zero, as it already was for 27 of its 32 columns.
+        self.n_value = int(net.value.weight.shape[0])
+        head[self.VALUE_ROW:self.VALUE_ROW + self.n_value] = net.value.weight.detach().half()
         self.tail = torch.cat([
             net.norm_f.weight.detach().reshape(-1).half().cuda(),
             net.norm_f.bias.detach().reshape(-1).half().cuda(),
@@ -443,7 +456,7 @@ class FusedEncoder:
             self.weights, self.emb, self.tail,
             self.policy_out, self.promo_out, self.value_out, self._empty_h,
             self.n_layers, self.eps, 0, self._wq8, self._sq8, self.quant,
-            int(self.two_boards))
+            int(self.two_boards), self.n_value)
         return self.policy_out, self.promo_out, self.value_out
 
     def forward_stage(self, boards, control, rep, stage: int):

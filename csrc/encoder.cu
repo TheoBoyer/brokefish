@@ -218,7 +218,14 @@ constexpr int NAUX = 32;                  // aux tile, padded from 5
 constexpr int NHEAD = NPOL + NAUX;        // 96 packed rows
 constexpr int N_PROMO = 4;
 constexpr int PROMO_COL = NPOL;           // where promo logit 0 lands in staging
+// The value head starts here and is either one column (the scalar tanh head of spec
+// §7.4) or three (win/draw/loss, in that order: 0 = loss, 1 = draw, 2 = win, from the
+// side to move). ⚠️ **Three costs nothing.** The aux tile is padded from 5 to 32
+// columns and warp 2 already computes all 32; the two extra columns come out of the
+// 27 that were zeros, so there is no extra mma, no extra SMEM and no extra register.
 constexpr int VALUE_COL = NPOL + 4;
+constexpr int N_VALUE_MAX = 3;
+static_assert(VALUE_COL + N_VALUE_MAX <= NHEAD, "the value rows have to fit the aux tile");
 // 104 halves is 52 words, so eight rows sit 20 banks apart and 20 is coprime
 // enough with 32 that all eight land in distinct banks -- same test as AROW.
 constexpr int HDROW = NHEAD + 8;
@@ -694,7 +701,8 @@ __device__ __noinline__ void tail_epilogue(half* bufA, half* bufB, half* scratch
                                            half* __restrict__ policy,
                                            half* __restrict__ promo,
                                            float* __restrict__ value, float eps,
-                                           int board, int warp, int lane, int tid) {
+                                           int n_value, int board, int warp, int lane,
+                                           int tid) {
     // Two independent reasons this norm is not optional. The stack is pre-norm,
     // so what falls out of it is a raw residual stream whose scale grows with
     // depth, in fp16, and a linear head on top of that is the classic pre-norm
@@ -735,13 +743,34 @@ __device__ __noinline__ void tail_epilogue(half* bufA, half* bufB, half* scratch
             *reinterpret_cast<uint2*>(promo + ((size_t)board * T + row) * N_PROMO) =
                 *reinterpret_cast<const uint2*>(scratch + row * HDROW + PROMO_COL);
     }
-    // The value is a row select decided by the sign of the control word, then
-    // tanh in fp32. Doing it here rather than shipping the whole [N,32,8] aux
+    // The value is a row select decided by the sign of the control word, then a
+    // squash in fp32. Doing it here rather than shipping the whole [N,32,8] aux
     // tensor saves every consumer in the search a data-dependent gather of two
     // bytes out of every 512, on every backup.
-    if (value && tid == 0)
-        value[board] = tanhf(__half2float(scratch[(control[board] < 0 ? 31 : 15) * HDROW
-                                                  + VALUE_COL]));
+    //
+    // ⚠️ **Both heads leave through the same [N] fp32 in [-1, 1]**, which is why the
+    // search, the terminal collapse and the whole Elo pipeline never learned that a
+    // second head exists. `n_value == 1` is `tanh(x)`, unchanged instruction for
+    // instruction. `n_value == 3` is a 3-way softmax collapsed to `p(win) - p(loss)`;
+    // it must match `nn/model.py:wdl_to_scalar` and does, including the max
+    // subtraction, which is what torch's softmax does too.
+    //
+    // `expf` and not `__expf`: this is one thread, once per board, in an epilogue that
+    // is 0.3 % of the network, so the fast intrinsic would buy nothing measurable and
+    // spend accuracy against the torch oracle that `tests/test_b2.py` compares to.
+    if (value && tid == 0) {
+        const half* row = scratch + (control[board] < 0 ? 31 : 15) * HDROW + VALUE_COL;
+        if (n_value == 1) {
+            value[board] = tanhf(__half2float(row[0]));
+        } else {
+            const float a = __half2float(row[0]);   // loss
+            const float b = __half2float(row[1]);   // draw
+            const float c = __half2float(row[2]);   // win
+            const float m = fmaxf(a, fmaxf(b, c));
+            const float ea = expf(a - m), eb = expf(b - m), ec = expf(c - m);
+            value[board] = (ec - ea) / (ea + eb + ec);
+        }
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -903,7 +932,7 @@ __global__ __launch_bounds__(THREADS, TWOB ? 1 : 2) void encoder_kernel(
     const uint8_t* __restrict__ rep_ptr, const half* __restrict__ emb,
     const half* __restrict__ tail, half* __restrict__ policy,
     half* __restrict__ promo, float* __restrict__ value,
-    int n_layers, float eps, int debug_stage, int n_boards) {
+    int n_layers, float eps, int debug_stage, int n_boards, int n_value) {
     static_assert(!(FP8 && INT8), "the FFN is quantised once, in one format");
     static_assert(!QATT || INT8, "QKVO quantisation is int8 only; e4m3 was measured "
                                  "3x worse at that site before it was built");
@@ -1216,7 +1245,7 @@ __global__ __launch_bounds__(THREADS, TWOB ? 1 : 2) void encoder_kernel(
             if (bb < nb)
                 tail_epilogue(bufA + (size_t)bb * T * AROWA, bufB + (size_t)bb * T * AROW,
                               scratch + (size_t)bb * T * AROW, tail, control, policy,
-                              promo, value, eps, b0 + bb, warp, lane, tid);
+                              promo, value, eps, n_value, b0 + bb, warp, lane, tid);
             __syncthreads();
         }
     }
@@ -1271,7 +1300,7 @@ void launch_one(int n_boards, size_t smem, half* y, const half* weights,
                 const uint8_t* wq8, const float* sq8, const int8_t* alive,
                 const uint16_t* boards, const int16_t* control, const uint8_t* rep,
                 const half* emb, const half* tail, half* policy, half* promo,
-                float* value, int n_layers, float eps, int debug_stage) {
+                float* value, int n_layers, float eps, int debug_stage, int n_value) {
     constexpr bool Q8 = FP8 || INT8;
     constexpr int BPC = brokefish::Lay<TWOB>::BPC;
     const int grid = (n_boards + BPC - 1) / BPC;
@@ -1280,7 +1309,8 @@ void launch_one(int n_boards, size_t smem, half* y, const half* weights,
     brokefish::encoder_kernel<FP8, INT8, TWOB, PROF, QATT, QOUT>
         <<<grid, brokefish::THREADS, smem>>>(
         y, weights, Q8 ? wq8 : nullptr, Q8 ? sq8 : nullptr, alive, boards, control,
-        rep, emb, tail, policy, promo, value, n_layers, eps, debug_stage, n_boards);
+        rep, emb, tail, policy, promo, value, n_layers, eps, debug_stage, n_boards,
+        n_value);
 }
 
 // `quant`: 0 = fp16, 1 = e4m3, 2 = int8. ⚠️ An explicit mode rather than a property of
@@ -1293,7 +1323,7 @@ void launch(int n_boards, int quant, bool twob, half* y, const half* weights,
             const float* sq8, const int8_t* alive,
             const uint16_t* boards, const int16_t* control, const uint8_t* rep,
             const half* emb, const half* tail, half* policy, half* promo, float* value,
-            int n_layers, float eps, int debug_stage) {
+            int n_layers, float eps, int debug_stage, int n_value = 1) {
     const size_t smem = twob ? brokefish::Lay<true>::BYTES : brokefish::Lay<false>::BYTES;
     const bool have_slab = (wq8 != nullptr) && (sq8 != nullptr);
     TORCH_CHECK(quant == 0 || have_slab,
@@ -1305,11 +1335,11 @@ void launch(int n_boards, int quant, bool twob, half* y, const half* weights,
 #define BROKEFISH_LAUNCH(F, I, W, P)                                                   \
     launch_one<F, I, W, P>(n_boards, smem, y, weights, wq8, sq8, alive, boards,        \
                            control, rep, emb, tail, policy, promo, value, n_layers,    \
-                           eps, debug_stage)
+                           eps, debug_stage, n_value)
 #define BROKEFISH_LAUNCH_Q(F, I, W, P, O)                                              \
     launch_one<F, I, W, P, true, O>(n_boards, smem, y, weights, wq8, sq8, alive,       \
                                     boards, control, rep, emb, tail, policy, promo,    \
-                                    value, n_layers, eps, debug_stage)
+                                    value, n_layers, eps, debug_stage, n_value)
     // quant 3 is quant 2 plus both attention matmuls, quant 4 is quant 2 plus QKV
     // alone. Both exist only at two boards per CTA, because that is the only occupancy
     // int8's s32 accumulators fit at and a one-board arm is a configuration nobody
@@ -1370,7 +1400,8 @@ void model_forward(torch::Tensor boards, torch::Tensor control, torch::Tensor re
                    torch::Tensor weights, torch::Tensor emb, torch::Tensor tail,
                    torch::Tensor policy, torch::Tensor promo, torch::Tensor value,
                    torch::Tensor y, int64_t n_layers, double eps, int64_t debug_stage,
-                   torch::Tensor wq8, torch::Tensor sq8, int64_t quant, int64_t twob) {
+                   torch::Tensor wq8, torch::Tensor sq8, int64_t quant, int64_t twob,
+                   int64_t n_value) {
     TORCH_CHECK(boards.is_cuda() && boards.scalar_type() == torch::kShort
                 && boards.is_contiguous() && boards.dim() == 2
                 && boards.size(1) == brokefish::T,
@@ -1403,6 +1434,12 @@ void model_forward(torch::Tensor boards, torch::Tensor control, torch::Tensor re
         TORCH_CHECK(value.is_cuda() && value.scalar_type() == torch::kFloat
                     && value.is_contiguous() && value.numel() == n,
                     "value must be [n] fp32 contiguous");
+    // ⚠️ The output is [n] either way, so a wrong `n_value` reads two head columns
+    // that exist and are in range and produces a plausible value. Nothing downstream
+    // can catch it; this check is the only place it can be caught.
+    TORCH_CHECK(n_value == 1 || n_value == brokefish::N_VALUE_MAX,
+                "n_value is 1 for the scalar tanh head or 3 for win/draw/loss; got ",
+                n_value);
     if (y.numel())
         TORCH_CHECK(y.is_cuda() && y.scalar_type() == torch::kHalf && y.is_contiguous()
                     && y.numel() == n * brokefish::T * brokefish::Dm,
@@ -1447,7 +1484,7 @@ void model_forward(torch::Tensor boards, torch::Tensor control, torch::Tensor re
            ptr_or_null<const uint8_t>(rep), ptr_or_null<const half>(emb),
            ptr_or_null<const half>(tail), ptr_or_null<half>(policy),
            ptr_or_null<half>(promo), ptr_or_null<float>(value),
-           (int)n_layers, (float)eps, (int)debug_stage);
+           (int)n_layers, (float)eps, (int)debug_stage, (int)n_value);
 }
 
 // ---------------------------------------------------------------------------
@@ -1495,7 +1532,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("emb"), py::arg("tail"), py::arg("policy"), py::arg("promo"),
           py::arg("value"), py::arg("y"), py::arg("n_layers"), py::arg("eps"),
           py::arg("debug_stage"), py::arg("wq8"), py::arg("sq8"), py::arg("quant") = 0,
-          py::arg("twob") = 0);
+          py::arg("twob") = 0, py::arg("n_value") = 1);
     m.def("int8_q_max", []() {
         return std::pair<double, double>{(double)brokefish::int8q::kQMaxS,
                                          (double)brokefish::int8q::kQMaxU};

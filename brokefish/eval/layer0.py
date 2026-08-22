@@ -129,7 +129,7 @@ def load_net_state(path: str, device: str = "cuda") -> dict:
 def main() -> None:
     import argparse
 
-    from brokefish.nn.model import BrokefishNet
+    from brokefish.nn.model import BrokefishNet, net_for_state
 
     ap = argparse.ArgumentParser(description="layer 0 for one checkpoint")
     ap.add_argument("checkpoint", nargs="?", help="a torch state_dict; random init if absent")
@@ -146,9 +146,11 @@ def main() -> None:
     ap.add_argument("--json", default=None, help="append the record to this file")
     args = ap.parse_args()
 
-    net = BrokefishNet().to(args.device)
+    net = BrokefishNet().to(args.device)   # replaced below when a checkpoint is given
     if args.checkpoint:
-        net.load_state_dict(load_net_state(args.checkpoint, args.device))
+        state = load_net_state(args.checkpoint, args.device)
+        net = net_for_state(state).to(args.device)
+        net.load_state_dict(state)
     net.eval()
 
     report = layer0_report(net, games=args.games, n_sims=args.sims,

@@ -417,7 +417,29 @@ Three heads, all **biasless**, applied to all 32 normed tokens:
 |---|---|---|
 | `W_p` | `[256, 64]` | policy logits, in exact correspondence with the engine's 32 mask words |
 | `W_promo` | `[256, 4]` | promotion logits per token, softmax over (N, B, R, Q) |
-| `W_value` | `[256, 1]` | read at the side-to-move king's token, slot 15 or 31, through `tanh` |
+| `W_value` | `[256, 1]` or `[256, 3]` | read at the side-to-move king's token, slot 15 or 31; see below |
+
+**The value head has two shapes and one output.** `[256, 1]` is the original and the
+default: one logit through `tanh`, trained against the outcome with a squared error.
+`[256, 3]` is a **win/draw/loss classifier**, trained with a cross-entropy, and is
+selected by `--value-classes 3` (added 2026-08-21). Its class order is normative —
+**0 = loss, 1 = draw, 2 = win, from the side to move**, so a stored outcome
+`z in {-1, 0, +1}` has class index `z + 1`, and `csrc/encoder.cu`'s epilogue reads
+those three columns by position.
+
+⚠️ **Both shapes emit the same `[N]` fp32 in `[-1, 1]`**, the classifier through
+`p(win) - p(loss)`. That is what makes this an option rather than a rewrite: the
+search (`search.md` §3.5), the terminal collapse, the value-head puzzle probe and the
+whole Elo pipeline consume one scalar and cannot tell which head produced it. A
+draw-aware search — a separate draw term in the utility, as KataGo has — would be a
+**different** change, to the search and not to the head.
+
+⚠️ **A checkpoint does not say which head it has.** Checkpoints are bare
+`state_dict`s with the architecture in the constructor, so the width is recovered
+from `value.weight.shape[0]` (`nn/model.py:n_value_of`). Every loader in the
+repository goes through it, which is the only reason a scalar-head checkpoint —
+`checkpoints/anchor.pt` among them, and every Elo scale anchors to that one — can
+still be rated against a classifier-head one in a single Bradley-Terry fit.
 
 `norm_f` keeps its affine, so `beta` is a learned 256-vector every head sees and
 each head's effective bias is `W_h @ beta` — any vector in that head's output
@@ -451,7 +473,7 @@ them and the value would otherwise cost every consumer a data-dependent gather:
 ```
 policy_logits [N, 32, 64]  fp16      raw
 promo         [N, 32,  4]  fp16      raw
-value         [N]          fp32      tanh applied, king row already selected
+value         [N]          fp32      squashed to [-1, 1], king row already selected
 ```
 
 At B = 16384 the three heads cost 2.1 GFLOP against a 6.5 TFLOP forward, or 0.03 %.

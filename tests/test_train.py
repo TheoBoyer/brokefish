@@ -60,16 +60,27 @@ MAX_MOBILITY = "R6R/3Q4/1Q4Q1/4Q3/2Q4Q/Q4Q2/pp1Q4/kBNN1KB1 w - - 0 1"
 # --------------------------------------------------------------------------- #
 
 class ConstNet(torch.nn.Module):
-    """Fixed logits, so a loss test measures the loss and not the network."""
+    """Fixed logits, so a loss test measures the loss and not the network.
+
+    ``value`` is ``[N]`` for the scalar head and ``[N, 3]`` for win/draw/loss; the
+    squash it applies is whichever one `BrokefishNet.heads` would, so a loss test
+    against this stub is testing the loss and not the collapse.
+    """
 
     def __init__(self, policy, promo, value):
         super().__init__()
         self.policy = torch.nn.Parameter(policy)
         self.promo = torch.nn.Parameter(promo)
         self.value = torch.nn.Parameter(value)
+        self.n_value = 1 if value.ndim == 1 else value.shape[-1]
 
-    def forward(self, boards, control, rep):
-        return self.policy, self.promo, torch.tanh(self.value)
+    def forward(self, boards, control, rep, with_logits=False):
+        from brokefish.nn.model import wdl_to_scalar
+        raw = self.value if self.n_value > 1 else self.value.unsqueeze(-1)
+        v = torch.tanh(raw).squeeze(-1) if self.n_value == 1 else wdl_to_scalar(raw)
+        if with_logits:
+            return self.policy, self.promo, v, raw
+        return self.policy, self.promo, v
 
 
 @torch.no_grad()
@@ -1239,3 +1250,134 @@ class TestTheSimsSchedule:
         assert (play["full_sims"], play["fast_sims"]) == (16, 8)
         assert play["sims_mean"] == pytest.approx(12.0)
         trainer.log.close()
+
+
+# --------------------------------------------------------------------------
+# The win/draw/loss value head, 2026-08-21. It is an option (`--value-classes 3`)
+# and the scalar head is untouched, so what these pin is the *branch*: the class
+# convention, that the collapse the search sees is `p(win) - p(loss)`, and that a
+# target which is not a game outcome fails loudly rather than rounding into a
+# class it does not mean.
+
+
+def test_the_wdl_loss_is_a_three_class_cross_entropy_on_the_outcome():
+    """The value term against `F.cross_entropy` written from the other end.
+
+    ⚠️ The class convention is the thing being pinned: **0 = loss, 1 = draw,
+    2 = win, from the side to move**, so the index of a stored `z` is `z + 1`. It is
+    normative because `csrc/encoder.cu`'s epilogue reads those three columns by
+    position — a permutation here and there would still produce a value in `[-1, 1]`
+    and would be wrong in a way nothing downstream can see.
+    """
+    batch, _, _ = make_batch(16, seed=11)
+    n = len(batch)
+    torch.manual_seed(0)
+    logits = torch.randn(n, 3, device=DEVICE)
+    net = ConstNet(torch.randn(n, 32, 64, device=DEVICE),
+                   torch.randn(n, 32, 4, device=DEVICE), logits)
+    parts = az_loss(net, batch)
+    assert parts.n_value == 3
+
+    # Written by hand in double, one sample at a time, sharing no helper with the loss.
+    ref = 0.0
+    for i in range(n):
+        z = float(batch.value[i])
+        assert z in (-1.0, 0.0, 1.0)
+        row = [float(x) for x in logits[i].double()]
+        top = max(row)
+        lse = top + math.log(sum(math.exp(x - top) for x in row))
+        ref += lse - row[int(z) + 1]
+    ref /= n
+    assert float(parts.value) == pytest.approx(ref, rel=1e-5, abs=1e-6)
+
+    # And the weight still scales it, exactly as it scales the squared error.
+    doubled = az_loss(net, batch, value_weight=2.0)
+    assert float(doubled.value) == pytest.approx(2.0 * float(parts.value), rel=1e-6)
+
+
+def test_the_wdl_head_hands_the_search_win_minus_loss():
+    """`value_pred` is the *only* thing the search, the collapse and the league see,
+    and it has to stay a scalar in [-1, 1] with the same sign convention as the tanh
+    head: positive means the side to move is winning."""
+    from brokefish.nn.model import wdl_to_scalar
+
+    batch, _, _ = make_batch(8, seed=12)
+    n = len(batch)
+    # One certain loss, one certain draw, one certain win, then noise.
+    logits = torch.randn(n, 3, device=DEVICE) * 0.1
+    logits[0] = torch.tensor([20.0, 0.0, 0.0], device=DEVICE)
+    logits[1] = torch.tensor([0.0, 20.0, 0.0], device=DEVICE)
+    logits[2] = torch.tensor([0.0, 0.0, 20.0], device=DEVICE)
+    net = ConstNet(torch.randn(n, 32, 64, device=DEVICE),
+                   torch.randn(n, 32, 4, device=DEVICE), logits)
+    v = az_loss(net, batch).value_pred
+    assert v.shape == (n,) and v.dtype is torch.float32
+    assert float(v[0]) == pytest.approx(-1.0, abs=1e-5)
+    assert float(v[1]) == pytest.approx(0.0, abs=1e-5)
+    assert float(v[2]) == pytest.approx(+1.0, abs=1e-5)
+    assert v.abs().max().item() <= 1.0
+    # A draw is the *zero* of this scale, which is the one thing the tanh head could
+    # only learn and this one gets by construction.
+    assert float(wdl_to_scalar(torch.tensor([[0.0, 5.0, 0.0]]))) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_the_wdl_loss_refuses_a_target_that_is_not_a_game_outcome():
+    """A bootstrapped or averaged value has no class index, and rounding it into one
+    would train a confident wrong label. §4's target is the game result and this is
+    the branch that says so."""
+    batch, _, _ = make_batch(8, seed=13)
+    n = len(batch)
+    net = ConstNet(torch.randn(n, 32, 64, device=DEVICE),
+                   torch.randn(n, 32, 4, device=DEVICE),
+                   torch.randn(n, 3, device=DEVICE))
+    soft = batch.slice(0, n)
+    soft.value = torch.full((n,), 0.37, device=DEVICE)
+    with pytest.raises(AssertionError, match="not in"):
+        az_loss(net, soft)
+
+
+def test_a_perfectly_fitted_wdl_head_has_a_vanishing_value_loss():
+    """The floor of the cross-entropy is zero, unlike the policy term's, because the
+    target is one-hot. `ln 3 = 1.0986` is where it starts from, which is the number
+    `--value-weight` is untuned against."""
+    batch, _, _ = make_batch(16, seed=14)
+    n = len(batch)
+    onehot = torch.zeros(n, 3, device=DEVICE)
+    onehot[torch.arange(n), (batch.value + 1).long()] = 30.0
+    net = ConstNet(torch.randn(n, 32, 64, device=DEVICE),
+                   torch.randn(n, 32, 4, device=DEVICE), onehot)
+    assert float(az_loss(net, batch).value) < 1e-6
+
+    flat = ConstNet(torch.randn(n, 32, 64, device=DEVICE),
+                    torch.randn(n, 32, 4, device=DEVICE),
+                    torch.zeros(n, 3, device=DEVICE))
+    assert float(az_loss(flat, batch).value) == pytest.approx(math.log(3), rel=1e-6)
+
+
+def test_the_scalar_head_is_untouched_by_the_option():
+    """The regression branch has to be the same arithmetic it always was: `n_value`
+    reported as 1, the squared error, and `value_pred` the tanh."""
+    batch, _, _ = make_batch(16, seed=3)
+    n = len(batch)
+    torch.manual_seed(0)
+    raw = torch.randn(n, device=DEVICE)
+    net = ConstNet(torch.randn(n, 32, 64, device=DEVICE),
+                   torch.randn(n, 32, 4, device=DEVICE), raw)
+    parts = az_loss(net, batch)
+    assert parts.n_value == 1
+    want = ((batch.value - torch.tanh(raw)) ** 2).mean()
+    assert float(parts.value) == pytest.approx(float(want), rel=1e-6)
+    assert torch.equal(parts.value_pred, torch.tanh(raw))
+
+
+def test_value_classes_reaches_the_network_and_the_config_hash():
+    """The knob is architectural, so a resume across it must be refused: the two
+    heads have different weight shapes and a hybrid run would not even load."""
+    from dataclasses import replace
+
+    from brokefish.train.loop import TrainConfig
+
+    cfg = TrainConfig()
+    assert cfg.value_classes == 1, "the default is the head every Elo number used"
+    assert replace(cfg, value_classes=3).hash() != cfg.hash()
+    assert BrokefishNet(n_value=3).value.weight.shape == (3, BrokefishNet().d_model)

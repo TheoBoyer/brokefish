@@ -49,13 +49,14 @@ def score_checkpoint(path: str, puzzles, impl: Optional[str] = None,
                      ks: Sequence[int] = (1, 3, 5), batch: int = 1024,
                      device: str = "cuda") -> dict:
     """Every puzzle metric for one checkpoint, as flat keys ready for wandb."""
-    from brokefish.nn.model import BrokefishNet
+    from brokefish.nn.model import net_for_state
 
     from .layer0 import load_net_state
     from .puzzles import score_puzzles_line
 
-    net = BrokefishNet()
-    net.load_state_dict(load_net_state(path, device="cpu"))
+    state = load_net_state(path, device="cpu")
+    net = net_for_state(state)
+    net.load_state_dict(state)
     net = net.to(device).eval()
     try:
         r = score_puzzles_line(puzzles, net, impl=impl, batch=batch,
@@ -110,10 +111,25 @@ class PuzzleProbe:
 
     def __init__(self, limit: Optional[int] = 20_000, ks: Sequence[int] = (1, 3, 5),
                  impl: Optional[str] = None, batch: int = 1024,
-                 device: str = "cuda", detail_path: Optional[str] = None) -> None:
+                 device: str = "cuda", detail_path: Optional[str] = None,
+                 value: bool = True, value_impl: Optional[str] = "cuda",
+                 value_chunk: int = 2048, value_batch: int = 4096) -> None:
         self.limit, self.ks, self.impl = limit, tuple(ks), impl
         self.batch, self.device = batch, device
         self.detail_path = detail_path
+        # ⚠️ **The value probe runs by default, and on the fused encoder.** Its absence
+        # is why a value-head regression stayed invisible for three runs: `t12h-muon9-int8`
+        # led `t12h-gumbel` by +0.061 policy pass@1 and lost to it 62-45-93 at n = 128,
+        # and nothing in either run measured the head that decides games at n >= 64.
+        #
+        # `value_impl = "cuda"` because measured 2026-08-19 on the full 20 000 puzzles the
+        # fused path is **21.5 s against 234.8 s** and agrees with the fp32 master weights
+        # to **0.0001** -- twenty times inside the 0.0022 binomial standard error, so the
+        # series is comparable across the switch and with every number scored before it.
+        # Peak 0.43 GiB, which is why it can sit beside a training step at all.
+        self.value, self.value_impl = value, value_impl
+        self.value_chunk, self.value_batch = value_chunk, value_batch
+        self._value_off: Optional[str] = None
         self._puzzles = None
         self.unavailable: Optional[str] = None
 
@@ -158,6 +174,7 @@ class PuzzleProbe:
         out = {"puzzles/solve_rate": r["solve_rate"],
                "puzzles/mean_line": r["mean_line"],
                "puzzles/seconds": time.time() - t0}
+        rv = self._value(net, step, log, out)
         for k in self.ks:
             out[f"puzzles/move_pass@{k}"] = r[f"move_pass@{k}"]
         for name, lo, hi in BUCKETS:
@@ -182,7 +199,7 @@ class PuzzleProbe:
         # The full 14-band curve and the kind table go to their own file: 56 wandb
         # series is a chart nobody reads, and losing the fine bins would mean
         # re-scoring every checkpoint to get them back.
-        self._write_detail(step, r)
+        self._write_detail(step, r, value_bins=(rv or {}).get("bins"))
         k = r.get("kinds", {})
         log.note(f"  puzzles  solve {r['solve_rate']:.4f}  "
                  f"pass@1 {r['move_pass@1']:.4f}  pass@5 {r['move_pass@5']:.4f}  "
@@ -190,8 +207,50 @@ class PuzzleProbe:
                  f"check {k.get('check', {}).get('pass@1', 0):.3f} "
                  f"mate {k.get('mate', {}).get('pass@1', 0):.3f}  "
                  f"[{out['puzzles/seconds']:.1f}s, not training time]")
+        if rv is not None:
+            log.note(f"  puzzles  VALUE head: pass@1 {rv['value_pass@1']:.4f}  "
+                     f"solve {rv['solve_rate']:.4f}  "
+                     f"[{out['puzzles/value_seconds']:.1f}s]")
 
-    def _write_detail(self, step: int, r: dict, log_dir: str = "logs") -> None:
+    def _value(self, net, step: int, log, out: dict) -> Optional[dict]:
+        """Score the value head and fold its metrics into `out`. Never raises.
+
+        ⚠️ Returns the raw result only so the caller can put the per-band table in the
+        detail file. Nothing here reaches a training decision, exactly as for the policy
+        probe -- `run` still returns `None`.
+        """
+        if not self.value or self._value_off is not None:
+            return None
+        from .puzzles import score_puzzles_value
+
+        t1 = time.time()
+        try:
+            rv = score_puzzles_value(self._puzzles, net, impl=self.value_impl,
+                                     chunk=self.value_chunk, batch=self.value_batch,
+                                     device=self.device)
+        except Exception as exc:  # noqa: BLE001 - a diagnostic may never kill a run
+            # ⚠️ Disabled for the rest of the run rather than retried every checkpoint:
+            # the failure modes here are the fused kernel being unavailable and the card
+            # being full, and neither fixes itself.
+            self._value_off = f"{type(exc).__name__}: {exc}"
+            log.note(f"  ⚠️ value puzzle probe disabled at step {step}: {self._value_off}")
+            return None
+        out["puzzles/value_pass@1"] = rv["value_pass@1"]
+        out["puzzles/value_solve_rate"] = rv["solve_rate"]
+        out["puzzles/value_seconds"] = time.time() - t1
+        for name, lo, hi in BUCKETS:
+            sel = [b for b in rv["bins"] if lo <= b["rating_lo"] < hi]
+            n = sum(b["n"] for b in sel)
+            t = sum(b["n_turns"] for b in sel)
+            if not n:
+                continue
+            out[f"puzzles/value_solve_rate_{name}"] = sum(b["solved"] for b in sel) / n
+            hits = sum(b["value_pass@1"] * b["n_turns"] for b in sel)
+            out[f"puzzles/value_pass@1_{name}"] = hits / t if t else 0.0
+        return rv
+
+    def _write_detail(self, step: int, r: dict, log_dir: str = "logs",
+                      value_bins=None) -> None:
         """Per-band and per-kind detail, appended to its own JSONL."""
         if self.detail_path is None:
             return
@@ -199,7 +258,8 @@ class PuzzleProbe:
             os.makedirs(os.path.dirname(self.detail_path) or ".", exist_ok=True)
             with open(self.detail_path, "a", buffering=1) as fh:
                 fh.write(json.dumps({"step": step, "bins": r["bins"],
-                                     "kinds": r.get("kinds", {})}, default=float) + "\n")
+                                     "kinds": r.get("kinds", {}),
+                                     "value_bins": value_bins}, default=float) + "\n")
         except Exception:  # noqa: BLE001 - a detail file may never kill a run
             self.detail_path = None
 

@@ -16,6 +16,7 @@ Run from the repository root::
 
 import functools
 
+import pytest
 import torch
 
 from brokefish.nn import available, encoder_impl, why_unavailable
@@ -379,3 +380,118 @@ if __name__ == "__main__":
         if name.startswith("test_"):
             fn()
             print(f"[OK] {name}")
+
+
+# --------------------------------------------------------------------------
+# The win/draw/loss value head, 2026-08-21. `--value-classes 3` puts three logits
+# where one was. It costs nothing: the aux tile of the packed head matrix is padded
+# from 5 columns to 32 and warp 2 already computes all of them, so the two extra
+# columns come out of 27 that were zeros. What has to be pinned is that the kernel's
+# epilogue and `nn/model.py` agree — a permuted class order would still produce a
+# plausible value in [-1, 1] and nothing downstream could tell.
+
+_WDL_CACHE: dict = {}
+
+
+def build_wdl(impl: str, seed: int = 0):
+    if (impl, seed) not in _WDL_CACHE:
+        torch.manual_seed(seed)
+        net = BrokefishNet(n_value=3).cuda().half().eval()
+        _WDL_CACHE[(impl, seed)] = (net, encoder_impl(impl)(net))
+    return _WDL_CACHE[(impl, seed)]
+
+
+@for_each_impl
+def test_the_wdl_epilogue_agrees_with_torch(impl):
+    net, fused = build_wdl(impl)
+    boards, control, rep = positions()
+    with torch.no_grad():
+        want = net(boards, control, rep)[2]
+    got = fused.forward_full(boards, control, rep)[2]
+    d = (got.float() - want.float()).abs().max().item()
+    assert d < VALUE_TOL, f"max|diff| {d:.3e}"
+    # And it is a live head, not a constant the tolerance would hide.
+    assert got.std().item() > 0.05, f"the value collapsed to {got.mean():.4f}"
+
+
+@for_each_impl
+def test_the_wdl_class_order_is_loss_draw_win(impl):
+    """The kernel reads the three columns in the same order the module writes them.
+
+    Swapping the *loss* and *win* rows of `value.weight` negates `p(win) - p(loss)`
+    exactly, whatever the position: `p0' = p2` and `p2' = p0`. So the kernel must
+    come back with the negated value — and it must do so **without** consulting
+    torch, which is what makes this a check of `VALUE_COL`'s layout rather than
+    another comparison against the oracle.
+
+    ⚠️ A permutation is the failure this exists for. Three real logits in the wrong
+    order still produce a finite value in [-1, 1] and still train; nothing downstream
+    of the head can see it, and neither can `test_the_wdl_epilogue_agrees_with_torch`
+    if the module and the kernel are permuted the same way.
+    """
+    net, fused = build_wdl(impl)
+    boards, control, rep = positions(n=64)
+    base = fused.forward_full(boards, control, rep)[2].clone()
+    assert base.abs().max().item() > 1e-2, "an all-draw head would pass anything"
+
+    saved = net.value.weight.detach().clone()
+    try:
+        net.value.weight.data.copy_(saved[[2, 1, 0]])
+        # Repacked from scratch: the head matrix is a constructor snapshot
+        # (CLAUDE.md's third trap), so mutating the module is not enough.
+        swapped = encoder_impl(impl)(net).forward_full(boards, control, rep)[2].clone()
+    finally:
+        net.value.weight.data.copy_(saved)
+    d = (swapped + base).abs().max().item()
+    assert d < VALUE_TOL, f"swapping loss and win did not negate the value: max {d:.3e}"
+
+    # The draw row is the one that does not move the sign, only the magnitude.
+    try:
+        net.value.weight.data.copy_(saved[[0, 2, 1]])
+        moved = encoder_impl(impl)(net).forward_full(boards, control, rep)[2].clone()
+    finally:
+        net.value.weight.data.copy_(saved)
+    assert (moved - base).abs().max().item() > 1e-3, \
+        "permuting the draw row changed nothing, so it is not being read"
+
+
+@for_each_impl
+def test_the_wdl_head_still_reads_the_side_to_move_king(impl):
+    """Spec 7.4's row select is the same row select. Flipping the side to move has to
+    move the value, or the three columns are being read off the wrong token."""
+    net, fused = build_wdl(impl)
+    boards, control, rep = positions()
+    a = fused.forward_full(boards, control, rep)[2].clone()
+    b = fused.forward_full(boards, -control, rep)[2].clone()
+    assert (a - b).abs().max().item() > 1e-3, "flipping the side to move changed nothing"
+
+
+def test_a_scalar_head_checkpoint_still_loads_after_the_option_exists():
+    """⚠️ Retro-compatibility, and it is not decoration: `checkpoints/anchor.pt` is a
+    scalar-head net and **every Elo scale in `docs/ledger/` anchors to it**. A
+    checkpoint is a bare `state_dict` with no architecture in it, so the head's width
+    is read back off `value.weight` — which is the only thing that lets an August
+    checkpoint and a win/draw/loss one meet in one Bradley-Terry fit."""
+    from brokefish.nn.model import n_value_of, net_for_state
+
+    torch.manual_seed(4)
+    old = BrokefishNet()                     # what every file on disk looks like
+    state = {k: v.clone() for k, v in old.state_dict().items()}
+    assert tuple(state["value.weight"].shape) == (1, 256)
+    assert n_value_of(state) == 1
+
+    got = net_for_state(state)
+    got.load_state_dict(state)               # strict: a wrong width raises here
+    boards, control, rep = positions(n=32)
+    with torch.no_grad():
+        a = old.cuda()(boards, control, rep)[2]
+        b = got.cuda()(boards, control, rep)[2]
+    assert torch.equal(a, b)
+
+    new = BrokefishNet(n_value=3)
+    ns = new.state_dict()
+    assert n_value_of(ns) == 3
+    net_for_state(ns).load_state_dict(ns)
+    # And the two are not silently interchangeable.
+    with pytest.raises(RuntimeError):
+        BrokefishNet().load_state_dict(ns)

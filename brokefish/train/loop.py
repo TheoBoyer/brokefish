@@ -205,6 +205,16 @@ class TrainConfig:
     # was invalidated by the FPU bug (`journal/2026-07-31-value-collapse.md`). This is
     # a restored intention, not a result, and it is a legitimate ablation.
     adam_wd: float = 0.01                      # decoupled, so unrelated to `l2` -- see below
+    # ⚠️ **Weight decay for the AdamW matrices, decoupled from Muon's on 2026-08-17.**
+    # Under `--optimizer muon` that group is not a footnote: it is the five embedding
+    # tables *and all three readout heads*, `value.weight` among them -- one row of 256
+    # that was decayed at the same rate as a 256x1024 trunk matrix while training at
+    # `aux_lr/lr = 0.05` of its speed. Measured the same day: `grad_policy_head` is
+    # identical across the AdamW control and both muon arms (0.127-0.131) while
+    # `grad_value_head` falls 0.290 -> 0.174, and value-head puzzle accuracy falls with
+    # it (0.486 -> 0.403) even as policy accuracy rises.
+    # `None` stays tied to `adam_wd`, so every run before this date reproduces.
+    aux_wd: Optional[float] = None
     grad_clip: float = 0.0                     # 0 disables; AGZ specifies no clipping
 
     # -- ablation 2, `train/muon.py`. Inert unless `optimizer == "muon"`.
@@ -274,6 +284,19 @@ class TrainConfig:
     # 0.5*(x-y)^2, so their runs weighted value at half -- and their own eq. (10)
     # says otherwise. See `az_loss`.
     value_weight: float = 1.0
+    # ⚠️ **The value head's shape, and the only architectural knob in this config.**
+    # 1 is spec §7.4's scalar tanh trained with a squared error -- every Elo number on
+    # the ledger. 3 is a win/draw/loss classifier trained with a cross-entropy
+    # (KataGo's and Leela's shape); the head still hands the search a single scalar,
+    # `p(win) - p(loss)`, so nothing but the loss and the packed head matrix knows.
+    #
+    # ⚠️ It lands in `config_hash`, so a resume across it is refused by
+    # `load_checkpoint` without `--allow-config-change`. That is correct: the two
+    # heads have different weight shapes and a hybrid run would not even load.
+    #
+    # ⚠️ `value_weight` is **not** calibrated for the cross-entropy branch. See
+    # `az_loss`.
+    value_classes: int = 1
     # `torch.compile` on the gradient step's forward. ~1.25x measured at batch 256;
     # see `Trainer.__init__` for why the dead-end entry in `CLAUDE.md` is about
     # something else. Off by default: it changes training numerics, so a compiled run
@@ -428,7 +451,7 @@ def build_optimizer(net: torch.nn.Module, cfg: TrainConfig) -> torch.optim.Optim
                 # The schedule's *peak*, not `lr_at(0)`: `lr_scale` is a ratio and
                 # `lr_at(0)` is the warmup's first step, `peak / warmup_steps`.
                 net, lr=cfg.lr_schedule[0][1], aux_lr=cfg.aux_lr, wd=cfg.adam_wd,
-                qkv_split=cfg.muon_qkv_split, head_group=cfg.muon_head_group,
+                aux_wd=cfg.aux_wd, qkv_split=cfg.muon_qkv_split, head_group=cfg.muon_head_group,
                 betas=cfg.betas, momentum=cfg.muon_momentum),
             ns_steps=cfg.muon_ns_steps, ns_scheme=cfg.muon_ns_scheme,
             normuon=cfg.normuon)
@@ -502,7 +525,7 @@ class Trainer:
                     f"not what was asked for")
 
         torch.manual_seed(cfg.seed)
-        self.net = BrokefishNet().to(self.device)          # fp32 master weights, §8.2
+        self.net = BrokefishNet(n_value=cfg.value_classes).to(self.device)  # fp32 master, §8.2
         self.opt = build_optimizer(self.net, cfg)
         # ⚠️ `self.net` stays the **raw** module and only the call is compiled.
         # `PackedWeights.pack`, §12 check 9 and every checkpoint path read the module
@@ -795,6 +818,14 @@ class Trainer:
             # Over the whole batch, not just the last micro-batch: saturation is the
             # mechanism that killed the value head at lr = 0.2 and a quarter of the
             # batch is a quarter of the evidence.
+            #
+            # ⚠️ Under `--value-classes 3` this counter keeps its name and changes its
+            # meaning: `value_pred` is `p(win) - p(loss)`, so |v| > 0.99 is a confident
+            # classifier, not a saturated tanh. It is still worth watching -- a
+            # classifier that puts 0.995 on one class has the same vanishing-gradient
+            # problem by a different route -- but it is **not** the same number as the
+            # one on the ledger, and `gradient/value` is not either (MSE against a
+            # 3-class cross-entropy). See `az_loss`.
             v = parts.value_pred
             keep["value_saturated_frac"] = (v.abs() > 0.99).float().mean() * scaled
             keep["value_mean"] = v.mean() * scaled
@@ -1141,7 +1172,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "game. Pass 65.2/mean_plies to reproduce the old per-game rule")
     p.add_argument("--fp8", action="store_true",
                    help="self-play the FFN in e4m3 (inference only; the gradient step "
-                        "is unchanged). ~1.15x encoder throughput for ~1 % prior error")
+                        "is unchanged). ~1.15x encoder throughput for ~1 %% prior error")
     p.add_argument("--int8", action="store_true",
                    help="self-play the FFN in int8 instead of e4m3. Same two matmuls, "
                         "inference only, and better on both axes: 1.016x e4m3's "
@@ -1217,8 +1248,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--optimizer", default=TrainConfig.optimizer,
                    choices=("sgd", "adamw", "muon"),
                    help="sgd is AGZ's; adamw is ablation 1")
+    p.add_argument("--aux-wd", type=float, default=None,
+                   help="weight decay for the AdamW matrices under muon -- the five "
+                        "embedding tables and the three readout heads. Defaults to "
+                        "--adam-wd, which is what every run before 2026-08-17 used and "
+                        "which decays value.weight, a single row of 256, as hard as a "
+                        "trunk matrix")
     p.add_argument("--adam-wd", type=float, default=TrainConfig.adam_wd,
                    help="AdamW's decoupled decay -- NOT --l2, see build_optimizer")
+    p.add_argument("--value-classes", type=int, default=TrainConfig.value_classes,
+                   choices=(1, 3),
+                   help="the value head's shape. 1 (default) is spec 7.4's scalar "
+                        "tanh trained on (z - v)^2, which every number on the ledger "
+                        "was measured with. 3 is a win/draw/loss classifier trained "
+                        "with a cross-entropy; it still gives the search a single "
+                        "scalar p(win) - p(loss), so only the loss and the packed head "
+                        "matrix change. WARNING: --value-weight is untuned for it.")
     p.add_argument("--value-weight", type=float, default=TrainConfig.value_weight,
                    help="weight on the value term against the policy term. 1.0 is "
                         "AlphaZero's; AlphaGateau's code uses optax.l2_loss = "
@@ -1321,6 +1366,7 @@ def config_from_args(args) -> TrainConfig:
         max_plies=args.max_plies, batch=args.batch, micro_batch=args.micro_batch,
         compile=args.compile, min_records=args.min_records,
         value_weight=args.value_weight,
+        value_classes=args.value_classes,
         total_steps=args.total_steps, euros_per_hour=args.euros_per_hour,
         buffer_dir=args.buffer_dir, seed=args.seed, impl=args.impl,
         encoder=args.encoder, deterministic=not args.nondeterministic,
@@ -1328,7 +1374,8 @@ def config_from_args(args) -> TrainConfig:
         keep_checkpoints=args.keep_checkpoints,
         puzzle_limit=args.puzzle_limit,
         buffer_snapshot_every=args.buffer_snapshot_every, audit_every=args.audit_every,
-        optimizer=args.optimizer, adam_wd=args.adam_wd, grad_clip=args.grad_clip,
+        optimizer=args.optimizer, adam_wd=args.adam_wd, aux_wd=args.aux_wd,
+        grad_clip=args.grad_clip,
         aux_lr=args.aux_lr, muon_head_group=args.head_group,
         muon_qkv_split=not args.no_qkv_split, normuon=args.normuon,
         muon_ns_scheme=args.ns_scheme,

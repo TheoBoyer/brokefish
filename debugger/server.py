@@ -38,7 +38,7 @@ from pydantic import BaseModel
 
 from brokefish.env import torch_impl as env
 from brokefish.env.interop import label_to_move, list_legal_moves, to_chess_board
-from brokefish.nn.model import BrokefishNet
+from brokefish.nn.model import BrokefishNet, net_for_state
 from brokefish.search import Search, SearchConfig, make_evaluator
 from brokefish.search.trace import (
     MOVE_BITS,
@@ -74,10 +74,13 @@ def load_net(path: Optional[str]) -> BrokefishNet:
     """
     key = path or ""
     if key not in _nets:
-        net = BrokefishNet().to(DEVICE).eval()
         if path:
             state = torch.load(path, map_location=DEVICE)
-            net.load_state_dict(state.get("model", state))
+            state = state.get("model", state)
+            net = net_for_state(state).to(DEVICE).eval()
+            net.load_state_dict(state)
+        else:
+            net = BrokefishNet().to(DEVICE).eval()
         for p in net.parameters():
             p.requires_grad_(False)
         _nets[key] = net

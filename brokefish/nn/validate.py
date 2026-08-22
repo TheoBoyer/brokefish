@@ -64,7 +64,7 @@ import torch
 
 from brokefish.env import torch_impl as env
 from brokefish.nn import available, encoder_impl, why_unavailable
-from brokefish.nn.model import BrokefishNet
+from brokefish.nn.model import BrokefishNet, net_for_state
 from brokefish.search.torch_impl import Search, SearchConfig
 
 # IEEE binary16. `MAX` is where an activation becomes `inf` -- fp16 has no
@@ -99,13 +99,13 @@ def load_net(path: Optional[str], device: str = "cuda") -> Tuple[BrokefishNet, s
     and the fused implementation are then built from this same rounded module, which
     is what makes the comparison below about arithmetic rather than about weights.
     """
-    net = BrokefishNet()
     if path is None:
-        return net.to(device).half().eval(), "random init (no checkpoint)"
+        return BrokefishNet().to(device).half().eval(), "random init (no checkpoint)"
     blob = torch.load(path, map_location="cpu", weights_only=False)
     state = blob
     if isinstance(blob, dict) and "net" in blob and isinstance(blob["net"], dict):
         state = blob["net"]          # a resumable checkpoint; a curve one is bare
+    net = net_for_state(state)
     net.load_state_dict(state)
     return net.to(device).half().eval(), path
 

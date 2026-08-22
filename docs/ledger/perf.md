@@ -1262,3 +1262,26 @@ Against Gate 1a's 56 996 that is **1.37x**. 90k was not reached on either path.
 ⚠️ The absolute numbers drift ~3 % with card temperature -- fp16 measured 64 682 here
 and 67 866 earlier the same day -- which is why only the ratios inside one interleaved
 run are comparable, and why the ledger records ratios.
+
+---
+
+## The win/draw/loss value head costs nothing, 2026-08-21
+
+`forward_full` at B = 4096 in the shipped int8 configuration (quant 3, two boards per
+CTA), **ABBA-interleaved**, 80 timings per arm, 8 launches per timing.
+
+| value head | ms / launch (median) | evals/s | vs scalar |
+|---|---:|---:|---:|
+| scalar, 1 column through `tanh` | 40.386 | 101 421 | 1.0000x |
+| win/draw/loss, 3 columns + softmax | 40.402 | 101 381 | **1.0004x** |
+
+**Predicted zero before measuring; measured +0.04 %, against a per-timing sd of 1.1 %.**
+The gap needs no explanation and that is the finding: the packed head matrix's aux tile
+is padded from 5 columns to 32 so it is a whole four-n-tile group, and warp 2 has been
+computing all 32 on every forward since B2 while five were read. The two extra value
+columns come out of the 27 that were zeros -- no extra `mma`, no extra shared memory,
+no extra register, and `gemm_direct` untouched. What is added is a 3-way softmax on one
+thread, once per board, inside an epilogue that is 0.3 % of the network.
+
+⚠️ Absolute numbers here are higher than the rows above because this is
+`forward_full` alone with no tree, not the MCTS loop. Only the ratio is a measurement.

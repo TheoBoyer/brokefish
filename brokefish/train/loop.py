@@ -297,6 +297,17 @@ class TrainConfig:
     # ⚠️ `value_weight` is **not** calibrated for the cross-entropy branch. See
     # `az_loss`.
     value_classes: int = 1
+    # ⚠️ **Where the value head reads from**, and therefore which frame it predicts in.
+    # `king` is spec §7.4's row select of the side-to-move king, predicting the mover's
+    # result. `pooled` is the masked mean of every live token of both colours,
+    # predicting White/draw/Black, which `heads` flips into the mover's frame before
+    # anything downstream sees it.
+    #
+    # ⚠️ The hypothesis: the policy head touches all 32 tokens and the king select
+    # touches one, so value gradient reaches the rest of the board only through that
+    # token's attention. It also lands in `config_hash`, so a resume across it is
+    # refused -- correct, since the two heads take different inputs.
+    value_head: str = "king"
     # `torch.compile` on the gradient step's forward. ~1.25x measured at batch 256;
     # see `Trainer.__init__` for why the dead-end entry in `CLAUDE.md` is about
     # something else. Off by default: it changes training numerics, so a compiled run
@@ -525,7 +536,8 @@ class Trainer:
                     f"not what was asked for")
 
         torch.manual_seed(cfg.seed)
-        self.net = BrokefishNet(n_value=cfg.value_classes).to(self.device)  # fp32 master, §8.2
+        self.net = BrokefishNet(n_value=cfg.value_classes,
+                                value_head=cfg.value_head).to(self.device)  # fp32, §8.2
         self.opt = build_optimizer(self.net, cfg)
         # ⚠️ `self.net` stays the **raw** module and only the call is compiled.
         # `PackedWeights.pack`, §12 check 9 and every checkpoint path read the module
@@ -829,6 +841,12 @@ class Trainer:
             v = parts.value_pred
             keep["value_saturated_frac"] = (v.abs() > 0.99).float().mean() * scaled
             keep["value_mean"] = v.mean() * scaled
+            # ⚠️ The pooled head's input is **not** unit-scale: `norm_f` normalises
+            # each token, the mean of normed vectors is not normed, and its magnitude
+            # moves with how aligned the tokens are and with how many pieces are alive.
+            # This is the cheap downstream proxy for that drift.
+            if parts.value_logit_rms is not None:
+                keep["value_logit_rms"] = parts.value_logit_rms * scaled
             parts_sum = keep if parts_sum is None else {
                 k: parts_sum[k] + keep[k] for k in keep}
 
@@ -1256,6 +1274,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "trunk matrix")
     p.add_argument("--adam-wd", type=float, default=TrainConfig.adam_wd,
                    help="AdamW's decoupled decay -- NOT --l2, see build_optimizer")
+    p.add_argument("--value-head", choices=("king", "pooled"),
+                   default=TrainConfig.value_head,
+                   help="where the value head reads. 'king' (default) is spec 7.4's "
+                        "row select of the side-to-move king, predicting the MOVER's "
+                        "result. 'pooled' is the masked mean over every live token of "
+                        "both colours, predicting WHITE's -- W/D/B -- which is flipped "
+                        "into the mover's frame inside the head. The pooled head sends "
+                        "value gradient into every token instead of one.")
     p.add_argument("--value-classes", type=int, default=TrainConfig.value_classes,
                    choices=(1, 3),
                    help="the value head's shape. 1 (default) is spec 7.4's scalar "
@@ -1367,6 +1393,7 @@ def config_from_args(args) -> TrainConfig:
         compile=args.compile, min_records=args.min_records,
         value_weight=args.value_weight,
         value_classes=args.value_classes,
+        value_head=args.value_head,
         total_steps=args.total_steps, euros_per_hour=args.euros_per_hour,
         buffer_dir=args.buffer_dir, seed=args.seed, impl=args.impl,
         encoder=args.encoder, deterministic=not args.nondeterministic,

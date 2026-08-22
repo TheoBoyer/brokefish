@@ -701,8 +701,9 @@ __device__ __noinline__ void tail_epilogue(half* bufA, half* bufB, half* scratch
                                            half* __restrict__ policy,
                                            half* __restrict__ promo,
                                            float* __restrict__ value, float eps,
-                                           int n_value, int board, int warp, int lane,
-                                           int tid) {
+                                           int n_value, int pooled,
+                                           const uint16_t* __restrict__ boards,
+                                           int board, int warp, int lane, int tid) {
     // Two independent reasons this norm is not optional. The stack is pre-norm,
     // so what falls out of it is a raw residual stream whose scale grows with
     // depth, in fp16, and a linear head on top of that is the classic pre-norm
@@ -758,18 +759,60 @@ __device__ __noinline__ void tail_epilogue(half* bufA, half* bufB, half* scratch
     // `expf` and not `__expf`: this is one thread, once per board, in an epilogue that
     // is 0.3 % of the network, so the fast intrinsic would buy nothing measurable and
     // spend accuracy against the torch oracle that `tests/test_b2.py` compares to.
+    //
+    // ⚠️ **`pooled` averages the head's own output over the live tokens, not a second
+    // GEMM on a pooled residual.** `norm_f` is upstream of the pool and the value head
+    // is biasless, so `W @ mean(hn) == mean(W @ hn)` exactly -- and the aux columns for
+    // all 32 tokens are already sitting in `scratch`, computed by warp 2 on every
+    // forward. So the pool is 32 reads by one thread in an epilogue that is 0.3 % of
+    // the network, and costs no mma, no SMEM and no register. In fp16 the two orders
+    // are different numbers, which is what `tests/test_b2.py`'s tolerance covers.
+    //
+    // ⚠️ **Dead slots are skipped.** A captured slot is `1 << 11` with colour, type and
+    // square wiped, so it decodes as a live white pawn on a1 (CLAUDE.md) and its head
+    // output is a real vector that means nothing. Averaging it in would make the value
+    // track how many pieces have been taken, by an accident of the encoding.
+    //
+    // ⚠️ **The pooled head predicts White's frame**, because nothing about a symmetric
+    // mean says whose turn it is. The mover's frame is one flip on the sign of the
+    // control word (spec §2.4: magnitude is the clock, so the sign never vanishes),
+    // and `search.cuh:1076` keeps consuming a mover-relative `[-1, 1]` either way.
     if (value && tid == 0) {
-        const half* row = scratch + (control[board] < 0 ? 31 : 15) * HDROW + VALUE_COL;
-        if (n_value == 1) {
-            value[board] = tanhf(__half2float(row[0]));
+        float a = 0.0f, b = 0.0f, c = 0.0f;
+        if (!pooled) {
+            const half* row = scratch + (control[board] < 0 ? 31 : 15) * HDROW + VALUE_COL;
+            a = __half2float(row[0]);                       // loss  (or the scalar)
+            if (n_value != 1) {
+                b = __half2float(row[1]);                   // draw
+                c = __half2float(row[2]);                   // win
+            }
         } else {
-            const float a = __half2float(row[0]);   // loss
-            const float b = __half2float(row[1]);   // draw
-            const float c = __half2float(row[2]);   // win
+            int live = 0;
+            for (int t = 0; t < T; ++t) {
+                if ((boards[(size_t)board * T + t] >> 11) & 1) continue;   // captured
+                const half* row = scratch + t * HDROW + VALUE_COL;
+                a += __half2float(row[0]);                  // Black  (or the scalar)
+                if (n_value != 1) {
+                    b += __half2float(row[1]);              // draw
+                    c += __half2float(row[2]);              // White
+                }
+                ++live;
+            }
+            // Two kings are never captured (spec §2.5), so `live >= 2`; the guard is
+            // for the debug paths that hand this a zeroed board.
+            const float inv = 1.0f / (float)(live > 0 ? live : 1);
+            a *= inv; b *= inv; c *= inv;
+        }
+        float v;
+        if (n_value == 1) {
+            v = tanhf(a);
+        } else {
             const float m = fmaxf(a, fmaxf(b, c));
             const float ea = expf(a - m), eb = expf(b - m), ec = expf(c - m);
-            value[board] = (ec - ea) / (ea + eb + ec);
+            v = (ec - ea) / (ea + eb + ec);
         }
+        if (pooled && control[board] < 0) v = -v;
+        value[board] = v;
     }
 }
 
@@ -932,7 +975,7 @@ __global__ __launch_bounds__(THREADS, TWOB ? 1 : 2) void encoder_kernel(
     const uint8_t* __restrict__ rep_ptr, const half* __restrict__ emb,
     const half* __restrict__ tail, half* __restrict__ policy,
     half* __restrict__ promo, float* __restrict__ value,
-    int n_layers, float eps, int debug_stage, int n_boards, int n_value) {
+    int n_layers, float eps, int debug_stage, int n_boards, int n_value, int pooled) {
     static_assert(!(FP8 && INT8), "the FFN is quantised once, in one format");
     static_assert(!QATT || INT8, "QKVO quantisation is int8 only; e4m3 was measured "
                                  "3x worse at that site before it was built");
@@ -1245,7 +1288,8 @@ __global__ __launch_bounds__(THREADS, TWOB ? 1 : 2) void encoder_kernel(
             if (bb < nb)
                 tail_epilogue(bufA + (size_t)bb * T * AROWA, bufB + (size_t)bb * T * AROW,
                               scratch + (size_t)bb * T * AROW, tail, control, policy,
-                              promo, value, eps, n_value, b0 + bb, warp, lane, tid);
+                              promo, value, eps, n_value, pooled, boards,
+                              b0 + bb, warp, lane, tid);
             __syncthreads();
         }
     }
@@ -1300,7 +1344,8 @@ void launch_one(int n_boards, size_t smem, half* y, const half* weights,
                 const uint8_t* wq8, const float* sq8, const int8_t* alive,
                 const uint16_t* boards, const int16_t* control, const uint8_t* rep,
                 const half* emb, const half* tail, half* policy, half* promo,
-                float* value, int n_layers, float eps, int debug_stage, int n_value) {
+                float* value, int n_layers, float eps, int debug_stage, int n_value,
+                int pooled) {
     constexpr bool Q8 = FP8 || INT8;
     constexpr int BPC = brokefish::Lay<TWOB>::BPC;
     const int grid = (n_boards + BPC - 1) / BPC;
@@ -1310,7 +1355,7 @@ void launch_one(int n_boards, size_t smem, half* y, const half* weights,
         <<<grid, brokefish::THREADS, smem>>>(
         y, weights, Q8 ? wq8 : nullptr, Q8 ? sq8 : nullptr, alive, boards, control,
         rep, emb, tail, policy, promo, value, n_layers, eps, debug_stage, n_boards,
-        n_value);
+        n_value, pooled);
 }
 
 // `quant`: 0 = fp16, 1 = e4m3, 2 = int8. ⚠️ An explicit mode rather than a property of
@@ -1323,7 +1368,8 @@ void launch(int n_boards, int quant, bool twob, half* y, const half* weights,
             const float* sq8, const int8_t* alive,
             const uint16_t* boards, const int16_t* control, const uint8_t* rep,
             const half* emb, const half* tail, half* policy, half* promo, float* value,
-            int n_layers, float eps, int debug_stage, int n_value = 1) {
+            int n_layers, float eps, int debug_stage, int n_value = 1,
+            int pooled = 0) {
     const size_t smem = twob ? brokefish::Lay<true>::BYTES : brokefish::Lay<false>::BYTES;
     const bool have_slab = (wq8 != nullptr) && (sq8 != nullptr);
     TORCH_CHECK(quant == 0 || have_slab,
@@ -1335,11 +1381,11 @@ void launch(int n_boards, int quant, bool twob, half* y, const half* weights,
 #define BROKEFISH_LAUNCH(F, I, W, P)                                                   \
     launch_one<F, I, W, P>(n_boards, smem, y, weights, wq8, sq8, alive, boards,        \
                            control, rep, emb, tail, policy, promo, value, n_layers,    \
-                           eps, debug_stage, n_value)
+                           eps, debug_stage, n_value, pooled)
 #define BROKEFISH_LAUNCH_Q(F, I, W, P, O)                                              \
     launch_one<F, I, W, P, true, O>(n_boards, smem, y, weights, wq8, sq8, alive,       \
                                     boards, control, rep, emb, tail, policy, promo,    \
-                                    value, n_layers, eps, debug_stage, n_value)
+                                    value, n_layers, eps, debug_stage, n_value, pooled)
     // quant 3 is quant 2 plus both attention matmuls, quant 4 is quant 2 plus QKV
     // alone. Both exist only at two boards per CTA, because that is the only occupancy
     // int8's s32 accumulators fit at and a one-board arm is a configuration nobody
@@ -1401,7 +1447,7 @@ void model_forward(torch::Tensor boards, torch::Tensor control, torch::Tensor re
                    torch::Tensor policy, torch::Tensor promo, torch::Tensor value,
                    torch::Tensor y, int64_t n_layers, double eps, int64_t debug_stage,
                    torch::Tensor wq8, torch::Tensor sq8, int64_t quant, int64_t twob,
-                   int64_t n_value) {
+                   int64_t n_value, int64_t pooled) {
     TORCH_CHECK(boards.is_cuda() && boards.scalar_type() == torch::kShort
                 && boards.is_contiguous() && boards.dim() == 2
                 && boards.size(1) == brokefish::T,
@@ -1484,7 +1530,7 @@ void model_forward(torch::Tensor boards, torch::Tensor control, torch::Tensor re
            ptr_or_null<const uint8_t>(rep), ptr_or_null<const half>(emb),
            ptr_or_null<const half>(tail), ptr_or_null<half>(policy),
            ptr_or_null<half>(promo), ptr_or_null<float>(value),
-           (int)n_layers, (float)eps, (int)debug_stage, (int)n_value);
+           (int)n_layers, (float)eps, (int)debug_stage, (int)n_value, (int)pooled);
 }
 
 // ---------------------------------------------------------------------------
@@ -1532,7 +1578,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("emb"), py::arg("tail"), py::arg("policy"), py::arg("promo"),
           py::arg("value"), py::arg("y"), py::arg("n_layers"), py::arg("eps"),
           py::arg("debug_stage"), py::arg("wq8"), py::arg("sq8"), py::arg("quant") = 0,
-          py::arg("twob") = 0, py::arg("n_value") = 1);
+          py::arg("twob") = 0, py::arg("n_value") = 1, py::arg("pooled") = 0);
     m.def("int8_q_max", []() {
         return std::pair<double, double>{(double)brokefish::int8q::kQMaxS,
                                          (double)brokefish::int8q::kQMaxU};

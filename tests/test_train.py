@@ -67,17 +67,22 @@ class ConstNet(torch.nn.Module):
     against this stub is testing the loss and not the collapse.
     """
 
-    def __init__(self, policy, promo, value):
+    def __init__(self, policy, promo, value, absolute=False):
         super().__init__()
         self.policy = torch.nn.Parameter(policy)
         self.promo = torch.nn.Parameter(promo)
         self.value = torch.nn.Parameter(value)
         self.n_value = 1 if value.ndim == 1 else value.shape[-1]
+        #: Mirrors `BrokefishNet.value_absolute`: the pooled head predicts White's
+        #: frame, so the loss has to flip the record's target into it.
+        self.value_absolute = absolute
 
     def forward(self, boards, control, rep, with_logits=False):
         from brokefish.nn.model import wdl_to_scalar
         raw = self.value if self.n_value > 1 else self.value.unsqueeze(-1)
         v = torch.tanh(raw).squeeze(-1) if self.n_value == 1 else wdl_to_scalar(raw)
+        if self.value_absolute:
+            v = torch.where(control > 0, v, -v)
         if with_logits:
             return self.policy, self.promo, v, raw
         return self.policy, self.promo, v
@@ -1381,3 +1386,100 @@ def test_value_classes_reaches_the_network_and_the_config_hash():
     assert cfg.value_classes == 1, "the default is the head every Elo number used"
     assert replace(cfg, value_classes=3).hash() != cfg.hash()
     assert BrokefishNet(n_value=3).value.weight.shape == (3, BrokefishNet().d_model)
+
+
+# --------------------------------------------------------------------------
+# The pooled White/draw/Black head, 2026-08-22. What changes in the loss is one thing
+# and it is the **frame**: the king select reads the mover's king and predicts the
+# mover's result, so `batch.value` is already its target; the pooled head predicts
+# White's, so the same record has to be flipped first.
+
+
+
+def both_colours(batch):
+    """⚠️ `make_batch` walks an **even** number of random plies, so every position it
+    produces has **White to move** — the same fact `eval/match.py`'s lockstep rests on.
+    A frame test on that fixture is vacuous, because the flip is the identity. Negating
+    half the control words gives the null-move position, which is all these tests need.
+    """
+    out = batch.slice(0, len(batch))
+    ctl = out.control.clone()
+    ctl[::2] = -ctl[::2]
+    out.control = ctl
+    assert bool((ctl > 0).any()) and bool((ctl < 0).any())
+    return out
+
+
+def test_the_absolute_head_trains_on_whites_frame():
+    """⚠️ Getting this backwards is not a crash. It trains a head that is exactly
+    right on the positions where White is to move and exactly wrong on the others,
+    which shows up as a head that learns nothing rather than as a bug — so it is
+    pinned against a hand-written transcription rather than trusted.
+    """
+    batch, _, _ = make_batch(24, seed=21)
+    batch = both_colours(batch)
+    n = len(batch)
+    torch.manual_seed(0)
+    logits = torch.randn(n, 3, device=DEVICE)
+    net = ConstNet(torch.randn(n, 32, 64, device=DEVICE),
+                   torch.randn(n, 32, 4, device=DEVICE), logits, absolute=True)
+    parts = az_loss(net, batch)
+
+    ref = 0.0
+    for i in range(n):
+        z = float(batch.value[i])                       # the mover's frame
+        white_to_move = int(batch.control[i]) > 0
+        z_white = z if white_to_move else -z             # White's frame
+        row = [float(x) for x in logits[i].double()]
+        top = max(row)
+        lse = top + math.log(sum(math.exp(x - top) for x in row))
+        ref += lse - row[int(z_white) + 1]
+    ref /= n
+    assert float(parts.value) == pytest.approx(ref, rel=1e-5, abs=1e-6)
+
+    # The same logits scored in the mover's frame are a *different* number, or the
+    # test would pass whether or not the flip happened.
+    flat = ConstNet(net.policy.detach(), net.promo.detach(), logits, absolute=False)
+    assert abs(float(az_loss(flat, batch).value) - ref) > 1e-3
+
+
+def test_the_absolute_head_still_reports_a_mover_relative_prediction():
+    """`value_pred` feeds `value_mean` and `value_saturated_frac`, and it is what the
+    search would consume, so it stays in the mover's frame on both heads."""
+    batch, _, _ = make_batch(16, seed=22)
+    batch = both_colours(batch)
+    n = len(batch)
+    logits = torch.zeros(n, 3, device=DEVICE)
+    logits[:, 2] = 20.0                                  # White wins, certainly
+    net = ConstNet(torch.randn(n, 32, 64, device=DEVICE),
+                   torch.randn(n, 32, 4, device=DEVICE), logits, absolute=True)
+    v = az_loss(net, batch).value_pred
+    want = torch.where(batch.control > 0, 1.0, -1.0)
+    assert torch.allclose(v, want, atol=1e-5)
+
+
+def test_the_absolute_scalar_head_measures_its_error_in_its_own_frame():
+    """The `n_value == 1` branch has the same frame problem and the same fix."""
+    batch, _, _ = make_batch(16, seed=23)
+    batch = both_colours(batch)
+    n = len(batch)
+    torch.manual_seed(1)
+    raw = torch.randn(n, device=DEVICE)
+    net = ConstNet(torch.randn(n, 32, 64, device=DEVICE),
+                   torch.randn(n, 32, 4, device=DEVICE), raw, absolute=True)
+    s = torch.where(batch.control > 0, 1.0, -1.0)
+    want = ((batch.value * s - torch.tanh(raw)) ** 2).mean()
+    assert float(az_loss(net, batch).value) == pytest.approx(float(want), rel=1e-6)
+
+
+def test_value_head_reaches_the_network_and_the_config_hash():
+    from dataclasses import replace
+
+    from brokefish.train.loop import TrainConfig
+
+    cfg = TrainConfig()
+    assert cfg.value_head == "king", "the default is the head every Elo number used"
+    assert replace(cfg, value_head="pooled").hash() != cfg.hash()
+    net = BrokefishNet(n_value=3, value_head="pooled")
+    assert net.value_absolute and "value_mode" in net.state_dict()
+    assert not BrokefishNet(n_value=3).value_absolute

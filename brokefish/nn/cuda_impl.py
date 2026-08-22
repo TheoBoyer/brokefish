@@ -139,6 +139,10 @@ class FusedEncoder:
     # backbone-only construction never has a value head at all, and an attribute that
     # exists in one arm and not the other is the shape of CLAUDE.md's third trap.
     n_value = 1
+    #: 1 when the value head is the masked mean over live tokens (and therefore
+    #: predicts White's frame), 0 for spec §7.4's king row select. Same lifetime and
+    #: same reason as `n_value`.
+    value_pooled = 0
     EMB_TABLES = ("emb_square", "emb_type_special", "emb_color_turn",
                   "emb_clock", "emb_rep")
 
@@ -375,6 +379,7 @@ class FusedEncoder:
         # 1 row for the scalar tanh head, 3 for win/draw/loss. The rest of the aux
         # tile stays zero, as it already was for 27 of its 32 columns.
         self.n_value = int(net.value.weight.shape[0])
+        self.value_pooled = int(getattr(net, "value_head", "king") == "pooled")
         head[self.VALUE_ROW:self.VALUE_ROW + self.n_value] = net.value.weight.detach().half()
         self.tail = torch.cat([
             net.norm_f.weight.detach().reshape(-1).half().cuda(),
@@ -456,7 +461,7 @@ class FusedEncoder:
             self.weights, self.emb, self.tail,
             self.policy_out, self.promo_out, self.value_out, self._empty_h,
             self.n_layers, self.eps, 0, self._wq8, self._sq8, self.quant,
-            int(self.two_boards), self.n_value)
+            int(self.two_boards), self.n_value, self.value_pooled)
         return self.policy_out, self.promo_out, self.value_out
 
     def forward_stage(self, boards, control, rep, stage: int):

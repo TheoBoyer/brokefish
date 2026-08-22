@@ -80,6 +80,14 @@ number on the ledger was produced by.
 
 $$l_v = -\log \hat{p}(\text{class}(z)), \qquad \text{class}(z) = z + 1$$
 
+⚠️ **With `--value-head pooled` the target is `z` in *White's* frame**, i.e.
+`z · sign(control)`, because the pooled head predicts White/draw/Black rather than the
+mover's result (`spec.md` §7.4). Getting that backwards does not crash: it trains a
+head that is exactly right where White is to move and exactly wrong everywhere else,
+which reads as a head that learns nothing rather than as a bug. `az_loss` takes the
+frame from the network's own `value_absolute`, and `tests/test_train.py` pins it
+against a hand transcription in double.
+
 Why it is worth a run. The value head is the one part of this network that has not
 been observed to train: across four 12-hour runs the held-out value-puzzle probe moved
 `0.3530 -> 0.3480` (×0.99) while the policy probe moved ×4.8, and that was independent

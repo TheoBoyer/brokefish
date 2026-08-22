@@ -29,6 +29,8 @@ is independence between the three heads' biases, not expressiveness.
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 from torch import nn
 
@@ -52,6 +54,22 @@ N_POLICY, N_PROMO = 64, 4
 #: index of a stored outcome ``z in {-1, 0, +1}`` is ``z + 1``.
 N_VALUE_SCALAR, N_VALUE_WDL = 1, 3
 VALUE_CLASSES = (N_VALUE_SCALAR, N_VALUE_WDL)
+
+#: Where the value head reads from, and therefore which frame it predicts in.
+#:
+#: ``"king"`` is spec §7.4's original: a **row select** of the side-to-move king's
+#: token, slot 15 or 31, predicting from the **mover's** point of view.
+#:
+#: ``"pooled"`` is the masked mean of *every live token, both colours*, predicting in
+#: an **absolute** frame -- White / draw / Black -- which the collapse then flips into
+#: the mover's by the sign of the control word.
+#:
+#: ⚠️ The hypothesis it exists to test (2026-08-22): the policy head is applied to all
+#: 32 tokens, so every token takes policy gradient directly, while the king select
+#: sends value gradient into *one* token and everything else is reached only through
+#: that token's attention. A bottleneck, not a disconnection -- 8 non-causal layers do
+#: carry it -- but a bottleneck the pooled head removes.
+VALUE_HEADS = ("king", "pooled")
 
 
 def wdl_to_scalar(logits: torch.Tensor) -> torch.Tensor:
@@ -90,9 +108,19 @@ def n_value_of(state: dict) -> int:
     return int(w.shape[0])
 
 
+def value_head_of(state: dict) -> str:
+    """``"pooled"`` if the state_dict carries the marker, ``"king"`` otherwise.
+
+    ⚠️ Absence is the legacy answer, not an error: every checkpoint written before
+    2026-08-22 predates the marker and is a king select.
+    """
+    return "pooled" if "value_mode" in state else "king"
+
+
 def net_for_state(state: dict, **kw) -> "BrokefishNet":
     """An empty net shaped to hold ``state``. Load into it; do not skip the load."""
-    return BrokefishNet(n_value=n_value_of(state), **kw)
+    return BrokefishNet(n_value=n_value_of(state),
+                        value_head=value_head_of(state), **kw)
 
 
 def decode_boards(boards: torch.Tensor):
@@ -122,13 +150,17 @@ class BrokefishNet(nn.Module):
 
     def __init__(self, d_model: int = D_MODEL, n_layers: int = N_LAYERS,
                  n_heads: int = N_HEADS, d_ff: int = D_FF, eps: float = 1e-5,
-                 n_value: int = N_VALUE_SCALAR):
+                 n_value: int = N_VALUE_SCALAR, value_head: str = "king"):
         super().__init__()
         if n_value not in VALUE_CLASSES:
             raise ValueError(f"n_value must be one of {VALUE_CLASSES} "
                              f"(1 = the scalar tanh head, 3 = win/draw/loss), "
                              f"got {n_value}")
+        if value_head not in VALUE_HEADS:
+            raise ValueError(f"value_head must be one of {VALUE_HEADS}, got "
+                             f"{value_head!r}")
         self.d_model, self.n_layers, self.n_value = d_model, n_layers, n_value
+        self.value_head = value_head
 
         self.emb_square = nn.Embedding(N_SQUARE, d_model)
         self.emb_type_special = nn.Embedding(N_TYPE_SPECIAL, d_model)
@@ -155,6 +187,16 @@ class BrokefishNet(nn.Module):
         # muP treats embeddings and readouts differently and that is a training
         # decision (C2), not a forward-pass one; the forward barely cares, since
         # the first thing downstream of the sum is a LayerNorm.
+        # ⚠️ **Registered only in the pooled case, and that is deliberate.**
+        # `n_value` alone no longer identifies the head -- a `[3, 256]` weight is
+        # win/draw/loss-from-the-king *or* White/draw/Black-from-the-pool. A marker in
+        # the state_dict is the only thing that can tell them apart, and adding it
+        # unconditionally would give every legacy checkpoint a missing key under
+        # `strict=True`. Present means pooled; absent means king, which is what every
+        # file written before 2026-08-22 is.
+        if value_head == "pooled":
+            self.register_buffer("value_mode", torch.tensor(1, dtype=torch.int64))
+
         std = d_model ** -0.5
         for mod in (self.emb_square, self.emb_type_special, self.emb_color_turn,
                     self.emb_clock, self.emb_rep,
@@ -195,7 +237,17 @@ class BrokefishNet(nn.Module):
 
     # -- stage 3 -----------------------------------------------------------
 
+    @property
+    def value_absolute(self) -> bool:
+        """Whether the head predicts in White's frame rather than the mover's.
+
+        The loss needs this to put its target in the same frame; nothing else does,
+        because :meth:`heads` flips before returning.
+        """
+        return self.value_head == "pooled"
+
     def heads(self, h: torch.Tensor, control: torch.Tensor,
+              alive: Optional[torch.Tensor] = None,
               with_logits: bool = False):
         """``[N, 32, d]`` normed tokens to (policy_logits, promo, value).
 
@@ -218,14 +270,36 @@ class BrokefishNet(nn.Module):
         move -- a promoted queen keeps its pawn slot, so a slot in 0-7 does not
         imply a pawn.
         """
-        king = torch.where(control < 0, KING_SLOT_BLACK, KING_SLOT_WHITE).long()
-        hk = h[torch.arange(h.shape[0], device=h.device), king]
+        if self.value_head == "pooled":
+            if alive is None:
+                raise ValueError(
+                    "the pooled value head needs the live-slot mask: a captured slot "
+                    "decodes as a live white pawn on a1 (CLAUDE.md), so an unmasked "
+                    "mean would average 32 real vectors of which only some mean "
+                    "anything, and the dead ones would track material lost")
+            # ⚠️ **`norm_f` is upstream of this pool**, so the vectors being averaged
+            # are already per-token normed and the only thing after the pool is a
+            # biasless linear. `W @ mean(hn) == mean(W @ hn)` exactly, which is why
+            # the CUDA epilogue may average the *logits* of the 32 tokens it already
+            # computes instead of re-doing a GEMM on a pooled vector. In fp16 the two
+            # orders are different numbers, which is what `VALUE_TOL` is for.
+            m = alive.unsqueeze(-1).to(h.dtype)
+            hv = (h * m).sum(1) / m.sum(1).clamp(min=1)
+        else:
+            king = torch.where(control < 0, KING_SLOT_BLACK, KING_SLOT_WHITE).long()
+            hv = h[torch.arange(h.shape[0], device=h.device), king]
         # ⚠️ The scalar branch is written so that `n_value == 1` is the *same*
         # sequence of ops it always was -- one `.float()`, one `tanh`, one squeeze --
         # because every Elo number on the ledger was produced by it and a reordering
         # in fp16 is a different number (`docs/ledger/perf.md`).
-        raw = self.value(hk).float()
+        raw = self.value(hv).float()
         value = torch.tanh(raw).squeeze(-1) if self.n_value == 1 else wdl_to_scalar(raw)
+        # The pooled head has no notion of whose turn it is baked into *which token it
+        # read*, so it predicts White's frame; the mover's is one deterministic flip
+        # away and nothing downstream has to learn it. `control > 0` is White to move
+        # (spec §2.4: the magnitude is the clock, never 0).
+        if self.value_absolute:
+            value = torch.where(control > 0, value, -value)
         if with_logits:
             return self.policy(h), self.promo(h), value, raw
         return self.policy(h), self.promo(h), value
@@ -243,7 +317,7 @@ class BrokefishNet(nn.Module):
         """
         x, alive = self.embed(boards, control, rep)
         h = self.encoder(x, src_key_padding_mask=~alive)
-        return self.heads(self.norm_f(h), control, with_logits=with_logits)
+        return self.heads(self.norm_f(h), control, alive=alive, with_logits=with_logits)
 
 
 def full_forward_via_backbone(net: BrokefishNet, backbone, boards, control, rep,
@@ -259,4 +333,4 @@ def full_forward_via_backbone(net: BrokefishNet, backbone, boards, control, rep,
     """
     x, alive = net.embed(boards, control, rep)
     h = backbone(x, alive)
-    return net.heads(net.norm_f(h), control, with_logits=with_logits)
+    return net.heads(net.norm_f(h), control, alive=alive, with_logits=with_logits)

@@ -417,7 +417,7 @@ Three heads, all **biasless**, applied to all 32 normed tokens:
 |---|---|---|
 | `W_p` | `[256, 64]` | policy logits, in exact correspondence with the engine's 32 mask words |
 | `W_promo` | `[256, 4]` | promotion logits per token, softmax over (N, B, R, Q) |
-| `W_value` | `[256, 1]` or `[256, 3]` | read at the side-to-move king's token, slot 15 or 31; see below |
+| `W_value` | `[256, 1]` or `[256, 3]` | read at one token or pooled over all live tokens; see below |
 
 **The value head has two shapes and one output.** `[256, 1]` is the original and the
 default: one logit through `tanh`, trained against the outcome with a squared error.
@@ -434,12 +434,37 @@ whole Elo pipeline consume one scalar and cannot tell which head produced it. A
 draw-aware search — a separate draw term in the utility, as KataGo has — would be a
 **different** change, to the search and not to the head.
 
+**The value head has two inputs and two frames.** `king` is the original: a row
+select of the side-to-move king's token, slot 15 or 31, which spec §2.5 guarantees is
+never captured, predicting from the **mover's** point of view. `pooled` is the
+**masked mean of every live token, both colours**, predicting in an **absolute**
+frame — White / draw / Black, so `z + 1` is the class index of the outcome *from
+White's side* — which the head then flips into the mover's by the sign of the control
+word. Selected by `--value-head pooled` (added 2026-08-22).
+
+⚠️ **Dead slots are excluded from the mean.** A captured slot is `1 << 11` with
+colour, type and square wiped, so §2.1's warning applies: it decodes as a live white
+pawn on a1 and its head output is a real vector that means nothing. Averaging it in
+would make the value track how many pieces have been taken, by an accident of the
+encoding.
+
+⚠️ **Pooling after the head equals pooling before it.** `norm_f` is per token and sits
+upstream of the pool, and the heads are biasless, so `W @ mean(hn) = mean(W @ hn)`
+exactly. An implementation may average the 32 per-token value logits it has already
+computed instead of running a second GEMM on a pooled vector, and `csrc/encoder.cu`
+does. In fp16 the two orders are different numbers, which is what the tolerance in
+`tests/test_b2.py` is for — measured, the pooled path is *tighter* than the row select
+(9.4e-4 against 3.9e-3), because averaging 32 logits cancels rounding.
+
 ⚠️ **A checkpoint does not say which head it has.** Checkpoints are bare
 `state_dict`s with the architecture in the constructor, so the width is recovered
-from `value.weight.shape[0]` (`nn/model.py:n_value_of`). Every loader in the
-repository goes through it, which is the only reason a scalar-head checkpoint —
-`checkpoints/anchor.pt` among them, and every Elo scale anchors to that one — can
-still be rated against a classifier-head one in a single Bradley-Terry fit.
+from `value.weight.shape[0]` (`nn/model.py:n_value_of`) and the *input* from the
+presence of a `value_mode` buffer (`value_head_of`), which is registered only in the
+pooled case so that every file written before it still loads under `strict=True`.
+Every loader in the repository goes through them, which is the only reason a
+scalar-head checkpoint — `checkpoints/anchor.pt` among them, and every Elo scale
+anchors to that one — can still be rated against a classifier-head one in a single
+Bradley-Terry fit.
 
 `norm_f` keeps its affine, so `beta` is a learned 256-vector every head sees and
 each head's effective bias is `W_h @ beta` — any vector in that head's output

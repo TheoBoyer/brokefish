@@ -58,6 +58,8 @@ from the label. :func:`is_promotion_edge` is that decision and it needs no moveg
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 
@@ -111,6 +113,13 @@ class LossParts:
     #: two** -- an MSE against z in {-1, 0, 1} starts near 1.0 and a 3-class CE starts
     #: at ln 3 = 1.0986, and they are different quantities that happen to look alike.
     n_value: int = 1
+    #: RMS of the raw value logits. ⚠️ It is here because the **pooled** head's input
+    #: is not unit-scale: `norm_f` normalises each token, but the mean of several
+    #: normed vectors is not normed, and its magnitude moves with how aligned the
+    #: tokens are and with **how many pieces are alive**. So the head's input shrinks
+    #: and drifts across a game in a way a single king token never did. This is the
+    #: cheap proxy for that drift; it is not the pooled vector's own norm.
+    value_logit_rms: Optional[torch.Tensor] = None
 
 
 def decode_labels(policy_move: torch.Tensor):
@@ -206,6 +215,14 @@ def az_loss(net, batch: TrainBatch, strict: bool = True,
     policy_logits, promo_logits, value_pred, value_logits = net(
         batch.board, batch.control, batch.rep, with_logits=True)
     n_value = value_logits.shape[-1]
+    # ⚠️ **Which frame the head predicts in decides what the target is.** The king
+    # select reads the *mover's* king and predicts the mover's result, so `batch.value`
+    # is already in its frame. The pooled head reads every token symmetrically and
+    # predicts White's, so the same record has to be flipped into White's frame before
+    # it can be a target. Getting this backwards trains a head that is exactly wrong on
+    # half the positions and right on the other half, which looks like a head that
+    # learns nothing rather than like a bug.
+    absolute = bool(getattr(net, "value_absolute", False))
 
     # The loss is computed outside autocast on purpose (§8.2): it is a reduction
     # over <= K_POLICY logits and one position, so bf16 saves nothing measurable and
@@ -235,16 +252,23 @@ def az_loss(net, batch: TrainBatch, strict: bool = True,
         policy_loss = -(pi * logp).sum(-1).mean()
         entropy = -(pi * pi.clamp(min=torch.finfo(torch.float32).tiny).log()).sum(-1).mean()
         v = value_pred.float()
+        # `+1` where White is to move, `-1` where Black is (spec §2.4: the control
+        # word's magnitude is the clock, so it is never 0 and the sign never vanishes).
+        flip = torch.where(batch.control > 0, 1.0, -1.0) if absolute else None
         if n_value == 1:
-            value_loss = value_weight * ((batch.value - v) ** 2).mean()
+            # `v * flip` un-does `heads`' flip, i.e. it is the head's own output again.
+            tgt = batch.value if flip is None else batch.value * flip
+            pred = v if flip is None else v * flip
+            value_loss = value_weight * ((tgt - pred) ** 2).mean()
         else:
             # ⚠️ `batch.value` is exactly {-1, 0, +1} by construction -- `buffer.py:253`
             # writes `-result * s_rec * s_end` and every factor is a sign -- so `+1` is
             # an exact class index and not a rounding. `round()` is here so that a
             # future bootstrapped target fails the check below rather than silently
             # truncating toward a class it does not mean.
-            cls = (batch.value + 1.0).round()
-            if not bool(((cls - (batch.value + 1.0)).abs() < 1e-6).all()):
+            z = batch.value if flip is None else batch.value * flip
+            cls = (z + 1.0).round()
+            if not bool(((cls - (z + 1.0)).abs() < 1e-6).all()):
                 raise AssertionError(
                     "a value target is not in {-1, 0, +1}, so it has no class index. "
                     "The win/draw/loss head is trained on the game outcome (§4); a "
@@ -255,7 +279,8 @@ def az_loss(net, batch: TrainBatch, strict: bool = True,
 
     return LossParts(total=policy_loss + value_loss, policy=policy_loss,
                      value=value_loss, entropy=entropy, kl=policy_loss - entropy,
-                     value_pred=v.detach(), n_value=n_value)
+                     value_pred=v.detach(), n_value=n_value,
+                     value_logit_rms=value_logits.detach().float().pow(2).mean().sqrt())
 
 
 def _check(batch: TrainBatch, valid: torch.Tensor, logit: torch.Tensor) -> None:

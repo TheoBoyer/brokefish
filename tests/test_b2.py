@@ -495,3 +495,121 @@ def test_a_scalar_head_checkpoint_still_loads_after_the_option_exists():
     # And the two are not silently interchangeable.
     with pytest.raises(RuntimeError):
         BrokefishNet().load_state_dict(ns)
+
+
+# --------------------------------------------------------------------------
+# The pooled White/draw/Black value head, 2026-08-22. `--value-head pooled` replaces
+# spec §7.4's row select of the side-to-move king with the masked mean of every live
+# token, both colours, and predicts in White's frame instead of the mover's.
+#
+# It is free for the same reason the WDL head was: `norm_f` is upstream of the pool
+# and the head is biasless, so `W @ mean(hn) == mean(W @ hn)`, and the aux columns for
+# all 32 tokens are already in `scratch`. The epilogue averages instead of selecting.
+
+_POOL_CACHE: dict = {}
+
+
+def build_pooled(impl: str, n_value: int = 3, seed: int = 0):
+    if (impl, n_value, seed) not in _POOL_CACHE:
+        torch.manual_seed(seed)
+        net = BrokefishNet(n_value=n_value, value_head="pooled").cuda().half().eval()
+        _POOL_CACHE[(impl, n_value, seed)] = (net, encoder_impl(impl)(net))
+    return _POOL_CACHE[(impl, n_value, seed)]
+
+
+@for_each_impl
+def test_the_pooled_epilogue_agrees_with_torch(impl):
+    net, fused = build_pooled(impl)
+    boards, control, rep = positions()
+    with torch.no_grad():
+        want = net(boards, control, rep)[2]
+    got = fused.forward_full(boards, control, rep)[2]
+    d = (got.float() - want.float()).abs().max().item()
+    assert d < VALUE_TOL, f"max|diff| {d:.3e}"
+    assert got.std().item() > 0.05, f"the value collapsed to {got.mean():.4f}"
+
+
+@for_each_impl
+def test_the_pool_skips_captured_slots(impl):
+    """⚠️ A captured slot is `1 << 11` with colour, type and square wiped, so it
+    decodes as **a live white pawn on a1** and its head output is a real vector that
+    means nothing. Averaging it in would make the value track how many pieces have been
+    taken, by an accident of the encoding.
+
+    Driven by capturing a slot and demanding the kernel's value follow the mean over
+    the *remaining* tokens, computed by hand from the normed stream.
+    """
+    net, fused = build_pooled(impl)
+    if not hasattr(fused, "forward_stage"):
+        return
+    boards, control, rep = positions(n=64)
+    boards = boards.clone()
+    live0 = ((boards >> 11) & 1 == 0).sum(-1)
+    # Capture a slot that is currently alive and is not a king (slots 15 and 31 are
+    # guaranteed never captured by spec §2.5, and the pool would still be well defined,
+    # but killing a king is not a position the engine can produce).
+    for row in range(boards.shape[0]):
+        for slot in range(32):
+            if slot in (15, 31):
+                continue
+            if not ((int(boards[row, slot]) >> 11) & 1):
+                boards[row, slot] = 1 << 11
+                break
+    live1 = ((boards >> 11) & 1 == 0).sum(-1)
+    assert bool((live1 < live0).all()), "the fixture failed to capture anything"
+
+    h = fused.forward_stage(boards, control, rep, 8)
+    alive = ((boards >> 11) & 1) == 0
+    with torch.no_grad():
+        m = alive.unsqueeze(-1).to(h.dtype)
+        pooled = (h * m).sum(1) / m.sum(1)
+        raw = net.value(pooled).float()
+        p = torch.softmax(raw, dim=-1)
+        want = (p[:, 2] - p[:, 0]) * torch.where(control > 0, 1.0, -1.0)
+    got = fused.forward_full(boards, control, rep)[2]
+    d = (got.float() - want).abs().max().item()
+    assert d < VALUE_TOL, f"max|diff| {d:.3e} — the pool is not masking dead slots"
+
+
+@for_each_impl
+def test_the_pooled_head_predicts_whites_frame(impl):
+    """The head is absolute and the flip is deterministic: what leaves it must be
+    `sign(control) * (p(White) - p(Black))`. Checked on the *torch* side, because it is
+    the definition the kernel is then held to by the test above."""
+    net, _ = build_pooled(impl)
+    boards, control, rep = positions(n=128)
+    # ⚠️ `random_openings` walks an **even** number of plies, so every position it
+    # produces has White to move — the same fact `eval/match.py`'s lockstep rests on.
+    # Half the batch is flipped to Black by negating the control word, which is the
+    # null-move position and is all this invariant needs.
+    control = control.clone()
+    control[::2] = -control[::2]
+    with torch.no_grad():
+        _, _, v, raw = net(boards, control, rep, with_logits=True)
+    p = torch.softmax(raw, dim=-1)
+    want = (p[:, 2] - p[:, 0]) * torch.where(control > 0, 1.0, -1.0)
+    assert torch.allclose(v, want, atol=1e-6)
+    assert bool((control > 0).any()) and bool((control < 0).any())
+
+
+def test_a_king_head_checkpoint_still_loads_after_the_pool_exists():
+    """⚠️ `n_value` alone no longer identifies the head — `[3, 256]` is win/draw/loss
+    from the king *or* White/draw/Black from the pool. The marker is a buffer that
+    exists only in the pooled case, so every legacy `state_dict` still loads strict."""
+    from brokefish.nn.model import net_for_state, value_head_of
+
+    torch.manual_seed(5)
+    for kw, want in ((dict(), "king"), (dict(n_value=3), "king"),
+                     (dict(n_value=3, value_head="pooled"), "pooled")):
+        net = BrokefishNet(**kw)
+        state = {k: v.clone() for k, v in net.state_dict().items()}
+        assert value_head_of(state) == want
+        assert ("value_mode" in state) == (want == "pooled")
+        got = net_for_state(state)
+        got.load_state_dict(state)          # strict: a wrong shape raises here
+        assert got.value_head == want and got.n_value == net.n_value
+
+    # And the two [3, 256] heads are not silently interchangeable.
+    pooled = BrokefishNet(n_value=3, value_head="pooled").state_dict()
+    with pytest.raises(RuntimeError):
+        BrokefishNet(n_value=3).load_state_dict(pooled)

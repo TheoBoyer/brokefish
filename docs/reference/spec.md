@@ -434,13 +434,31 @@ whole Elo pipeline consume one scalar and cannot tell which head produced it. A
 draw-aware search — a separate draw term in the utility, as KataGo has — would be a
 **different** change, to the search and not to the head.
 
-**The value head has two inputs and two frames.** `king` is the original: a row
+**The value head has three inputs and two frames.** `king` is the original: a row
 select of the side-to-move king's token, slot 15 or 31, which spec §2.5 guarantees is
 never captured, predicting from the **mover's** point of view. `pooled` is the
 **masked mean of every live token, both colours**, predicting in an **absolute**
 frame — White / draw / Black, so `z + 1` is the class index of the outcome *from
 White's side* — which the head then flips into the mover's by the sign of the control
-word. Selected by `--value-head pooled` (added 2026-08-22).
+word. Selected by `--value-head pooled` (added 2026-08-22). `prenorm` pools the **raw**
+residual stream and applies `norm_f` to the pooled vector rather than pooling vectors
+`norm_f` has already normalised; same absolute frame, same flip
+(`--value-head prenorm`, added 2026-08-23).
+
+⚠️ **`prenorm` exists because a mean of normed vectors is not normed.** Measured on
+`t12h-wdb`, `|mean(LN(h))|` drifts **15.47 → 10.86** across a 12 h run as the token
+cloud spreads, `|value.weight|` grows **+42 %** compensating, and
+`value_saturated_frac` reaches 0.111 — a readout chasing an input whose scale moves.
+`LN(mean(h))` has its scale set by the norm and cannot drift. Pooling before the norm
+also lets a token with a larger residual contribute more, which an unweighted mean of
+normed tokens cannot express.
+
+⚠️ **`prenorm` is the one head that is not free.** `LN(mean(h))` is not a linear
+function of the per-token value logits, so an implementation cannot average columns it
+already has: `csrc/encoder.cu` pools `bufA`, norms it once and takes three dot products
+against an unpacked copy of the value rows kept at `TailOff::w_val`. Measured
+ABBA-interleaved at B = 4096: **+0.49 %** against the king select, which is *less* than
+the pooled head's +0.80 %.
 
 ⚠️ **Dead slots are excluded from the mean.** A captured slot is `1 << 11` with
 colour, type and square wiped, so §2.1's warning applies: it decodes as a live white

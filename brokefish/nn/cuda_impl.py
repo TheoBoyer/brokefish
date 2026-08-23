@@ -139,10 +139,11 @@ class FusedEncoder:
     # backbone-only construction never has a value head at all, and an attribute that
     # exists in one arm and not the other is the shape of CLAUDE.md's third trap.
     n_value = 1
-    #: 1 when the value head is the masked mean over live tokens (and therefore
-    #: predicts White's frame), 0 for spec §7.4's king row select. Same lifetime and
-    #: same reason as `n_value`.
-    value_pooled = 0
+    #: 0 = spec §7.4's king row select, 1 = the mean of the *normed* tokens,
+    #: 2 = `norm_f` applied to the mean of the *raw* residual. 1 and 2 predict White's
+    #: frame and are flipped in the epilogue. Same lifetime and reason as `n_value`.
+    VMODE = {"king": 0, "pooled": 1, "prenorm": 2}
+    vmode = 0
     EMB_TABLES = ("emb_square", "emb_type_special", "emb_color_turn",
                   "emb_clock", "emb_rep")
 
@@ -379,12 +380,19 @@ class FusedEncoder:
         # 1 row for the scalar tanh head, 3 for win/draw/loss. The rest of the aux
         # tile stays zero, as it already was for 27 of its 32 columns.
         self.n_value = int(net.value.weight.shape[0])
-        self.value_pooled = int(getattr(net, "value_head", "king") == "pooled")
+        self.vmode = self.VMODE[getattr(net, "value_head", "king")]
         head[self.VALUE_ROW:self.VALUE_ROW + self.n_value] = net.value.weight.detach().half()
+        # ⚠️ An **unpacked** copy of the value rows rides at the end, padded to
+        # `N_VALUE_MAX`. `pack_b` puts the head in `gemm_direct`'s fragment order, which
+        # the prenorm epilogue cannot dot against; it needs three plain row-major
+        # vectors. 1.5 KB, and `TailOff::stride` in `csrc/encoder.cu` must agree.
+        val = torch.zeros(3, self.D, dtype=torch.half, device="cuda")
+        val[:self.n_value] = net.value.weight.detach().half()
         self.tail = torch.cat([
             net.norm_f.weight.detach().reshape(-1).half().cuda(),
             net.norm_f.bias.detach().reshape(-1).half().cuda(),
             pack_b(head),
+            val.reshape(-1),
         ]).contiguous().cuda()
 
     def _require_net(self, what: str) -> BrokefishNet:
@@ -461,7 +469,7 @@ class FusedEncoder:
             self.weights, self.emb, self.tail,
             self.policy_out, self.promo_out, self.value_out, self._empty_h,
             self.n_layers, self.eps, 0, self._wq8, self._sq8, self.quant,
-            int(self.two_boards), self.n_value, self.value_pooled)
+            int(self.two_boards), self.n_value, self.vmode)
         return self.policy_out, self.promo_out, self.value_out
 
     def forward_stage(self, boards, control, rep, stage: int):

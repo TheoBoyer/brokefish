@@ -613,3 +613,100 @@ def test_a_king_head_checkpoint_still_loads_after_the_pool_exists():
     pooled = BrokefishNet(n_value=3, value_head="pooled").state_dict()
     with pytest.raises(RuntimeError):
         BrokefishNet(n_value=3).load_state_dict(pooled)
+
+
+# --------------------------------------------------------------------------
+# `--value-head prenorm`, 2026-08-23: pool the RAW residual and apply `norm_f` to the
+# pooled vector, instead of pooling vectors `norm_f` has already normalised.
+#
+# The defect it removes was measured, not assumed: on `t12h-wdb`, `|mean(LN(h))|`
+# drifts 15.47 -> 10.86 across a 12 h run as the token cloud spreads, and
+# `|value.weight|` grows 42 % chasing it. `LN(mean(h))` cannot drift.
+
+
+def build_prenorm(impl: str, n_value: int = 3, seed: int = 0):
+    key = ("pre", impl, n_value, seed)
+    if key not in _POOL_CACHE:
+        torch.manual_seed(seed)
+        net = BrokefishNet(n_value=n_value, value_head="prenorm").cuda().half().eval()
+        _POOL_CACHE[key] = (net, encoder_impl(impl)(net))
+    return _POOL_CACHE[key]
+
+
+@for_each_impl
+def test_the_prenorm_epilogue_agrees_with_torch(impl):
+    """⚠️ This one is **not** the free column-average the other two heads get.
+    `LN(mean(h))` is not linear in the per-token value logits, so the kernel pools
+    `bufA`, norms it and takes three dot products against an unpacked copy of the
+    value rows. Nothing about that is shared with the torch path."""
+    net, fused = build_prenorm(impl)
+    boards, control, rep = positions()
+    control = control.clone(); control[::2] = -control[::2]
+    with torch.no_grad():
+        want = net(boards, control, rep)[2]
+    got = fused.forward_full(boards, control, rep)[2]
+    d = (got.float() - want.float()).abs().max().item()
+    assert d < VALUE_TOL, f"max|diff| {d:.3e}"
+    assert got.std().item() > 0.05, f"the value collapsed to {got.mean():.4f}"
+
+
+@for_each_impl
+def test_the_prenorm_input_scale_does_not_move_with_the_live_count(impl):
+    """The whole point. `mean(LN(h))` shrinks as the token cloud spreads and as pieces
+    come off; `LN(mean(h))` cannot, because the norm sets the scale. Driven by
+    capturing pieces and watching the two input norms."""
+    net, _ = build_prenorm(impl)
+    boards, control, rep = positions(n=64)
+    norms = {"pre": [], "post": []}
+    counts = []
+    for kill in (0, 6, 12):
+        b = boards.clone()
+        for row in range(b.shape[0]):
+            done = 0
+            for slot in range(32):
+                if done >= kill:
+                    break
+                if slot in (15, 31):
+                    continue
+                if not ((int(b[row, slot]) >> 11) & 1):
+                    b[row, slot] = 1 << 11
+                    done += 1
+        alive = ((b >> 11) & 1) == 0
+        with torch.no_grad():
+            x, al = net.embed(b, control, rep)
+            h = net.encoder(x, src_key_padding_mask=~al)
+            m = alive.unsqueeze(-1).to(h.dtype)
+            pre = net.norm_f((h * m).sum(1) / m.sum(1))
+            post = (net.norm_f(h) * m).sum(1) / m.sum(1)
+        counts.append(float(alive.float().sum(-1).mean()))
+        norms["pre"].append(float(pre.float().norm(dim=-1).mean()))
+        norms["post"].append(float(post.float().norm(dim=-1).mean()))
+    assert counts[0] > counts[-1] + 3, f"the fixture did not remove pieces: {counts}"
+    spread = lambda v: (max(v) - min(v)) / max(v)
+    assert spread(norms["pre"]) < 0.01, (
+        f"the prenorm input scale moved with the live count: {norms['pre']}")
+    assert spread(norms["pre"]) < spread(norms["post"]), (
+        f"prenorm is not more stable than post-norm pooling: "
+        f"pre {norms['pre']} post {norms['post']}")
+
+
+def test_every_value_head_round_trips_through_the_loader():
+    """⚠️ Three heads now, and two of them are `[3, 256]`. The marker stores an **id**
+    rather than a name so an old *pooled* checkpoint keeps resolving to `pooled` after
+    `prenorm` was added."""
+    from brokefish.nn.model import net_for_state, value_head_of, VALUE_MODE_ID
+
+    for kw, want in ((dict(), "king"), (dict(n_value=3), "king"),
+                     (dict(n_value=3, value_head="pooled"), "pooled"),
+                     (dict(n_value=3, value_head="prenorm"), "prenorm"),
+                     (dict(n_value=1, value_head="prenorm"), "prenorm")):
+        net = BrokefishNet(**kw)
+        state = {k: v.clone() for k, v in net.state_dict().items()}
+        assert value_head_of(state) == want
+        got = net_for_state(state)
+        got.load_state_dict(state)
+        assert got.value_head == want and got.n_value == net.n_value
+    # a checkpoint written by a build that knows a mode this one does not must say so
+    with pytest.raises(ValueError, match="unknown value_mode"):
+        value_head_of({"value_mode": torch.tensor(99)})
+    assert VALUE_MODE_ID["pooled"] == 1, "the pooled id is on disk and cannot move"

@@ -233,7 +233,13 @@ struct TailOff {
     static constexpr int lnf_w  = 0;
     static constexpr int lnf_b  = Dm;
     static constexpr int w_head = 2 * Dm;      // packed [NHEAD][Dm]
-    static constexpr int stride = w_head + NHEAD * Dm;
+    // ⚠️ A second, **unpacked** `[N_VALUE_MAX][Dm]` copy of the value rows, 1.5 KB.
+    // `w_head` is in `gemm_direct`'s fragment order, which is what makes the packed
+    // head fast and what makes a plain dot product against three of its rows painful.
+    // The prenorm path needs exactly that dot product, once per board, so it gets its
+    // own row-major copy rather than a special case inside `pack_b`.
+    static constexpr int w_val  = w_head + NHEAD * Dm;
+    static constexpr int stride = w_val + N_VALUE_MAX * Dm;
 };
 
 // --------------------------------------------------------------------------
@@ -699,7 +705,7 @@ __device__ __noinline__ void tail_epilogue(half* bufA, half* bufB, half* scratch
                                            half* __restrict__ policy,
                                            half* __restrict__ promo,
                                            float* __restrict__ value, float eps,
-                                           int n_value, int pooled,
+                                           int n_value, int vmode,
                                            const uint16_t* __restrict__ boards,
                                            int board, int warp, int lane, int tid) {
     // Two independent reasons this norm is not optional. The stack is pre-norm,
@@ -758,7 +764,7 @@ __device__ __noinline__ void tail_epilogue(half* bufA, half* bufB, half* scratch
     // is 0.3 % of the network, so the fast intrinsic would buy nothing measurable and
     // spend accuracy against the torch oracle that `tests/test_b2.py` compares to.
     //
-    // ⚠️ **`pooled` averages the head's own output over the live tokens, not a second
+    // ⚠️ **`vmode == 1` averages the head's own output over the live tokens, not a second
     // GEMM on a pooled residual.** `norm_f` is upstream of the pool and the value head
     // is biasless, so `W @ mean(hn) == mean(W @ hn)` exactly -- and the aux columns for
     // all 32 tokens are already sitting in `scratch`, computed by warp 2 on every
@@ -775,9 +781,75 @@ __device__ __noinline__ void tail_epilogue(half* bufA, half* bufB, half* scratch
     // mean says whose turn it is. The mover's frame is one flip on the sign of the
     // control word (spec §2.4: magnitude is the clock, so the sign never vanishes),
     // and `search.cuh:1076` keeps consuming a mover-relative `[-1, 1]` either way.
-    if (value && tid == 0) {
+    // ⚠️ **`vmode == 2` is the one that is not free.** `LN(mean(h))` is not a linear
+    // function of the per-token value logits, so there is nothing in `scratch` to
+    // average -- it pools `bufA`, the *raw* residual, norms that once, and takes three
+    // dot products. One warp, ~300 ops a lane, in an epilogue that is 0.3 % of the
+    // network. What it buys is a head input whose scale is fixed by the norm: measured
+    // on `t12h-wdb`, `|mean(LN(h))|` drifts 15.47 -> 10.86 over a run and the head's
+    // weights grow 42 % chasing it. Pooling first also lets a token with a larger
+    // residual count for more, which an unweighted mean of normed tokens cannot.
+    if (value && vmode == 2 && warp == 0) {
+        float acc[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[j] = 0.0f;
+        int live = 0;
+        for (int t = 0; t < T; ++t) {
+            if ((boards[(size_t)board * T + t] >> 11) & 1) continue;   // captured
+            const uint4 r4 = *reinterpret_cast<const uint4*>(bufA + ai_idx(t, lane * 8));
+            const half* rv = reinterpret_cast<const half*>(&r4);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) acc[j] += __half2float(rv[j]);
+            ++live;
+        }
+        const float inv = 1.0f / (float)(live > 0 ? live : 1);
+        float sum = 0.0f, sq = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { acc[j] *= inv; sum += acc[j]; sq += acc[j] * acc[j]; }
+#pragma unroll
+        for (int off = 16; off; off >>= 1) {
+            sum += __shfl_xor_sync(0xffffffff, sum, off);
+            sq += __shfl_xor_sync(0xffffffff, sq, off);
+        }
+        const float mu = sum / Dm;
+        // Same clamped one-pass variance as `layernorm`, and for the same reason.
+        const float rstd = rsqrtf(fmaxf(sq / Dm - mu * mu, 0.0f) + eps);
+        const uint4 g4 = *reinterpret_cast<const uint4*>(tail + TailOff::lnf_w + lane * 8);
+        const uint4 b4 = *reinterpret_cast<const uint4*>(tail + TailOff::lnf_b + lane * 8);
+        const half* gv = reinterpret_cast<const half*>(&g4);
+        const half* bv = reinterpret_cast<const half*>(&b4);
+        float nv[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            nv[j] = (acc[j] - mu) * rstd * __half2float(gv[j]) + __half2float(bv[j]);
+        float o[N_VALUE_MAX] = {0.0f, 0.0f, 0.0f};
+        for (int k = 0; k < n_value; ++k) {
+            const uint4 w4 = *reinterpret_cast<const uint4*>(
+                tail + TailOff::w_val + k * Dm + lane * 8);
+            const half* wv = reinterpret_cast<const half*>(&w4);
+            float d = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) d += nv[j] * __half2float(wv[j]);
+#pragma unroll
+            for (int off = 16; off; off >>= 1) d += __shfl_xor_sync(0xffffffff, d, off);
+            o[k] = d;
+        }
+        if (lane == 0) {
+            float v;
+            if (n_value == 1) {
+                v = tanhf(o[0]);
+            } else {
+                const float m = fmaxf(o[0], fmaxf(o[1], o[2]));
+                const float ea = expf(o[0] - m), eb = expf(o[1] - m), ec = expf(o[2] - m);
+                v = (ec - ea) / (ea + eb + ec);
+            }
+            if (control[board] < 0) v = -v;      // absolute frame -> the mover's
+            value[board] = v;
+        }
+    }
+    if (value && vmode != 2 && tid == 0) {
         float a = 0.0f, b = 0.0f, c = 0.0f;
-        if (!pooled) {
+        if (vmode == 0) {
             const half* row = scratch + (control[board] < 0 ? 31 : 15) * HDROW + VALUE_COL;
             a = __half2float(row[0]);                       // loss  (or the scalar)
             if (n_value != 1) {
@@ -809,7 +881,7 @@ __device__ __noinline__ void tail_epilogue(half* bufA, half* bufB, half* scratch
             const float ea = expf(a - m), eb = expf(b - m), ec = expf(c - m);
             v = (ec - ea) / (ea + eb + ec);
         }
-        if (pooled && control[board] < 0) v = -v;
+        if (vmode && control[board] < 0) v = -v;
         value[board] = v;
     }
 }
@@ -973,7 +1045,7 @@ __global__ __launch_bounds__(THREADS, TWOB ? 1 : 2) void encoder_kernel(
     const uint8_t* __restrict__ rep_ptr, const half* __restrict__ emb,
     const half* __restrict__ tail, half* __restrict__ policy,
     half* __restrict__ promo, float* __restrict__ value,
-    int n_layers, float eps, int debug_stage, int n_boards, int n_value, int pooled) {
+    int n_layers, float eps, int debug_stage, int n_boards, int n_value, int vmode) {
     static_assert(!(FP8 && INT8), "the FFN is quantised once, in one format");
     static_assert(!QATT || INT8, "QKVO quantisation is int8 only; e4m3 was measured "
                                  "3x worse at that site before it was built");
@@ -1286,7 +1358,7 @@ __global__ __launch_bounds__(THREADS, TWOB ? 1 : 2) void encoder_kernel(
             if (bb < nb)
                 tail_epilogue(bufA + (size_t)bb * T * AROWA, bufB + (size_t)bb * T * AROW,
                               scratch + (size_t)bb * T * AROW, tail, control, policy,
-                              promo, value, eps, n_value, pooled, boards,
+                              promo, value, eps, n_value, vmode, boards,
                               b0 + bb, warp, lane, tid);
             __syncthreads();
         }

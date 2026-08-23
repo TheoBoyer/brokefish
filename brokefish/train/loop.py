@@ -303,6 +303,9 @@ class TrainConfig:
     # predicting White/draw/Black, which `heads` flips into the mover's frame before
     # anything downstream sees it.
     #
+    # `prenorm` pools before `norm_f` instead of after, which fixes the input scale
+    # by construction and lets a token with a larger residual count for more.
+    #
     # ⚠️ The hypothesis: the policy head touches all 32 tokens and the king select
     # touches one, so value gradient reaches the rest of the board only through that
     # token's attention. It also lands in `config_hash`, so a resume across it is
@@ -1274,14 +1277,19 @@ def build_parser() -> argparse.ArgumentParser:
                         "trunk matrix")
     p.add_argument("--adam-wd", type=float, default=TrainConfig.adam_wd,
                    help="AdamW's decoupled decay -- NOT --l2, see build_optimizer")
-    p.add_argument("--value-head", choices=("king", "pooled"),
+    p.add_argument("--value-head", choices=("king", "pooled", "prenorm"),
                    default=TrainConfig.value_head,
                    help="where the value head reads. 'king' (default) is spec 7.4's "
                         "row select of the side-to-move king, predicting the MOVER's "
                         "result. 'pooled' is the masked mean over every live token of "
                         "both colours, predicting WHITE's -- W/D/B -- which is flipped "
                         "into the mover's frame inside the head. The pooled head sends "
-                        "value gradient into every token instead of one.")
+                        "value gradient into every token instead of one. 'prenorm' "
+                        "pools the RAW residual and applies norm_f to the pooled "
+                        "vector, so the head's input scale is fixed by the norm rather "
+                        "than drifting with how spread the token cloud is -- measured "
+                        "on t12h-wdb, |mean(LN(h))| fell 15.47 -> 10.86 over a run "
+                        "while |value.weight| grew 42 %.")
     p.add_argument("--value-classes", type=int, default=TrainConfig.value_classes,
                    choices=(1, 3),
                    help="the value head's shape. 1 (default) is spec 7.4's scalar "

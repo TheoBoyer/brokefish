@@ -69,7 +69,27 @@ VALUE_CLASSES = (N_VALUE_SCALAR, N_VALUE_WDL)
 #: sends value gradient into *one* token and everything else is reached only through
 #: that token's attention. A bottleneck, not a disconnection -- 8 non-causal layers do
 #: carry it -- but a bottleneck the pooled head removes.
-VALUE_HEADS = ("king", "pooled")
+#: ``"prenorm"`` pools the **raw residual stream** and applies `norm_f` to the pooled
+#: vector, instead of pooling vectors `norm_f` has already normalised. Two things
+#: follow, and they are the reason it exists (2026-08-23):
+#:
+#: ⚠️ **The head's input scale is fixed by construction.** Measured on `t12h-wdb`,
+#: `|mean(LN(h))|` drifts **15.47 -> 10.86** across a 12 h run as the token cloud
+#: spreads, and `|value.weight|` grows **+42 %** chasing it while `value_saturated_frac`
+#: reaches 0.111. `LN(mean(h))` cannot drift: LayerNorm sets the scale.
+#:
+#: ⚠️ **It restores a learned per-token weighting.** Pooling *after* `norm_f` gives
+#: every live slot exactly equal weight; pooling before it lets a token with a larger
+#: residual count for more. That is the thing AlphaZero's per-square value head has and
+#: an unweighted mean does not.
+#:
+#: ⚠️ It is **not** free in the kernel, unlike the other two: `LN(mean(h))` is not a
+#: linear function of the per-token value logits, so the epilogue cannot just average
+#: columns it already has.
+VALUE_HEADS = ("king", "pooled", "prenorm")
+#: What the `value_mode` buffer holds. Absent means `"king"`, which is every checkpoint
+#: written before 2026-08-22.
+VALUE_MODE_ID = {"pooled": 1, "prenorm": 2}
 
 
 def wdl_to_scalar(logits: torch.Tensor) -> torch.Tensor:
@@ -109,12 +129,21 @@ def n_value_of(state: dict) -> int:
 
 
 def value_head_of(state: dict) -> str:
-    """``"pooled"`` if the state_dict carries the marker, ``"king"`` otherwise.
+    """Which value head a ``state_dict`` was written with.
 
-    ⚠️ Absence is the legacy answer, not an error: every checkpoint written before
-    2026-08-22 predates the marker and is a king select.
+    ⚠️ Absence of the marker is the legacy answer, not an error: every checkpoint
+    written before 2026-08-22 predates it and is a king select. The id is stored rather
+    than the name so an old *pooled* checkpoint keeps resolving to `"pooled"` after
+    `"prenorm"` was added.
     """
-    return "pooled" if "value_mode" in state else "king"
+    if "value_mode" not in state:
+        return "king"
+    got = int(state["value_mode"])
+    for name, i in VALUE_MODE_ID.items():
+        if i == got:
+            return name
+    raise ValueError(f"unknown value_mode {got} in this state_dict; this build knows "
+                     f"{VALUE_MODE_ID}")
 
 
 def net_for_state(state: dict, **kw) -> "BrokefishNet":
@@ -194,8 +223,9 @@ class BrokefishNet(nn.Module):
         # unconditionally would give every legacy checkpoint a missing key under
         # `strict=True`. Present means pooled; absent means king, which is what every
         # file written before 2026-08-22 is.
-        if value_head == "pooled":
-            self.register_buffer("value_mode", torch.tensor(1, dtype=torch.int64))
+        if value_head in VALUE_MODE_ID:
+            self.register_buffer("value_mode",
+                                 torch.tensor(VALUE_MODE_ID[value_head], dtype=torch.int64))
 
         std = d_model ** -0.5
         for mod in (self.emb_square, self.emb_type_special, self.emb_color_turn,
@@ -244,11 +274,12 @@ class BrokefishNet(nn.Module):
         The loss needs this to put its target in the same frame; nothing else does,
         because :meth:`heads` flips before returning.
         """
-        return self.value_head == "pooled"
+        return self.value_head in ("pooled", "prenorm")
 
     def heads(self, h: torch.Tensor, control: torch.Tensor,
               alive: Optional[torch.Tensor] = None,
-              with_logits: bool = False):
+              with_logits: bool = False,
+              h_raw: Optional[torch.Tensor] = None):
         """``[N, 32, d]`` normed tokens to (policy_logits, promo, value).
 
         ``h`` must already be through ``norm_f``. ``policy_logits`` is raw --
@@ -270,7 +301,16 @@ class BrokefishNet(nn.Module):
         move -- a promoted queen keeps its pawn slot, so a slot in 0-7 does not
         imply a pawn.
         """
-        if self.value_head == "pooled":
+        if self.value_head == "prenorm":
+            if alive is None or h_raw is None:
+                raise ValueError(
+                    "the prenorm value head needs the live-slot mask and the "
+                    "*pre-norm* residual stream: it pools before `norm_f`, which is "
+                    "the whole point -- the pooled vector's scale is then fixed by the "
+                    "norm instead of drifting with how spread the token cloud is")
+            m = alive.unsqueeze(-1).to(h_raw.dtype)
+            hv = self.norm_f((h_raw * m).sum(1) / m.sum(1).clamp(min=1))
+        elif self.value_head == "pooled":
             if alive is None:
                 raise ValueError(
                     "the pooled value head needs the live-slot mask: a captured slot "
@@ -307,7 +347,7 @@ class BrokefishNet(nn.Module):
     # -- the whole thing ---------------------------------------------------
 
     def forward(self, boards: torch.Tensor, control: torch.Tensor, rep: torch.Tensor,
-                with_logits: bool = False):
+                with_logits: bool = False):  # noqa: D401
         """The 3-tuple ``(policy, promo, value)`` -- ``value`` is ``[N]`` fp32 in
         ``[-1, 1]`` whatever the head is, which is why nothing downstream changed.
 
@@ -317,7 +357,8 @@ class BrokefishNet(nn.Module):
         """
         x, alive = self.embed(boards, control, rep)
         h = self.encoder(x, src_key_padding_mask=~alive)
-        return self.heads(self.norm_f(h), control, alive=alive, with_logits=with_logits)
+        return self.heads(self.norm_f(h), control, alive=alive,
+                          with_logits=with_logits, h_raw=h)
 
 
 def full_forward_via_backbone(net: BrokefishNet, backbone, boards, control, rep,
@@ -333,4 +374,5 @@ def full_forward_via_backbone(net: BrokefishNet, backbone, boards, control, rep,
     """
     x, alive = net.embed(boards, control, rep)
     h = backbone(x, alive)
-    return net.heads(net.norm_f(h), control, alive=alive, with_logits=with_logits)
+    return net.heads(net.norm_f(h), control, alive=alive, with_logits=with_logits,
+                     h_raw=h)

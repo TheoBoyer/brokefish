@@ -1,0 +1,23 @@
+n = 800, B = 4096, 4087 distinct live positions, 6 order-balanced rounds, int8 FFN+QKV+out_proj, 2 boards/CTA
+  round 0  none   34.849 s
+  round 0  ln1    35.670 s
+  round 0  both   36.453 s
+  round 1  both   36.554 s
+  round 1  ln1    35.910 s
+  round 1  none   35.223 s
+  round 2  none   35.245 s
+  round 2  ln1    35.984 s
+  round 2  both   36.703 s
+  round 3  both   36.735 s
+  round 3  ln1    36.071 s
+  round 3  none   35.332 s
+  round 4  none   35.349 s
+  round 4  ln1    36.064 s
+  round 4  both   36.823 s
+  round 5  both   36.795 s
+  round 5  ln1    36.079 s
+  round 5  none   35.407 s
+
+  none    35.234 s/move       91604 useful evals/s   1.0000x   +0.00 %
+  ln1     35.963 s/move       89747 useful evals/s   0.9797x   +2.07 %
+  both    36.677 s/move       87999 useful evals/s   0.9607x   +4.10 %

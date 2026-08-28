@@ -200,7 +200,22 @@ __device__ __forceinline__ void gemm_s8_row(uint32_t (&acc)[MT][4][2],
 
     int32_t hacc[MT][4][4] = {};
 
-#pragma unroll 1
+    // ⚠️ **Unrolled by two, and the exact factor is the measurement.** Rolled, the four
+    // weight loads of iteration `k32 + 1` cannot issue until the back edge, so their
+    // ~250-cycle L2 latency is exposed with only 2 warps per scheduler to cover it --
+    // this kernel runs at 16.7 % occupancy and 70 % of its cycles have no eligible warp
+    // (ncu, 2026-08-28). At two, the compiler overlaps one iteration's loads with the
+    // other's `mma` without a hand-written ping-pong buffer, which is the thing that
+    // regressed twice (88 204 -> 72 704 evals/s, above).
+    //
+    // Measured 2026-08-28, `bench_phases --impl int8`, cycles per board (warp 0):
+    // rolled **401,343**, unroll 2 **393,872 (-1.86 %)**, unroll 4 **408,651** -- worse
+    // than rolled, with `ff2_gemm` alone going 89,601 -> 101,244 as it spills. The
+    // window that fits in the register budget is exactly two.
+    //
+    // ⚠️ `perf.md` records "`#pragma unroll 2` on the same loop is inside noise". That
+    // was measured against the *ping-pong* form of this loop, not this one.
+#pragma unroll 2
     for (int k32 = 0; k32 < K32N; ++k32) {
         uint32_t af[MT][4];
 #pragma unroll

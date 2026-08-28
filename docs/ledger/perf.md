@@ -1422,6 +1422,62 @@ architectural change and stays bit-identical at `c = 0`. **In the real MCTS:**
 
 `logs/reinject-ab-half2.log`. Both modes are now inside the 5 % budget.
 
+### The int8 GEMM's k-loop wants to be unrolled by exactly two: -1.86 %
+
+2026-08-28, from the ncu reading above rather than from a guess. `gemm_s8_row`'s k-loop
+was `#pragma unroll 1`, so the four weight loads of iteration `k32 + 1` could not issue
+until the back edge and their ~250-cycle L2 latency was exposed with **two warps per
+scheduler** to cover it. At two, the compiler overlaps one iteration's loads with the
+other's `mma` -- without the hand-written ping-pong buffer that regressed twice.
+
+`bench_phases --impl int8`, cycles per board (warp 0). ⚠️ Cycles and not seconds: the
+`none` baseline reproduces to **61 cycles** across five separate builds, which is what
+makes a 7,471-cycle move a measurement.
+
+| | rolled | **unroll 2** | unroll 4 |
+|---|---:|---:|---:|
+| `qkv_gemm` | 63,828 | 61,645 | 63,572 |
+| `proj_gemm` | 22,066 | 22,475 | 24,272 |
+| `ff1_gemm` | 87,605 | **82,754** | 82,276 |
+| `ff2_gemm` | 90,809 | 89,601 | **101,244** |
+| **whole kernel** | 401,343 | **393,872 (−1.86 %)** | 408,651 (+1.82 %) |
+
+**Unroll 4 is worse than rolled**: `ff2_gemm` alone goes 89,601 -> 101,244 as the window
+stops fitting the register budget. Two is the whole of the answer. 254 registers, no
+spill. In the real MCTS the `none` arm goes **35.986 -> 35.234 s/move, 89 690 -> 91 604
+useful evals/s** (`logs/unroll2-ab.log`; across builds, so thermally contaminated --
+the cycle count is the measurement and the wall clock is the corroboration).
+
+⚠️ **This contradicts a line above.** The §fp8 note records "`#pragma unroll 2` on the
+same loop is inside noise". That was measured against the *ping-pong* form of the loop,
+not this one; on the plain loop it is worth 1.86 %.
+
+### Three things that removed real work and bought nothing
+
+All three measured on 2026-08-28, all reverted, and together they are the most useful
+thing in this section: **at 16.7 % occupancy with 70 % of cycles having no eligible
+warp, the non-matmul phases are not on the critical path, and taking work out of them
+does not make the kernel faster.**
+
+| change | what it removed | quantise phases | whole kernel |
+|---|---|---:|---:|
+| conflict-free lane map in `quantise_row_int8` | **all 1,835,008 shared bank conflicts** (-> 259) | −1,337 | 401,343 -> 401,566 |
+| `__hmax2` amax instead of fp32 `fmaxf` | 48 of ~140 ALU ops per row per lane | −642 | 401,343 -> 401,783 |
+| `__ldg` + `__restrict__` on the weight stream | the coherent load path | — | 401,343 -> 401,660 |
+
+⚠️ **The bank conflicts were entirely in `quantise_row_int8` and the arithmetic closes
+exactly**: a lane owned 16 contiguous halves, so the eight lanes of a row sat at a
+32-byte stride and folded the 128-byte bank set twice -- 8 wavefronts where 4 suffice.
+7 quantise calls per layer x 8 loads per warp x 4 excessive x 8 warps x 8 layers x 128
+CTAs = **1,835,008**, against ncu's 1,835,008. Splitting a lane's slice into two 8-half
+chunks half a tile apart removes every one of them, and **it is worth nothing**, because
+`short_scoreboard` is 0.68 of 6.67 stall cycles and the LSU was never the limiter.
+
+The corollary is where the remaining headroom is: the GEMMs run at **74 % of int8 tensor
+peak** (402.6M MACs per CTA in 528,640 GEMM cycles = 762 MACs/cycle against 1,024), and
+they are 65.9 % of the kernel. Perfect latency hiding inside them is worth ~17 %; nothing
+outside them is worth anything. The unroll-2 result above is the first 1.86 % of it.
+
 ### Measured: RMSNorm is worth 0.55 %, not 2-3 %
 
 Asked directly, so measured directly rather than estimated. A throughput probe with the

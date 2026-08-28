@@ -449,9 +449,9 @@ __device__ __forceinline__ void layernorm(half* dst, const half* src, const half
             const half* cc = rj.coef + (size_t)site * kRjStride;
             c_sq2 = __half2half2(cc[0]);
             c_ts2 = __half2half2(cc[1]);
-            const float c_ct = __half2float(cc[2]);
-            const float c_ck = __half2float(cc[3]);
-            const float c_rp = __half2float(cc[4]);
+            const __half2 c_ct2 = __half2half2(cc[2]);
+            const __half2 c_ck2 = __half2half2(cc[3]);
+            const __half2 c_rp2 = __half2half2(cc[4]);
 #pragma unroll
             for (int bb = 0; bb < BPC; ++bb) {
                 // Same clamps and the same duplicate-board rule as `embed_board`: an
@@ -465,20 +465,28 @@ __device__ __forceinline__ void layernorm(half* dst, const half* src, const half
                 const int rp = min((int)rj.rep[gb], N_REP - 1);
                 const uint4 kc = ldg16(rj.emb + EmbOff::clock + clk * Dm + lane * 8);
                 const uint4 kr = ldg16(rj.emb + EmbOff::rep + rp * Dm + lane * 8);
-                const half* pc = reinterpret_cast<const half*>(&kc);
-                const half* pr = reinterpret_cast<const half*>(&kr);
+                const __half2* pc = reinterpret_cast<const __half2*>(&kc);
+                const __half2* pr = reinterpret_cast<const __half2*>(&kr);
+                // ⚠️ **The clock/rep term does not depend on the colour, so it is built
+                // once per board and not once per colour.** It used to sit inside the
+                // `col` loop, which computed it twice for the same answer -- and in
+                // scalar fp32, at seven ops per element, where the row loop below has
+                // been `half2` since it was written. Both halves of that are fixed
+                // here: 16 `half2` ops per board against 112 scalar ones, and still
+                // exactly zero at `c = 0`.
+                __half2 pb[4];
+#pragma unroll
+                for (int k = 0; k < 4; ++k)
+                    pb[k] = __hfma2(c_ck2, pc[k], __hmul2(c_rp2, pr[k]));
                 uint4 mix[2];
 #pragma unroll
                 for (int col = 0; col < 2; ++col) {
                     const uint4 kt = ldg16(rj.emb + EmbOff::color_turn
                                            + (col * 2 + stm) * Dm + lane * 8);
-                    const half* pt = reinterpret_cast<const half*>(&kt);
-                    half o[8];
+                    const __half2* pt = reinterpret_cast<const __half2*>(&kt);
+                    __half2 o[4];
 #pragma unroll
-                    for (int j = 0; j < 8; ++j)
-                        o[j] = __float2half(c_ct * __half2float(pt[j])
-                                            + (c_ck * __half2float(pc[j])
-                                               + c_rp * __half2float(pr[j])));
+                    for (int k = 0; k < 4; ++k) o[k] = __hfma2(c_ct2, pt[k], pb[k]);
                     mix[col] = *reinterpret_cast<const uint4*>(o);
                 }
                 // Named registers, not an array index: `bb` is a literal here because
@@ -505,6 +513,9 @@ __device__ __forceinline__ void layernorm(half* dst, const half* src, const half
             // `row` spans [i*NWARPS, i*NWARPS + NWARPS) and T is a multiple of NWARPS,
             // so every lane of this unrolled iteration is on the same board and the
             // compiler folds `bb` to a literal.
+            // `i` is not `constexpr` -- it is a `#pragma unroll` induction variable -- but
+            // both of these fold to literals once the loop is unrolled, which is all
+            // ptxas needs to drop the selects entirely.
             const int bb = (i * NWARPS) / T;
             const uint32_t w = __shfl_sync(0xffffffffu, (BPC == 2 && bb) ? word1 : word0,
                                            row & (T - 1));
@@ -513,7 +524,19 @@ __device__ __forceinline__ void layernorm(half* dst, const half* src, const half
             // `emb_clock`, in bounds by an accident of slab order.
             const int sq_i = w & 63;
             const int ts_i = min(((w >> 6) & 7) * 2 + ((w >> 9) & 1), N_TYPE_SPECIAL - 1);
-            const int col = (w >> 10) & 1;
+            // ⚠️ **The colour is the slot's, not the word's, and it is a compile-time
+            // constant here.** Spec 2.1 partitions the piece list -- slots 0-15 White,
+            // 16-31 Black -- and `row = warp + i * NWARPS` with `warp < NWARPS <= 16`
+            // never straddles slot 16, so `(i & 3) >= 2` decides it with no runtime
+            // decode and no select between the four `cs` slices at all.
+            //
+            // ⚠️ It differs from `(w >> 10) & 1` on exactly one case: a **dead** slot,
+            // whose word is `1 << 11` with the colour bit wiped, so the word calls
+            // every dead slot White while the slot index still knows which half it is
+            // in. `BrokefishNet.mix` uses the slot rule for the same reason, so the two
+            // agree; nothing downstream can see it either way, because a dead token is
+            // masked out of every attention it appears in.
+            const int col = ((i & 3) >= 2) ? 1 : 0;
             const uint4 cs = (BPC == 2 && bb) ? (col ? cs11 : cs10)
                                               : (col ? cs01 : cs00);
             const __half2* pcs = reinterpret_cast<const __half2*>(&cs);

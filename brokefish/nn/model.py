@@ -340,11 +340,15 @@ class BrokefishNet(nn.Module):
         """
         captured, color, special, ptype, square = decode_boards(boards)
         stm = (control < 0).long()                          # 1 = black to move
+        slot_color = (torch.arange(T, device=boards.device) >= T // 2).long()
         idx = (square,
                ptype * 2 + special,
                color * 2 + stm[:, None],
                (control.abs().long() - 1).clamp_(0, N_CLOCK - 1),
-               rep.long().clamp_(0, N_REP - 1))
+               rep.long().clamp_(0, N_REP - 1),
+               # index 5: the re-injection's colour_turn row, from the *slot*. See
+               # `mix`. It is not part of the spec 7.2 sum and `embed` never reads it.
+               slot_color[None, :] * 2 + stm[:, None])
         return idx, captured == 0
 
     # -- stage 2 -----------------------------------------------------------
@@ -365,7 +369,16 @@ class BrokefishNet(nn.Module):
         """
         m = F.embedding(idx[0], c[0] * self.emb_square.weight)
         m = m + F.embedding(idx[1], c[1] * self.emb_type_special.weight)
-        m = m + F.embedding(idx[2], c[2] * self.emb_color_turn.weight)
+        # ⚠️ **The colour here is the slot's, not the decoded word's**, and the two
+        # differ on exactly one case: a captured slot's word is `1 << 11` with the
+        # colour bit wiped, so `decode_boards` calls every dead slot White while the
+        # slot index still knows which half of the piece list it is in (spec 2.1: 0-15
+        # White, 16-31 Black). The slot rule is what the kernel can afford -- it makes
+        # the colour a compile-time constant of the unrolled row index and deletes the
+        # per-row decode and a four-way register select -- and nothing downstream can
+        # see the difference, because a dead token is masked out of every attention it
+        # appears in. `embed` keeps the word's colour, which is normative for the sum.
+        m = m + F.embedding(idx[5], c[2] * self.emb_color_turn.weight)
         per_board = (F.embedding(idx[3], c[3] * self.emb_clock.weight)
                      + F.embedding(idx[4], c[4] * self.emb_rep.weight))
         return m + per_board[:, None, :]

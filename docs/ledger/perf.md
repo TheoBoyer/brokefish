@@ -1478,6 +1478,33 @@ peak** (402.6M MACs per CTA in 528,640 GEMM cycles = 762 MACs/cycle against 1,02
 they are 65.9 % of the kernel. Perfect latency hiding inside them is worth ~17 %; nothing
 outside them is worth anything. The unroll-2 result above is the first 1.86 % of it.
 
+### The injection's own path, ground down: 8,705 -> 6,982 cycles per board
+
+All against the `none` arm of the same build, `bench_phases --impl int8`, 512 CTAs.
+
+| | ln1 delta, cycles/board | in the MCTS |
+|---|---:|---:|
+| as first landed (runtime mode, scalar fp32) | 8,705 | +4.19 % |
+| mode as a template parameter | — | +2.64 % |
+| the row mix in `half2` | 7,599 | +2.18 % |
+| **+ preamble in `half2`, hoisted out of the colour loop** | 7,216 | +2.11 % |
+| **+ the colour taken from the slot, not the word** | **6,982** | — |
+
+Two things the last two rows buy, both from reading the code rather than the profiler:
+
+**The clock/rep term does not depend on the colour** and was being built twice, in
+scalar fp32 at seven ops per element, inside a loop whose other operand is the only
+thing that varies. Once per board in `half2` is 16 ops against 112.
+
+**The colour of a slot is a compile-time constant of the row index.** Spec 2.1
+partitions the piece list -- 0-15 White, 16-31 Black -- and `row = warp + i * NWARPS`
+with `warp < NWARPS` never straddles slot 16, so `(i & 3) >= 2` decides it. The per-row
+`(w >> 10) & 1` and the four-way select between the `cs` slices both disappear.
+⚠️ It differs from the word's colour bit on exactly one case -- a **dead** slot, whose
+word is `1 << 11` with the colour wiped -- so `BrokefishNet.mix` was changed to the same
+rule. Nothing downstream can see it: a dead token is masked out of every attention it
+appears in, and `c = 0` is still bit-identical either way.
+
 ### Measured: RMSNorm is worth 0.55 %, not 2-3 %
 
 Asked directly, so measured directly rather than estimated. A throughput probe with the

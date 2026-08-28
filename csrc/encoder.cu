@@ -440,15 +440,15 @@ __device__ __forceinline__ void layernorm(half* dst, const half* src, const half
     constexpr int BPC = ROWS / T;
     static_assert(ROWS % T == 0, "a LayerNorm covers whole boards");
     static_assert(T % NWARPS == 0, "so that one unrolled iteration stays on one board");
-    float c_sq = 0.f, c_ts = 0.f;
+    __half2 c_sq2 = {}, c_ts2 = {};
     uint32_t word0 = 0, word1 = 0;
     uint4 cs00 = {}, cs01 = {}, cs10 = {}, cs11 = {};
     constexpr bool inject = RJ;
     if constexpr (RJ) {
         {
             const half* cc = rj.coef + (size_t)site * kRjStride;
-            c_sq = __half2float(cc[0]);
-            c_ts = __half2float(cc[1]);
+            c_sq2 = __half2half2(cc[0]);
+            c_ts2 = __half2half2(cc[1]);
             const float c_ct = __half2float(cc[2]);
             const float c_ck = __half2float(cc[3]);
             const float c_rp = __half2float(cc[4]);
@@ -516,7 +516,7 @@ __device__ __forceinline__ void layernorm(half* dst, const half* src, const half
             const int col = (w >> 10) & 1;
             const uint4 cs = (BPC == 2 && bb) ? (col ? cs11 : cs10)
                                               : (col ? cs01 : cs00);
-            const half* pcs = reinterpret_cast<const half*>(&cs);
+            const __half2* pcs = reinterpret_cast<const __half2*>(&cs);
             // ⚠️ **There is no runtime guard on these two loads and there must not be.**
             // The first version of this had `if (inject)` around them so that a site
             // which does not inject would skip the work; it **cost 0.7 % on `ln1` and
@@ -529,18 +529,32 @@ __device__ __forceinline__ void layernorm(half* dst, const half* src, const half
             const uint4 es = ldg16(rj.emb + EmbOff::square + sq_i * Dm + lane * 8);
             const uint4 et = ldg16(rj.emb + EmbOff::type_special
                                    + ts_i * Dm + lane * 8);
-            const half* pe = reinterpret_cast<const half*>(&es);
-            const half* pt = reinterpret_cast<const half*>(&et);
+            const __half2* pe = reinterpret_cast<const __half2*>(&es);
+            const __half2* pt = reinterpret_cast<const __half2*>(&et);
+            const __half2* pv = reinterpret_cast<const __half2*>(&raw);
+            // ⚠️ **half2, not scalar fp32, and that is worth measuring not assuming.**
+            // The scalar form is 8 converts of `v`, 8 of each of the three sources, 16
+            // fma and 8 adds = 56 ops per row per lane; this is 12. The injection's cost
+            // is issue slots and not load latency -- ncu, 2026-08-28: the loads move
+            // `long_scoreboard` 1.16 -> 1.12 while instructions go up 6 % --
+            // so the arithmetic is where the budget actually goes.
+            __half2 m2[4];
 #pragma unroll
-            for (int j = 0; j < 8; ++j) {
+            for (int k = 0; k < 4; ++k) {
                 // The grouping mirrors `BrokefishNet.mix`:
                 // (square + type_special + color_turn) + (clock + rep), with the last
                 // two folded into `cs` above. At c = 0 every added term is an exact
-                // zero, so a re-injecting kernel with untrained coefficients is the
-                // old kernel to the bit.
-                xm[j] = __half2float(v[j])
-                        + (c_sq * __half2float(pe[j]) + c_ts * __half2float(pt[j]))
-                        + __half2float(pcs[j]);
+                // zero -- `__hfma2(0, x, v)` is `v` for finite `x` and `__hadd2(v, 0)`
+                // is `v` -- so a re-injecting kernel with untrained coefficients is
+                // still the old kernel to the bit.
+                __half2 t = __hfma2(c_sq2, pe[k], pv[k]);
+                t = __hfma2(c_ts2, pt[k], t);
+                m2[k] = __hadd2(t, pcs[k]);
+            }
+            const half* pm = reinterpret_cast<const half*>(m2);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                xm[j] = __half2float(pm[j]);
                 sum += xm[j];
                 sq += xm[j] * xm[j];
             }

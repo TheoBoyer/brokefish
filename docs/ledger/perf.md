@@ -1362,6 +1362,86 @@ micro-batch, 10 order-balanced rounds: `none` 575.34 ms, **`ln1` 600.31 ms (+4.3
 rather than the gathered result, which keeps the graph free of five `[N, 32, d]`
 activations per site.
 
+### What ncu says the kernel is, and where the last of it went
+
+`ncu` on the shipped arm (int8 quant 3, two boards, 512 CTAs, sm89), 2026-08-28:
+
+| | |
+|---|---:|
+| Compute (SM) throughput | 52.15 % |
+| Memory throughput | 45.40 % |
+| **DRAM throughput** | **0.35 %** |
+| L2 hit rate | **99.60 %** |
+| L1/TEX hit rate | **3.46 %** |
+| Registers per thread | 254 |
+| Dynamic SMEM per block | 100.35 KB |
+| Block limit, registers / SMEM | **1 / 1** |
+| **Achieved occupancy** | **16.67 %** (8 warps/SM, 2 per scheduler) |
+| Eligible warps per scheduler | 0.38 |
+| Cycles with no eligible warp | 70.03 % |
+| Warp cycles per issued instruction | 6.67 |
+
+**The kernel is latency-bound and both occupancy limiters are maxed at once** -- 254 of
+255 registers and 100,352 of 102,400 B of shared memory each pin it to one block per SM.
+There is no DRAM problem and there never was: the weight slab lives in L2 at a 99.6 %
+hit rate. L1 is 3.5 % because the SMEM carveout leaves it ~28 KB.
+
+Stalls, in warp-cycles per issued instruction:
+
+| stall | none | ln1 |
+|---|---:|---:|
+| `wait` (fixed-latency dependency) | **1.83** | 1.74 |
+| `long_scoreboard` (global / L2) | 1.16 | 1.12 |
+| `math_pipe_throttle` (tensor pipe busy) | 1.13 | 1.08 |
+| `short_scoreboard` (SMEM / MIO) | 0.68 | 0.62 |
+| `barrier` | 0.19 | 0.18 |
+
+⚠️ **The top stall has moved.** The note under §fp8 records `long_scoreboard` at 3.62 as
+"the top stall since fp8 landed"; on the int8 two-board kernel it is 1.16 and `wait`
+leads at 1.83. Memory is no longer what this kernel waits on.
+
+That reading is what found the last of the injection's cost. `long_scoreboard` barely
+moves when the injection is switched on (1.16 -> 1.12) while **instructions go up 6.04 %
+(234.87M -> 249.07M) for 2.3 % more time** -- so the cost is *issue slots*, not load
+latency. Two probes confirmed it and one was kept:
+
+| probe | ln1, cycles/board | vs pre-norm fp32 |
+|---|---:|---:|
+| the mix in scalar fp32, pre-norm (as landed) | 410,048 | — |
+| `LN(h) + m` instead of `LN(h + m)` -- loads off the critical path | 408,906 | −0.28 % |
+| **the mix in `half2`** -- 12 ops per row instead of 56 | **409,003** | **−0.26 %** |
+
+Taking the loads off the reduction's critical path is worth almost nothing, which is the
+same finding from the other side. The `half2` form is kept because it needs no
+architectural change and stays bit-identical at `c = 0`. **In the real MCTS:**
+
+| | runtime mode, fp32 | template mode | + `half2` mix |
+|---|---:|---:|---:|
+| `ln1` | +4.19 % / +3.80 % | +2.64 % | **+2.18 %** |
+| `both` | +5.75 % / +5.20 % | +5.17 % | **+4.15 %** |
+
+`logs/reinject-ab-half2.log`. Both modes are now inside the 5 % budget.
+
+### Measured: RMSNorm is worth 0.55 %, not 2-3 %
+
+Asked directly, so measured directly rather than estimated. A throughput probe with the
+mean, its shuffle chain and the subtraction removed from `layernorm` (outputs
+deliberately wrong; reverted):
+
+| cycles/board, warp 0 | LayerNorm | RMSNorm probe |
+|---|---:|---:|
+| `ln1` phase | 12,168 | 10,903 |
+| `res1_ln2` | 15,356 | 14,106 |
+| **whole kernel** | 401,343 | **399,129 (−0.55 %)** |
+
+Normalisation is 7.8 % of the kernel, so a form that removes half of its arithmetic
+"should" be worth ~3 %. It is worth 0.55 %, because **the two reduction chains are
+independent and interleave**: `sum` and `sq` shuffle in the same five rounds, and
+dropping one removes issue slots without shortening the dependency chain that the
+`wait` stall is actually measuring. ⚠️ Not a reason to change the architecture on its
+own -- every checkpoint on the ledger is LayerNorm and the retrain costs more than
+0.55 % buys.
+
 ⚠️ **Absolute evals/s here are not comparable to Gate 1a's 76 496.** This harness resets
 the tree before every timed move, where `bench_search` measures a move inside a
 continuing game, so `useful_frac` differs. Only the ratios inside one interleaved run

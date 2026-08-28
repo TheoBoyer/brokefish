@@ -72,15 +72,21 @@ K_POLICY = 96
 
 RECORD = np.dtype({
     "names": ["board", "control", "rep", "policy_len", "policy_move", "policy_prob",
-              "value", "root_value", "weight_gen"],
+              "value", "root_value", "weight_gen", "value_mask"],
     "formats": [("<i2", 32), "<i2", "u1", "u1", ("<i2", K_POLICY), ("<f2", K_POLICY),
-                "<f4", "<f4", "<u2"],
+                "<f4", "<f4", "<u2", "u1"],
     "offsets": [0, 64, 66, 67, 68, 68 + 2 * K_POLICY, 68 + 4 * K_POLICY,
-                72 + 4 * K_POLICY, 76 + 4 * K_POLICY],
-    "itemsize": 78 + 4 * K_POLICY,
+                72 + 4 * K_POLICY, 76 + 4 * K_POLICY, 78 + 4 * K_POLICY],
+    "itemsize": 79 + 4 * K_POLICY,
 })
+# `value_mask` (2026-08-25): 1 where the record's `z` is a value-loss target, 0 where
+# only the policy is trained on it. Written once, at game close, by `value_subsample`:
+# every k-th ply of the game, with the residue rotating per game. ⚠️ It is a property
+# of the record and not of the draw, on purpose -- a mask re-rolled per epoch shows the
+# head every label eventually and changes nothing about how many times one game's one
+# bit is repeated to it, which is the quantity this exists to control.
 RECORD_BYTES = RECORD.itemsize
-assert RECORD_BYTES == 462, RECORD_BYTES
+assert RECORD_BYTES == 463, RECORD_BYTES
 # `policy_len` is `u1`, so the width may never exceed 255.
 assert K_POLICY <= 255, K_POLICY
 
@@ -106,7 +112,10 @@ class ReplayBuffer:
 
     def __init__(self, path: Optional[str] = None, window_games: int = 500_000,
                  mean_plies: int = 80, capacity_records: Optional[int] = None,
-                 seed: int = 0, resume: bool = False) -> None:
+                 seed: int = 0, resume: bool = False, value_subsample: int = 1) -> None:
+        if value_subsample < 1:
+            raise ValueError(f"value_subsample must be >= 1, got {value_subsample}")
+        self.value_subsample = int(value_subsample)
         if capacity_records is None:
             capacity_records = window_games * mean_plies
         self.capacity = int(capacity_records)
@@ -251,6 +260,11 @@ class ReplayBuffer:
         s_rec = np.where(block["control"] > 0, 1.0, -1.0)
         s_end = 1.0 if term_control > 0 else -1.0
         block["value"] = -np.float32(result) * s_rec * s_end
+        # Which plies carry the value target. `k = 1` marks every record, bit-for-bit
+        # the run before this field existed. The residue rotates with the game count so
+        # no ply parity is systematically favoured across games.
+        k = self.value_subsample
+        block["value_mask"] = ((np.arange(length) + self.total_games) % k == 0)
         self._commit(block)
         self.total_games += 1
         self.total_records += length
@@ -329,7 +343,8 @@ class ReplayBuffer:
             rep=to("rep", torch.uint8), policy_move=to("policy_move", torch.int16),
             policy_prob=to("policy_prob", torch.float16),
             policy_len=to("policy_len", torch.uint8), value=to("value", torch.float32),
-            weight_gen=to("weight_gen", torch.int32))
+            weight_gen=to("weight_gen", torch.int32),
+            value_mask=to("value_mask", torch.float32))
 
     # -- reporting and persistence ------------------------------------------ #
 

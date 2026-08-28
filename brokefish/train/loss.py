@@ -87,14 +87,19 @@ class TrainBatch:
     policy_len: torch.Tensor   # [N]     uint8
     value: torch.Tensor        # [N]     float32, z in {-1, 0, +1}
     weight_gen: torch.Tensor   # [N]     int32, for the staleness counter of §11
+    #: [N] float32 in {0, 1}: which rows the value loss is taken over. ``None`` is
+    #: every row (the buffer writes it; hand-built batches may omit it).
+    value_mask: Optional[torch.Tensor] = None
 
     def __len__(self) -> int:
         return int(self.board.shape[0])
 
     def slice(self, lo: int, hi: int) -> "TrainBatch":
+        m = None if self.value_mask is None else self.value_mask[lo:hi]
         return TrainBatch(*(t[lo:hi] for t in (
             self.board, self.control, self.rep, self.policy_move,
-            self.policy_prob, self.policy_len, self.value, self.weight_gen)))
+            self.policy_prob, self.policy_len, self.value, self.weight_gen)),
+            value_mask=m)
 
 
 @dataclass
@@ -255,11 +260,22 @@ def az_loss(net, batch: TrainBatch, strict: bool = True,
         # `+1` where White is to move, `-1` where Black is (spec §2.4: the control
         # word's magnitude is the clock, so it is never 0 and the sign never vanishes).
         flip = torch.where(batch.control > 0, 1.0, -1.0) if absolute else None
+        # The value term is a mean over the *masked* rows: with every row marked this
+        # is the plain mean and the loss is unchanged; with 1 in k marked, the term
+        # keeps its magnitude and the unmarked rows contribute no value gradient at
+        # all. ⚠️ Per micro-batch, so the per-micro-batch weighting of `train_step`
+        # (by row count) is exact for the policy and approximate for the value by the
+        # mask's fluctuation across micro-batches -- a 2 % effect at 1 in 4 over 1024.
+        mask = batch.value_mask
+        if mask is None:
+            mask = torch.ones_like(v)
+        mask = mask.float()
+        m_sum = mask.sum().clamp(min=1.0)
         if n_value == 1:
             # `v * flip` un-does `heads`' flip, i.e. it is the head's own output again.
             tgt = batch.value if flip is None else batch.value * flip
             pred = v if flip is None else v * flip
-            value_loss = value_weight * ((tgt - pred) ** 2).mean()
+            value_loss = value_weight * (((tgt - pred) ** 2) * mask).sum() / m_sum
         else:
             # ⚠️ `batch.value` is exactly {-1, 0, +1} by construction -- `buffer.py:253`
             # writes `-result * s_rec * s_end` and every factor is a sign -- so `+1` is
@@ -274,8 +290,8 @@ def az_loss(net, batch: TrainBatch, strict: bool = True,
                     "The win/draw/loss head is trained on the game outcome (§4); a "
                     "bootstrapped or averaged target needs a soft-label loss, not this "
                     "one")
-            value_loss = value_weight * F.cross_entropy(
-                value_logits.float(), cls.long(), reduction="mean")
+            value_loss = value_weight * (F.cross_entropy(
+                value_logits.float(), cls.long(), reduction="none") * mask).sum() / m_sum
 
     return LossParts(total=policy_loss + value_loss, policy=policy_loss,
                      value=value_loss, entropy=entropy, kl=policy_loss - entropy,

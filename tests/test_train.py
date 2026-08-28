@@ -481,13 +481,13 @@ def _positions(n: int, seed: int, plies: int = 24):
 # §4 and §5, the buffer — checks 5 and 6
 # --------------------------------------------------------------------------- #
 
-def test_the_record_is_462_bytes_and_round_trips():
-    # 462 = 64 board + 2 control + 1 rep + 1 policy_len + 96*(2+2) policy
-    #       + 4 value + 4 root_value + 2 weight_gen. Written out rather than
+def test_the_record_is_463_bytes_and_round_trips():
+    # 463 = 64 board + 2 control + 1 rep + 1 policy_len + 96*(2+2) policy
+    #     + 4 value + 4 root_value + 2 weight_gen + 1 value_mask. Written out rather than
     #       derived, so a silent layout change fails here instead of in a .dat
     #       whose zeroed bytes decode as a live white pawn on a1.
-    assert RECORD_BYTES == 462
-    assert RECORD.itemsize == 462
+    assert RECORD_BYTES == 463
+    assert RECORD.itemsize == 463
     buf = ReplayBuffer(window_games=8, mean_plies=8, seed=0)
     rows = one_game(3, result=1)
     for r in rows:
@@ -558,6 +558,39 @@ def test_eviction_is_by_game_and_the_window_holds():
     assert buf.n_games == 3
     assert buf.n_records == sum(lengths[-3:])
     assert buf.evicted_games == 2
+
+
+def test_value_subsample_marks_every_kth_ply_and_only_masks_the_value_loss():
+    """`--value-subsample k`: 1 in k records per game carry the value target, the
+    residue rotates per game, k = 1 marks all, and the masked loss equals the plain
+    loss over the marked rows while the policy term does not move."""
+    buf = ReplayBuffer(window_games=8, mean_plies=16, seed=0, value_subsample=4)
+    for g in range(3):
+        for r in one_game(9, result=1, seed=g):
+            buf.append(r)
+    masks = [np.array(buf.data[9 * g:9 * (g + 1)]["value_mask"]).tolist() for g in range(3)]
+    assert masks[0] == [1, 0, 0, 0, 1, 0, 0, 0, 1]
+    assert masks[1] == [0, 0, 0, 1, 0, 0, 0, 1, 0]   # residue rotated by one game
+    assert masks[2] == [0, 0, 1, 0, 0, 0, 1, 0, 0]
+    plain = ReplayBuffer(window_games=8, mean_plies=16, seed=0)
+    for r in one_game(9, result=1):
+        plain.append(r)
+    assert np.array(plain.data[:9]["value_mask"]).tolist() == [1] * 9
+
+    net = BrokefishNet(n_value=3).to(DEVICE)
+    batch = buf.sample(24, device=DEVICE)
+    parts = az_loss(net, batch, strict=False)
+    keep = batch.value_mask.bool()
+    sub = TrainBatch(*(t[keep] for t in (
+        batch.board, batch.control, batch.rep, batch.policy_move, batch.policy_prob,
+        batch.policy_len, batch.value, batch.weight_gen)))
+    ref = az_loss(net, sub, strict=False)
+    torch.testing.assert_close(parts.value, ref.value)
+    unmasked = az_loss(net, TrainBatch(*(t for t in (
+        batch.board, batch.control, batch.rep, batch.policy_move, batch.policy_prob,
+        batch.policy_len, batch.value, batch.weight_gen))), strict=False)
+    torch.testing.assert_close(parts.policy, unmasked.policy)
+    assert not torch.allclose(parts.value, unmasked.value)
 
 
 def test_the_buffer_survives_a_wraparound():

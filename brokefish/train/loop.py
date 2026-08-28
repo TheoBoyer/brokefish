@@ -297,6 +297,15 @@ class TrainConfig:
     # ⚠️ `value_weight` is **not** calibrated for the cross-entropy branch. See
     # `az_loss`.
     value_classes: int = 1
+    # **Value-label subsampling** (2026-08-25). The value loss is taken over 1 in k
+    # records of every game -- every k-th ply, residue rotating per game -- and the
+    # policy loss over all of them. Nothing else moves: same records, same cadence,
+    # same reuse per record, same optimiser, same throughput. It exists to move one
+    # quantity in isolation, how many times a game's one bit of `z` is shown to the
+    # head (~118 plies -> ~118 / k), which is the variable the Muon value-head
+    # investigation names and which playout cap randomisation could only move at the
+    # price of 1/p more reuse. 1 is every run before it, bit for bit.
+    value_subsample: int = 1
     # ⚠️ **Where the value head reads from**, and therefore which frame it predicts in.
     # `king` is spec §7.4's row select of the side-to-move king, predicting the mover's
     # result. `pooled` is the masked mean of every live token of both colours,
@@ -579,7 +588,8 @@ class Trainer:
                                   f"{run}.dat"))
         self.buffer = ReplayBuffer(
             path=path, window_games=cfg.window_games, mean_plies=cfg.mean_plies,
-            seed=cfg.seed, resume=resume is not None)
+            seed=cfg.seed, resume=resume is not None,
+            value_subsample=cfg.value_subsample)
         self.buffer.open_games(cfg.batch_games)
 
         # §9's counters.
@@ -1302,6 +1312,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="weight on the value term against the policy term. 1.0 is "
                         "AlphaZero's; AlphaGateau's code uses optax.l2_loss = "
                         "0.5*(x-y)^2, so 0.5 reproduces what they ran")
+    p.add_argument("--value-subsample", type=int, default=TrainConfig.value_subsample,
+                   help="take the value loss over 1 in k records of each game (every "
+                        "k-th ply), the policy loss over all of them. Moves how often "
+                        "one game's outcome bit is shown to the value head and nothing "
+                        "else. 1 = every record, the historical loss")
     p.add_argument("--betas", type=float, nargs=2, default=list(TrainConfig.betas))
     p.add_argument("--grad-clip", type=float, default=TrainConfig.grad_clip,
                    help="global grad-norm clip; 0 disables (AGZ specifies none)")
@@ -1401,6 +1416,7 @@ def config_from_args(args) -> TrainConfig:
         compile=args.compile, min_records=args.min_records,
         value_weight=args.value_weight,
         value_classes=args.value_classes,
+        value_subsample=args.value_subsample,
         value_head=args.value_head,
         total_steps=args.total_steps, euros_per_hour=args.euros_per_hour,
         buffer_dir=args.buffer_dir, seed=args.seed, impl=args.impl,

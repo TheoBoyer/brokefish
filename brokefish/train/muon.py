@@ -227,6 +227,12 @@ def chunk_spec(name: str, n_heads: int = 8, qkv_split: bool = True,
     return 0, 1
 
 
+def no_decay(name: str) -> bool:
+    """Shared with `loop.no_decay`; duplicated rather than imported because
+    `loop` imports this module and the cycle is not worth a lazy import here."""
+    return name.endswith("reinject_c")
+
+
 def is_muon_param(name: str, p: torch.Tensor) -> bool:
     """Hidden matmul weights only: 6,291,456 parameters, 98.6 % of this network.
 
@@ -271,9 +277,13 @@ def muon_param_groups(net: torch.nn.Module, *, lr: float, aux_lr: float, wd: flo
         if is_muon_param(n, p):
             muon.append(p)
             specs.append(chunk_spec(n, n_heads, qkv_split, head_group))
-        elif p.ndim >= 2:
+        elif p.ndim >= 2 and not no_decay(n):
             aux_decay.append(p)
         else:
+            # ⚠️ `no_decay` catches `reinject_c`, which is `[sites, 5]` and would
+            # otherwise land in `aux_decay` on its shape alone. It is a table of
+            # scalars starting at exactly zero; at this group's rates decaying it is
+            # not regularisation, it is deleting the parameter. See `loop.no_decay`.
             aux_flat.append(p)
 
     # ⚠️ **`aux_wd` decouples the AdamW matrices from the Muon ones, and the default

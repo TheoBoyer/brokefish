@@ -435,6 +435,26 @@ class TrainConfig:
         return lr
 
 
+def no_decay(name: str) -> bool:
+    """Parameters that are `ndim >= 2` but must not be weight-decayed.
+
+    ⚠️ **`reinject_c` is `[sites, 5]`, so the plain `ndim >= 2` rule would decay it**,
+    and it is a table of *scalars* -- one gain per (site, source) -- not a matrix. The
+    argument is the one already made for LayerNorm gains: shrinking a gain toward zero
+    is not regularisation, it scales a contribution down and nothing scales it back up.
+    Worse here, because these start at **exactly zero** and the whole experiment is
+    whether they grow: decay is a headwind aimed at the hypothesis.
+
+    ⚠️ The size of that headwind depends entirely on the recipe, which is why this is
+    fixed before the first run rather than after. AdamW's decoupled decay multiplies by
+    `(1 - lr * wd)` per step: at `t12h-wdl`'s lr 1e-3 and wd 0.01 that is a 5 % shrink
+    over 5,000 steps, an annoyance. At a Muon arm's lr 0.02 with `--adam-wd 0.09` it is
+    `exp(-9)`, which is annihilation. A run pair that differed only in optimiser would
+    not be comparable at all.
+    """
+    return name.endswith("reinject_c")
+
+
 def build_optimizer(net: torch.nn.Module, cfg: TrainConfig) -> torch.optim.Optimizer:
     """AGZ's optimiser, or ablation 1's.
 
@@ -491,8 +511,8 @@ def build_optimizer(net: torch.nn.Module, cfg: TrainConfig) -> torch.optim.Optim
             f"unknown optimizer {cfg.optimizer!r}, want 'sgd', 'adamw' or 'muon'")
 
     named = [(n, p) for n, p in net.named_parameters() if p.requires_grad]
-    decay = [p for _, p in named if p.ndim >= 2]
-    flat = [p for _, p in named if p.ndim < 2]
+    decay = [p for n, p in named if p.ndim >= 2 and not no_decay(n)]
+    flat = [p for n, p in named if p.ndim < 2 or no_decay(n)]
     return torch.optim.AdamW(
         [{"params": decay, "weight_decay": cfg.adam_wd},
          {"params": flat, "weight_decay": 0.0}],

@@ -163,6 +163,10 @@ def main() -> int:
     ap.add_argument("--impl", default="both",
                     choices=("fp8", "fp16", "int8", "both"))
     ap.add_argument("--checkpoint", default=None)
+    ap.add_argument("--reinject", default="none", choices=("none", "ln1", "both"),
+                    help="profile the per-layer input re-injection of spec 7.1a. The "
+                         "coefficients stay at zero, so the arithmetic is the shipped "
+                         "one and the phases are comparable to `none` row for row")
     a = ap.parse_args()
 
     ext = load_extension("brokefish_encoder", ["encoder.cu"])
@@ -176,7 +180,8 @@ def main() -> int:
         net, src = load_net(a.checkpoint)
     else:
         torch.manual_seed(0)
-        net, src = BrokefishNet().cuda().eval().half(), "random init"
+        net = BrokefishNet(reinject=a.reinject).cuda().eval().half()
+        src = f"random init, reinject={a.reinject}"
     print(f"net: {src}\nboards per launch: {a.boards}")
 
     boards, control, rep = _positions(a.boards)

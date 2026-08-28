@@ -443,9 +443,9 @@ __device__ __forceinline__ void layernorm(half* dst, const half* src, const half
     float c_sq = 0.f, c_ts = 0.f;
     uint32_t word0 = 0, word1 = 0;
     uint4 cs00 = {}, cs01 = {}, cs10 = {}, cs11 = {};
-    const bool inject = RJ && rj.coef != nullptr && site >= 0;
+    constexpr bool inject = RJ;
     if constexpr (RJ) {
-        if (inject) {
+        {
             const half* cc = rj.coef + (size_t)site * kRjStride;
             c_sq = __half2float(cc[0]);
             c_ts = __half2float(cc[1]);
@@ -517,20 +517,18 @@ __device__ __forceinline__ void layernorm(half* dst, const half* src, const half
             const uint4 cs = (BPC == 2 && bb) ? (col ? cs11 : cs10)
                                               : (col ? cs01 : cs00);
             const half* pcs = reinterpret_cast<const half*>(&cs);
-            // ⚠️ **Do not hoist this branch outward to skip the decode above.** Doing
-            // exactly that, on the theory that a site which does not inject should not
-            // pay for the shuffle, was measured on 2026-08-28 and **cost 0.7 % on `ln1`
-            // and 3.0 % on `both`** (`logs/reinject-ab-branch-guarded.log`), while
-            // taking the shipped arm from 250 to 254 registers. A branch around the two
-            // loads is a scheduling barrier: ptxas can no longer lift them out of the
-            // unrolled row loop, and their L2 latency stops hiding behind the
-            // shuffle reduction of the previous row. The dead decode is cheaper than
-            // the lost pipelining.
-            uint4 es = {}, et = {};
-            if (inject) {
-                es = ldg16(rj.emb + EmbOff::square + sq_i * Dm + lane * 8);
-                et = ldg16(rj.emb + EmbOff::type_special + ts_i * Dm + lane * 8);
-            }
+            // ⚠️ **There is no runtime guard on these two loads and there must not be.**
+            // The first version of this had `if (inject)` around them so that a site
+            // which does not inject would skip the work; it **cost 0.7 % on `ln1` and
+            // 3.0 % on `both`** (`logs/reinject-ab-branch-guarded.log`) and 4 registers,
+            // because a branch around them is a scheduling barrier -- ptxas can no
+            // longer lift them out of the unrolled row loop and their L2 latency stops
+            // hiding behind the previous row's shuffle reduction. The answer is to make
+            // the *mode* a template parameter, which is what `RJ` is, so a non-injecting
+            // site is compiled without any of this rather than branching around it.
+            const uint4 es = ldg16(rj.emb + EmbOff::square + sq_i * Dm + lane * 8);
+            const uint4 et = ldg16(rj.emb + EmbOff::type_special
+                                   + ts_i * Dm + lane * 8);
             const half* pe = reinterpret_cast<const half*>(&es);
             const half* pt = reinterpret_cast<const half*>(&et);
 #pragma unroll
@@ -1182,8 +1180,13 @@ struct Timer {
 // worth its precision" is a real one and is answered by measuring both, not by
 // assuming the FLOP share carries over. `QOUT` implies `QATT`: quantising the
 // projection while leaving QKV in fp16 is the strictly worse half of the trade.
+// `RJ` is the re-injection *mode* and not a flag -- 0 off, 1 the attention norm of each
+// block, 2 both norms -- because the difference has to reach `layernorm`'s template.
+// A runtime `rj_mode` would leave the `ln2` site of mode 1 executing a decode it throws
+// away: measured 5,355 cycles per board, **1.3 % of the whole kernel**
+// (`bench_phases --reinject ln1` against `--reinject none`, 2026-08-28).
 template <bool FP8, bool INT8, bool TWOB, bool PROF = false, bool QATT = false,
-          bool QOUT = QATT, bool RJ = false>
+          bool QOUT = QATT, int RJ = 0>
 __global__ __launch_bounds__(THREADS, TWOB ? 1 : 2) void encoder_kernel(
     half* __restrict__ y, const half* __restrict__ weights,
     const uint8_t* __restrict__ wq8, const float* __restrict__ sq8,
@@ -1203,10 +1206,8 @@ __global__ __launch_bounds__(THREADS, TWOB ? 1 : 2) void encoder_kernel(
     const half* __restrict__ tail, half* __restrict__ policy,
     half* __restrict__ promo, float* __restrict__ value,
     int n_layers, float eps, int debug_stage, int n_boards, int n_value, int vmode,
-    // Per-layer input re-injection. `rj_coef` is `[sites][kRjStride]` halves and
-    // `rj_mode` is 1 for the attention norm alone, 2 for both norms of a block; the
-    // template flag is what decides whether any of it is compiled in at all.
-    const half* __restrict__ rj_coef = nullptr, int rj_mode = 0) {
+    // Per-layer input re-injection: `[sites][kRjStride]` halves, indexed by `RJ`.
+    const half* __restrict__ rj_coef = nullptr) {
     static_assert(!(FP8 && INT8), "the FFN is quantised once, in one format");
     static_assert(!QATT || INT8, "QKVO quantisation is int8 only; e4m3 was measured "
                                  "3x worse at that site before it was built");
@@ -1246,7 +1247,6 @@ __global__ __launch_bounds__(THREADS, TWOB ? 1 : 2) void encoder_kernel(
     // window do not move between layers, only the site index does. Same reason as
     // `tm` for living up here.
     const RjCtx rj{boards, control, rep_ptr, emb, RJ ? rj_coef : nullptr, b0, nb};
-    const bool rj_both = RJ && rj_mode == 2;
 
     // One 32-bit word per board says which slots hold a live piece (spec 7.3). Dead
     // keys leave the softmax as -inf; dead rows are computed and never read.
@@ -1286,8 +1286,8 @@ __global__ __launch_bounds__(THREADS, TWOB ? 1 : 2) void encoder_kernel(
 
         // The affine slots hold ones and zeros: gamma lives in w_qkv's input axis and
         // beta in b_qkv, folded there by `FusedEncoder._fold_norm`.
-        layernorm<false, TB, RJ>(bufB, bufA, W + Off::ln1_w, W + Off::ln1_b, eps,
-                                 warp, lane, rj, rj_both ? layer * 2 : layer);
+        layernorm<false, TB, (RJ != 0)>(bufB, bufA, W + Off::ln1_w, W + Off::ln1_b, eps,
+                                        warp, lane, rj, RJ == 2 ? layer * 2 : layer);
 
         if (debug_stage == 1) { __syncthreads(); goto dump; }
         // Cross-warp handoff. layernorm writes bufB by row (warp w owns rows
@@ -1385,8 +1385,8 @@ __global__ __launch_bounds__(THREADS, TWOB ? 1 : 2) void encoder_kernel(
         residual_rows<TB>(bufA, scratch, warp, lane);
 
         if (debug_stage == 2) goto dump;
-        layernorm<false, TB, RJ>(bufB, bufA, W + Off::ln2_w, W + Off::ln2_b, eps,
-                                 warp, lane, rj, rj_both ? layer * 2 + 1 : -1);
+        layernorm<false, TB, (RJ == 2)>(bufB, bufA, W + Off::ln2_w, W + Off::ln2_b, eps,
+                                        warp, lane, rj, layer * 2 + 1);
         if (debug_stage == 3) { __syncthreads(); goto dump; }
         __syncthreads();
         tm.mark(prof::kRes1Ln2);
@@ -1580,13 +1580,13 @@ T* ptr_or_null(const torch::Tensor& t) {
 // kernel; `csrc/tests/README.md` records the ptxas report that proves it.
 bool g_profile = false;
 template <bool FP8, bool INT8, bool TWOB, bool PROF, bool QATT = false,
-          bool QOUT = QATT, bool RJ = false>
+          bool QOUT = QATT, int RJ = 0>
 void launch_one(int n_boards, size_t smem, half* y, const half* weights,
                 const uint8_t* wq8, const float* sq8, const int8_t* alive,
                 const uint16_t* boards, const int16_t* control, const uint8_t* rep,
                 const half* emb, const half* tail, half* policy, half* promo,
                 float* value, int n_layers, float eps, int debug_stage, int n_value,
-                int vmode, const half* rj_coef = nullptr, int rj_mode = 0) {
+                int vmode, const half* rj_coef = nullptr) {
     constexpr bool Q8 = FP8 || INT8;
     constexpr int BPC = brokefish::Lay<TWOB>::BPC;
     const int grid = (n_boards + BPC - 1) / BPC;
@@ -1596,7 +1596,7 @@ void launch_one(int n_boards, size_t smem, half* y, const half* weights,
         <<<grid, brokefish::THREADS, smem>>>(
         y, weights, Q8 ? wq8 : nullptr, Q8 ? sq8 : nullptr, alive, boards, control,
         rep, emb, tail, policy, promo, value, n_layers, eps, debug_stage, n_boards,
-        n_value, vmode, RJ ? rj_coef : nullptr, RJ ? rj_mode : 0);
+        n_value, vmode, RJ ? rj_coef : nullptr);
 }
 
 // `quant`: 0 = fp16, 1 = e4m3, 2 = int8. ⚠️ An explicit mode rather than a property of
@@ -1646,21 +1646,35 @@ void launch(int n_boards, int quant, bool twob, half* y, const half* weights,
         TORCH_CHECK(rj_mode == 1 || rj_mode == 2,
                     "rj_mode is 1 (the attention norm) or 2 (both norms of a block), "
                     "got ", rj_mode);
+        // The profile variants exist so `bench_phases` can put the injection's cost in
+        // a phase instead of leaving it as a wall-clock delta; they are the same two
+        // configurations and nothing else.
+#define BROKEFISH_LAUNCH_RJ(F, I, W, P, A, O, M)                                       \
+        launch_one<F, I, W, P, A, O, M>(                                               \
+            n_boards, smem, y, weights, wq8, sq8, alive, boards, control, rep, emb,     \
+            tail, policy, promo, value, n_layers, eps, debug_stage, n_value, vmode,     \
+            rj_coef)
+#define BROKEFISH_LAUNCH_RJM(F, I, W, A, O)                                         \
+        do {                                                                           \
+            if (rj_mode == 2) {                                                        \
+                if (g_profile) BROKEFISH_LAUNCH_RJ(F, I, W, true, A, O, 2);             \
+                else           BROKEFISH_LAUNCH_RJ(F, I, W, false, A, O, 2);            \
+            } else {                                                                   \
+                if (g_profile) BROKEFISH_LAUNCH_RJ(F, I, W, true, A, O, 1);             \
+                else           BROKEFISH_LAUNCH_RJ(F, I, W, false, A, O, 1);            \
+            }                                                                          \
+        } while (0)
         if (quant == 3 && twob) {
-            launch_one<false, true, true, false, true, true, true>(
-                n_boards, smem, y, weights, wq8, sq8, alive, boards, control, rep, emb,
-                tail, policy, promo, value, n_layers, eps, debug_stage, n_value, vmode,
-                rj_coef, rj_mode);
+            BROKEFISH_LAUNCH_RJM(false, true, true, true, true);
         } else if (quant == 0 && !twob) {
-            launch_one<false, false, false, false, false, false, true>(
-                n_boards, smem, y, weights, wq8, sq8, alive, boards, control, rep, emb,
-                tail, policy, promo, value, n_layers, eps, debug_stage, n_value, vmode,
-                rj_coef, rj_mode);
+            BROKEFISH_LAUNCH_RJM(false, false, false, false, false);
         } else {
             TORCH_CHECK(false, "input re-injection is built for quant 3 with two "
                                "boards per CTA and for quant 0 with one; got quant ",
                         quant, ", twob ", (int)twob);
         }
+#undef BROKEFISH_LAUNCH_RJ
+#undef BROKEFISH_LAUNCH_RJM
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         return;
     }

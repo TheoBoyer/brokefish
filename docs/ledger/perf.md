@@ -1331,7 +1331,29 @@ site that does not inject would not pay for the shuffle -- **cost 0.7 % on `ln1`
 250 to 254 registers. A branch around the two loads is a scheduling barrier: ptxas can
 no longer lift them out of the unrolled row loop and their L2 latency stops hiding
 behind the previous row's shuffle reduction. The dead decode is cheaper than the lost
-pipelining. Reverted, with the reason written where the branch would go back.
+pipelining.
+
+### Which is why the mode is a template parameter: +4.19 % -> +2.64 %
+
+`bench_phases --reinject ln1` against `--reinject none` found the dead work rather than
+the branch: **`res1_ln2` grew 15,356 -> 20,711 cycles per board in a mode that does not
+inject at `ln2` at all**, 1.3 % of the whole kernel spent decoding board words and
+throwing them away. The answer is neither a branch nor the dead code: make the *mode* a
+template argument (`int RJ`, 0/1/2) so the `ln2` call site of mode 1 is `RJ = false`
+code with nothing to branch around.
+
+| phase, cycles/board (warp 0) | none | ln1, runtime mode | ln1, template mode |
+|---|---:|---:|---:|
+| `ln1` | 12,168 | 22,068 | 20,416 |
+| `res1_ln2` | 15,356 | 20,711 | **15,376** |
+| whole kernel | 401,343 | 418,234 | 410,048 |
+| instrumented delta | — | +4.21 % | **+2.17 %** |
+
+`res1_ln2` returns to the uninjected value exactly, and removing the runtime branch
+helped the injecting site too. **In the real MCTS, `ln1` goes +3.80 % -> +2.64 %**
+(`logs/reinject-ab-mode-template.log`; `both` is unchanged at +5.17 %, which is the
+control -- it injects at every site, so the template can save it nothing). Still 254
+registers, no spill.
 
 **The training step pays the same order**, forward + backward on a 1024-row
 micro-batch, 10 order-balanced rounds: `none` 575.34 ms, **`ln1` 600.31 ms (+4.34 %)**,

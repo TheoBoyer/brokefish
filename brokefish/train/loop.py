@@ -44,7 +44,7 @@ import torch
 
 from brokefish.env import cuda_impl as _cuda_env
 from brokefish.env import torch_impl as _torch_env
-from brokefish.nn.model import BrokefishNet
+from brokefish.nn.model import BrokefishNet, REINJECT_MODES
 from brokefish.search import SearchConfig, search_impl
 
 from .buffer import ReplayBuffer
@@ -320,6 +320,14 @@ class TrainConfig:
     # token's attention. It also lands in `config_hash`, so a resume across it is
     # refused -- correct, since the two heads take different inputs.
     value_head: str = "king"
+    # **Per-layer input re-injection** (2026-08-28). Each block's LayerNorm sees
+    # `h + sum_k c[site, k] * E_k` -- the five embedding tables of spec §7.2, with a
+    # learned scalar per (site, source). The residual stream is untouched. `none` is
+    # every run before it, bit for bit, and the coefficients start at zero, so `ln1`
+    # and `both` also *begin* as the old network rather than as a re-randomised one.
+    # ⚠️ The kernel cost is real and is the reason `both` exists as a separate mode:
+    # it doubles the per-token gather. See `docs/ledger/perf.md`.
+    reinject: str = "none"
     # `torch.compile` on the gradient step's forward. ~1.25x measured at batch 256;
     # see `Trainer.__init__` for why the dead-end entry in `CLAUDE.md` is about
     # something else. Off by default: it changes training numerics, so a compiled run
@@ -549,7 +557,8 @@ class Trainer:
 
         torch.manual_seed(cfg.seed)
         self.net = BrokefishNet(n_value=cfg.value_classes,
-                                value_head=cfg.value_head).to(self.device)  # fp32, §8.2
+                                value_head=cfg.value_head,
+                                reinject=cfg.reinject).to(self.device)  # fp32, §8.2
         self.opt = build_optimizer(self.net, cfg)
         # ⚠️ `self.net` stays the **raw** module and only the call is compiled.
         # `PackedWeights.pack`, §12 check 9 and every checkpoint path read the module
@@ -1317,6 +1326,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "k-th ply), the policy loss over all of them. Moves how often "
                         "one game's outcome bit is shown to the value head and nothing "
                         "else. 1 = every record, the historical loss")
+    p.add_argument("--reinject", choices=REINJECT_MODES, default=TrainConfig.reinject,
+                   help="re-inject the five input embeddings into every block's "
+                        "LayerNorm with a learned scalar per (site, source). `ln1` is "
+                        "the attention norm of each block, `both` adds the FFN norm at "
+                        "twice the gather. Coefficients start at zero, so this begins "
+                        "as the network it modifies")
     p.add_argument("--betas", type=float, nargs=2, default=list(TrainConfig.betas))
     p.add_argument("--grad-clip", type=float, default=TrainConfig.grad_clip,
                    help="global grad-norm clip; 0 disables (AGZ specifies none)")
@@ -1418,6 +1433,7 @@ def config_from_args(args) -> TrainConfig:
         value_classes=args.value_classes,
         value_subsample=args.value_subsample,
         value_head=args.value_head,
+        reinject=args.reinject,
         total_steps=args.total_steps, euros_per_hour=args.euros_per_hour,
         buffer_dir=args.buffer_dir, seed=args.seed, impl=args.impl,
         encoder=args.encoder, deterministic=not args.nondeterministic,

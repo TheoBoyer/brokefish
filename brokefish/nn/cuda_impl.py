@@ -146,6 +146,16 @@ class FusedEncoder:
     vmode = 0
     EMB_TABLES = ("emb_square", "emb_type_special", "emb_color_turn",
                   "emb_clock", "emb_rep")
+    #: Per-layer input re-injection: 0 = off, 1 = the attention norm of each block,
+    #: 2 = both norms. Same lifetime and reason as `n_value` -- a class attribute so the
+    #: backbone-only construction, which has no `BrokefishNet` and so no coefficients,
+    #: still answers the question.
+    RJMODE = {"none": 0, "ln1": 1, "both": 2}
+    rj_mode = 0
+    rj = None
+    #: Halves per site in the coefficient slab; `kRjStride` in `csrc/encoder.cu`. Five
+    #: are used and the padding buys the 16-byte alignment of the load.
+    RJ_STRIDE = 8
 
     def __init__(self, source, acc_dtype: str = "fp16", fp8: bool = False,
                  int8: bool = False, two_boards: bool | None = None,
@@ -395,6 +405,26 @@ class FusedEncoder:
             val.reshape(-1),
         ]).contiguous().cuda()
 
+        # ⚠️ **A slab of its own, not a tail extension.** The tail's length is a
+        # compile-time constant the kernel asserts against; the coefficient block is
+        # sized by `n_layers` and by the mode, so folding it in would make that
+        # constant a function of both.
+        self.rj_mode = self.RJMODE[getattr(net, "reinject", "none")]
+        if self.rj_mode:
+            if not (self.quant == 3 and self.two_boards) \
+                    and not (self.quant == 0 and not self.two_boards):
+                raise NotImplementedError(
+                    f"input re-injection is built for quant 3 with two boards per CTA "
+                    f"(what self-play runs) and for quant 0 with one (the reference the "
+                    f"tests use); this encoder is {self.label}. Adding an arm is a "
+                    f"line in `launch`, paid for in build time on every compile")
+            c = net.reinject_c.detach().float()
+            slab = torch.zeros(c.shape[0], self.RJ_STRIDE, dtype=torch.half)
+            slab[:, :c.shape[1]] = c.half()
+            self.rj = slab.reshape(-1).contiguous().cuda()
+        else:
+            self.rj = torch.empty(0, dtype=torch.half, device="cuda")
+
     def _require_net(self, what: str) -> BrokefishNet:
         if self.net is None:
             raise ValueError(
@@ -469,8 +499,15 @@ class FusedEncoder:
             self.weights, self.emb, self.tail,
             self.policy_out, self.promo_out, self.value_out, self._empty_h,
             self.n_layers, self.eps, 0, self._wq8, self._sq8, self.quant,
-            int(self.two_boards), self.n_value, self.vmode)
+            int(self.two_boards), self.n_value, self.vmode,
+            self._rj_slab(), self.rj_mode)
         return self.policy_out, self.promo_out, self.value_out
+
+    def _rj_slab(self):
+        """The coefficient slab, or an empty tensor when nothing is injected."""
+        if self.rj is None:
+            return torch.empty(0, dtype=torch.half, device="cuda")
+        return self.rj
 
     def forward_stage(self, boards, control, rep, stage: int):
         """Activations at an intermediate stage, for testing the prologue and epilogue.
@@ -489,5 +526,6 @@ class FusedEncoder:
             self.weights, self.emb, self.tail,
             self._empty_h, self._empty_h, self._empty_f, self.state,
             self.n_layers, self.eps, stage, self._wq8, self._sq8, self.quant,
-            int(self.two_boards))
+            int(self.two_boards), self.n_value, self.vmode,
+            self._rj_slab(), self.rj_mode)
         return self.state

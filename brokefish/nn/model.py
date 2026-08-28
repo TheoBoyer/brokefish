@@ -33,6 +33,7 @@ from typing import Optional
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 D_MODEL, N_LAYERS, N_HEADS, D_FF, T = 256, 8, 8, 1024, 32
 
@@ -91,6 +92,33 @@ VALUE_HEADS = ("king", "pooled", "prenorm")
 #: written before 2026-08-22.
 VALUE_MODE_ID = {"pooled": 1, "prenorm": 2}
 
+#: **Per-layer re-injection of the model's own inputs** (2026-08-28). Each block's
+#: LayerNorm input becomes ``h + sum_k c[site, k] * E_k``, where the five ``E_k`` are the
+#: embedding tables of spec 7.2 -- square, type_special, color_turn, clock, rep -- and
+#: ``c`` is a learned scalar per (site, source). **The residual stream is untouched**:
+#: the mix enters the LN's argument and nothing else, so ``h`` still carries exactly
+#: ``h + attn(.) + ffn(.)``.
+#:
+#: ``"none"`` is every network before this date and runs the *same* ``self.encoder(x)``
+#: call it always did. ``"ln1"`` injects at the attention norm of each block, 8 sites.
+#: ``"both"`` injects at the FFN norm as well, 16 sites, and costs twice the gather.
+#:
+#: ⚠️ **The residual's own coefficient is fixed at 1 and that loses nothing.** The mix
+#: is the first thing a LayerNorm sees and LN is scale-invariant, so only the *ratio*
+#: between the residual and the injected term is observable; a learned coefficient on
+#: ``h`` would be a degenerate direction for the optimiser to wander along.
+#:
+#: ⚠️ **Zero-initialised, so an untrained ``reinject`` net is the old network exactly**
+#: -- not approximately. The kernel is templated on the mode rather than branching on
+#: it, so ``"none"`` is also byte-identical machine code.
+REINJECT_MODES = ("none", "ln1", "both")
+REINJECT_MODE_ID = {"ln1": 1, "both": 2}
+#: How many embedding tables feed a site, in the normative order of `EmbOff` in
+#: `csrc/encoder.cu:199` and of `cuda_impl.PackedWeights.EMB_TABLES`: square,
+#: type_special, color_turn, clock, rep. The kernel indexes `reinject_c` with the same
+#: integers, so this order is part of the file format.
+N_SOURCES = 5
+
 
 def wdl_to_scalar(logits: torch.Tensor) -> torch.Tensor:
     """``[N, 3]`` logits to the ``[N]`` scalar in ``[-1, 1]`` every consumer expects.
@@ -146,10 +174,29 @@ def value_head_of(state: dict) -> str:
                      f"{VALUE_MODE_ID}")
 
 
+def reinject_of(state: dict) -> str:
+    """Which per-layer input re-injection a ``state_dict`` was written with.
+
+    ⚠️ Absence of the marker is the legacy answer, exactly as for ``value_mode``: every
+    checkpoint written before 2026-08-28 predates the feature and injects nothing. The
+    id is stored rather than the mode name so the meaning of an old file cannot move
+    when a mode is added.
+    """
+    if "reinject_mode" not in state:
+        return "none"
+    got = int(state["reinject_mode"])
+    for name, i in REINJECT_MODE_ID.items():
+        if i == got:
+            return name
+    raise ValueError(f"unknown reinject_mode {got} in this state_dict; this build "
+                     f"knows {REINJECT_MODE_ID}")
+
+
 def net_for_state(state: dict, **kw) -> "BrokefishNet":
     """An empty net shaped to hold ``state``. Load into it; do not skip the load."""
     return BrokefishNet(n_value=n_value_of(state),
-                        value_head=value_head_of(state), **kw)
+                        value_head=value_head_of(state),
+                        reinject=reinject_of(state), **kw)
 
 
 def decode_boards(boards: torch.Tensor):
@@ -179,7 +226,8 @@ class BrokefishNet(nn.Module):
 
     def __init__(self, d_model: int = D_MODEL, n_layers: int = N_LAYERS,
                  n_heads: int = N_HEADS, d_ff: int = D_FF, eps: float = 1e-5,
-                 n_value: int = N_VALUE_SCALAR, value_head: str = "king"):
+                 n_value: int = N_VALUE_SCALAR, value_head: str = "king",
+                 reinject: str = "none"):
         super().__init__()
         if n_value not in VALUE_CLASSES:
             raise ValueError(f"n_value must be one of {VALUE_CLASSES} "
@@ -188,8 +236,13 @@ class BrokefishNet(nn.Module):
         if value_head not in VALUE_HEADS:
             raise ValueError(f"value_head must be one of {VALUE_HEADS}, got "
                              f"{value_head!r}")
+        if reinject not in REINJECT_MODES:
+            raise ValueError(f"reinject must be one of {REINJECT_MODES}, got "
+                             f"{reinject!r}")
         self.d_model, self.n_layers, self.n_value = d_model, n_layers, n_value
         self.value_head = value_head
+        self.reinject = reinject
+        self.n_sites = 0 if reinject == "none" else n_layers * (2 if reinject == "both" else 1)
 
         self.emb_square = nn.Embedding(N_SQUARE, d_model)
         self.emb_type_special = nn.Embedding(N_TYPE_SPECIAL, d_model)
@@ -227,6 +280,18 @@ class BrokefishNet(nn.Module):
             self.register_buffer("value_mode",
                                  torch.tensor(VALUE_MODE_ID[value_head], dtype=torch.int64))
 
+        # ⚠️ **Zeros, and that is the whole retro-compatibility story here.** A net
+        # built with `reinject` and never trained is the old network to the last bit,
+        # so an A/B that changes only this flag starts from a shared point rather than
+        # from a re-randomised one -- and a `t12h` checkpoint can be loaded into it,
+        # since the only new tensors are these and they have no old counterpart to
+        # conflict with. The marker rides beside them for the same reason `value_mode`
+        # does: nothing else in a bare `state_dict` says what shape the net had.
+        if reinject in REINJECT_MODE_ID:
+            self.reinject_c = nn.Parameter(torch.zeros(self.n_sites, N_SOURCES))
+            self.register_buffer("reinject_mode",
+                                 torch.tensor(REINJECT_MODE_ID[reinject], dtype=torch.int64))
+
         std = d_model ** -0.5
         for mod in (self.emb_square, self.emb_type_special, self.emb_color_turn,
                     self.emb_clock, self.emb_rep,
@@ -248,22 +313,91 @@ class BrokefishNet(nn.Module):
         finite vector that the attention mask then makes irrelevant. That is
         spec 7.3's bargain, and it is what keeps the prologue divergence-free.
         """
-        captured, color, special, ptype, square = decode_boards(boards)
-        stm = (control < 0).long()                          # 1 = black to move
-        clock = (control.abs().long() - 1).clamp_(0, N_CLOCK - 1)
-        rep_i = rep.long().clamp_(0, N_REP - 1)
+        idx, alive = self.embed_indices(boards, control, rep)
 
         # The clock and repetition tables are indexed per board, so their sum is
         # one vector for all 32 tokens. Adding them to each other first is what
         # the kernel does -- four half2 adds per board instead of eight per token
         # -- and in fp16 the grouping is part of the answer, not an optimisation
         # detail. Hence the order: (square + type_special + color_turn) + (clock + rep).
-        per_board = self.emb_clock(clock) + self.emb_rep(rep_i)
-        x = self.emb_square(square)
-        x = x + self.emb_type_special(ptype * 2 + special)
-        x = x + self.emb_color_turn(color * 2 + stm[:, None])
+        per_board = self.emb_clock(idx[3]) + self.emb_rep(idx[4])
+        x = self.emb_square(idx[0])
+        x = x + self.emb_type_special(idx[1])
+        x = x + self.emb_color_turn(idx[2])
         x = x + per_board[:, None, :]
-        return x, captured == 0
+        return x, alive
+
+    def embed_indices(self, boards: torch.Tensor, control: torch.Tensor,
+                      rep: torch.Tensor):
+        """The five table indices of spec 7.2, plus the live-slot mask.
+
+        Split out of :meth:`embed` because per-layer re-injection needs the *indices*
+        rather than their summed lookup: it gathers the same five rows again at every
+        site with different coefficients. The order is normative and shared with
+        `EmbOff` in the kernel -- square, type_special, color_turn, clock, rep -- and
+        the last two are ``[N]``, one row per board, where the first three are
+        ``[N, 32]``.
+        """
+        captured, color, special, ptype, square = decode_boards(boards)
+        stm = (control < 0).long()                          # 1 = black to move
+        idx = (square,
+               ptype * 2 + special,
+               color * 2 + stm[:, None],
+               (control.abs().long() - 1).clamp_(0, N_CLOCK - 1),
+               rep.long().clamp_(0, N_REP - 1))
+        return idx, captured == 0
+
+    # -- stage 2 -----------------------------------------------------------
+
+    def mix(self, idx, c: torch.Tensor) -> torch.Tensor:
+        """``sum_k c[k] * E_k`` for one site: ``[N, 32, d]``.
+
+        ⚠️ **The coefficient scales the table, not the gathered result.** Both give the
+        same number; only this one multiplies a ``[rows, d]`` tensor instead of an
+        ``[N, 32, d]`` one, and -- the part that matters -- it leaves autograd saving
+        the *indices* for the gather's backward rather than five ``[N, 32, d]``
+        activations per site. At 8 sites and a 1024-row batch that is the difference
+        between ~0 and 1.3 GB of graph.
+
+        The summation order mirrors :meth:`embed`'s for the same reason it is normative
+        there: (square + type_special + color_turn) + (clock + rep), so the kernel's
+        grouping and this one differ only where fp16 rounds.
+        """
+        m = F.embedding(idx[0], c[0] * self.emb_square.weight)
+        m = m + F.embedding(idx[1], c[1] * self.emb_type_special.weight)
+        m = m + F.embedding(idx[2], c[2] * self.emb_color_turn.weight)
+        per_board = (F.embedding(idx[3], c[3] * self.emb_clock.weight)
+                     + F.embedding(idx[4], c[4] * self.emb_rep.weight))
+        return m + per_board[:, None, :]
+
+    def encode(self, x: torch.Tensor, alive: torch.Tensor, idx=None) -> torch.Tensor:
+        """The eight blocks. ``idx`` is required when ``reinject`` is on.
+
+        ⚠️ **The ``"none"`` path is the original call, untouched.** It goes through
+        `nn.TransformerEncoder`, which owns a fused fast path this hand-rolled loop does
+        not reproduce bit-for-bit; keeping the default on it means no existing number
+        moves because this feature exists.
+
+        The re-injecting path calls each layer's own ``_sa_block`` / ``_ff_block``
+        rather than reimplementing them, so the parameters, their names and the
+        arithmetic are the layer's -- the only edit is what goes into ``norm1`` and
+        ``norm2``.
+        """
+        if self.reinject == "none":
+            return self.encoder(x, src_key_padding_mask=~alive)
+        if idx is None:
+            raise ValueError("reinject needs the embedding indices; call "
+                             "`embed_indices` and pass them, or use `forward`")
+        pad = ~alive
+        both = self.reinject == "both"
+        for i, lay in enumerate(self.encoder.layers):
+            site = i * 2 if both else i
+            x = x + lay._sa_block(lay.norm1(x + self.mix(idx, self.reinject_c[site])),
+                                  None, pad, is_causal=False)
+            n2 = lay.norm2(x + self.mix(idx, self.reinject_c[site + 1])) if both \
+                else lay.norm2(x)
+            x = x + lay._ff_block(n2)
+        return x
 
     # -- stage 3 -----------------------------------------------------------
 
@@ -355,8 +489,13 @@ class BrokefishNet(nn.Module):
         element. Only the loss wants it, and only because a classifier is trained on
         logits while the search is fed a scalar.
         """
-        x, alive = self.embed(boards, control, rep)
-        h = self.encoder(x, src_key_padding_mask=~alive)
+        idx, alive = self.embed_indices(boards, control, rep)
+        per_board = self.emb_clock(idx[3]) + self.emb_rep(idx[4])
+        x = self.emb_square(idx[0])
+        x = x + self.emb_type_special(idx[1])
+        x = x + self.emb_color_turn(idx[2])
+        x = x + per_board[:, None, :]
+        h = self.encode(x, alive, idx)
         return self.heads(self.norm_f(h), control, alive=alive,
                           with_logits=with_logits, h_raw=h)
 
@@ -372,6 +511,12 @@ def full_forward_via_backbone(net: BrokefishNet, backbone, boards, control, rep,
     Writing a Triton prologue and epilogue for symmetry would produce no number
     we do not already have.
     """
+    if net.reinject != "none":
+        raise NotImplementedError(
+            "the Triton backbone does not implement per-layer input re-injection. "
+            "It is a stack-level change -- the mix enters every block's LayerNorm -- "
+            "so a fused backbone that only sees `x` cannot express it. Use "
+            "`--impl cuda` or `--impl torch`")
     x, alive = net.embed(boards, control, rep)
     h = backbone(x, alive)
     return net.heads(net.norm_f(h), control, alive=alive, with_logits=with_logits,

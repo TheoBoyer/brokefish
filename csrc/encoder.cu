@@ -380,9 +380,49 @@ __device__ __forceinline__ void gemm_direct(uint32_t (&acc)[MT][4][2], const hal
 /// ⚠️ Only the *body* folds. `tail_epilogue`'s `norm_f` would need a bias vector added
 /// to the three heads, which have none, so it keeps `AFFINE = true` -- it runs once per
 /// board against the body's sixteen, and buying it would cost a new slab field.
-template <bool AFFINE, int ROWS>
+// --------------------------------------------------------------------------
+// Per-layer input re-injection (2026-08-28). A block's LayerNorm sees
+// `h + sum_k c[site][k] * E_k` instead of `h`, where the five `E_k` are the embedding
+// tables of spec 7.2 and `c` is a learned scalar per (site, source). The residual
+// stream is untouched: this changes what the norm is *given*, not what the block adds.
+//
+// The whole cost question is which of the five tables is per token. Only three are:
+// `square` (64 rows), `type_special` (12) and `color_turn` (4). `clock` and `rep` are
+// indexed by the *board*, exactly as in `embed_board`, so they are the same vector for
+// all 32 rows. And within one board `color_turn` takes only two of its four rows,
+// because the side to move is fixed -- so it too can be read once per LayerNorm and
+// selected per row by the token's colour bit.
+//
+// That is why the preamble below pre-mixes colour, clock and rep into **two slices per
+// board**, `cs[colour]`, and the row loop gathers only `square` and `type_special`:
+// two 16-byte loads per lane per row instead of five. Per board per site that is
+// 32 rows x 2 x 512 B = 32 KB against 80 KB.
+//
+// ⚠️ The tables are read with `__ldg` and they are 40 KB in total for the three
+// per-token ones -- shared by every CTA on the device and hit in L2 essentially always.
+// That is the argument for gathering them again rather than materialising a per-board
+// mix: the basis is smaller than any precomputed combination of it, and it is shared.
+constexpr int kRjStride = 8;      // halves per site in the coefficient slab; 5 are used
+
+struct RjCtx {
+    const uint16_t* __restrict__ boards;
+    const int16_t* __restrict__ control;
+    const uint8_t* __restrict__ rep;
+    const half* __restrict__ emb;
+    //: `[site][kRjStride]` halves. **Null means this site does not inject**, which is
+    //: how `--reinject ln1` skips `ln2` without a second kernel instantiation.
+    const half* __restrict__ coef;
+    int b0, nb;
+};
+
+__device__ __forceinline__ uint4 ldg16(const half* p) {
+    return __ldg(reinterpret_cast<const uint4*>(p));
+}
+
+template <bool AFFINE, int ROWS, bool RJ>
 __device__ __forceinline__ void layernorm(half* dst, const half* src, const half* gamma,
-                                          const half* beta, float eps, int warp, int lane) {
+                                          const half* beta, float eps, int warp, int lane,
+                                          const RjCtx& rj, int site) {
     // One 128-bit load each instead of eight scalar LDG.E.U16: a lane's eight
     // columns are contiguous and the same for every row it owns, so these are
     // loop-invariant and 16-byte aligned (every offset in Off is a multiple of
@@ -395,6 +435,60 @@ __device__ __forceinline__ void layernorm(half* dst, const half* src, const half
     }
     const half* gv = reinterpret_cast<const half*>(&graw);
     const half* bv = reinterpret_cast<const half*>(&braw);
+
+    // -- re-injection preamble, loop-invariant over the rows below ---------
+    constexpr int BPC = ROWS / T;
+    static_assert(ROWS % T == 0, "a LayerNorm covers whole boards");
+    static_assert(T % NWARPS == 0, "so that one unrolled iteration stays on one board");
+    float c_sq = 0.f, c_ts = 0.f;
+    uint32_t word0 = 0, word1 = 0;
+    uint4 cs00 = {}, cs01 = {}, cs10 = {}, cs11 = {};
+    const bool inject = RJ && rj.coef != nullptr && site >= 0;
+    if constexpr (RJ) {
+        if (inject) {
+            const half* cc = rj.coef + (size_t)site * kRjStride;
+            c_sq = __half2float(cc[0]);
+            c_ts = __half2float(cc[1]);
+            const float c_ct = __half2float(cc[2]);
+            const float c_ck = __half2float(cc[3]);
+            const float c_rp = __half2float(cc[4]);
+#pragma unroll
+            for (int bb = 0; bb < BPC; ++bb) {
+                // Same clamps and the same duplicate-board rule as `embed_board`: an
+                // odd batch's spare slot re-reads board `b0`, which is harmless
+                // arithmetic whose outputs are never written.
+                const int gb = rj.b0 + (bb < rj.nb ? bb : 0);
+                const uint32_t w = rj.boards[(size_t)gb * T + lane];
+                const int ctl = rj.control[gb];
+                const int stm = ctl < 0;
+                const int clk = min(max((ctl < 0 ? -ctl : ctl) - 1, 0), N_CLOCK - 1);
+                const int rp = min((int)rj.rep[gb], N_REP - 1);
+                const uint4 kc = ldg16(rj.emb + EmbOff::clock + clk * Dm + lane * 8);
+                const uint4 kr = ldg16(rj.emb + EmbOff::rep + rp * Dm + lane * 8);
+                const half* pc = reinterpret_cast<const half*>(&kc);
+                const half* pr = reinterpret_cast<const half*>(&kr);
+                uint4 mix[2];
+#pragma unroll
+                for (int col = 0; col < 2; ++col) {
+                    const uint4 kt = ldg16(rj.emb + EmbOff::color_turn
+                                           + (col * 2 + stm) * Dm + lane * 8);
+                    const half* pt = reinterpret_cast<const half*>(&kt);
+                    half o[8];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j)
+                        o[j] = __float2half(c_ct * __half2float(pt[j])
+                                            + (c_ck * __half2float(pc[j])
+                                               + c_rp * __half2float(pr[j])));
+                    mix[col] = *reinterpret_cast<const uint4*>(o);
+                }
+                // Named registers, not an array index: `bb` is a literal here because
+                // BPC is, and a dynamically indexed register array is local memory.
+                if (bb == 0) { word0 = w; cs00 = mix[0]; cs01 = mix[1]; }
+                else         { word1 = w; cs10 = mix[0]; cs11 = mix[1]; }
+            }
+        }
+    }
+
 #pragma unroll
     for (int i = 0; i < ROWS / NWARPS; ++i) {
         int row = warp + i * NWARPS;
@@ -402,11 +496,63 @@ __device__ __forceinline__ void layernorm(half* dst, const half* src, const half
         uint4 raw = *reinterpret_cast<const uint4*>(p);
         const half* v = reinterpret_cast<const half*>(&raw);
         float sum = 0.f, sq = 0.f;
+        // ⚠️ Held only on the re-injecting path. Without it the two passes below read
+        // `v[j]` twice and the fp16 word is the only thing live across the shuffle
+        // reduction; keeping eight floats there unconditionally would raise the whole
+        // kernel's register demand for a feature that is off.
+        float xm[RJ ? 8 : 1];
+        if constexpr (RJ) {
+            // `row` spans [i*NWARPS, i*NWARPS + NWARPS) and T is a multiple of NWARPS,
+            // so every lane of this unrolled iteration is on the same board and the
+            // compiler folds `bb` to a literal.
+            const int bb = (i * NWARPS) / T;
+            const uint32_t w = __shfl_sync(0xffffffffu, (BPC == 2 && bb) ? word1 : word0,
+                                           row & (T - 1));
+            // Exactly `embed_board`'s decode, including the clamp on `type`: 6 and 7
+            // are reachable from a malformed word and unclamped would read a row of
+            // `emb_clock`, in bounds by an accident of slab order.
+            const int sq_i = w & 63;
+            const int ts_i = min(((w >> 6) & 7) * 2 + ((w >> 9) & 1), N_TYPE_SPECIAL - 1);
+            const int col = (w >> 10) & 1;
+            const uint4 cs = (BPC == 2 && bb) ? (col ? cs11 : cs10)
+                                              : (col ? cs01 : cs00);
+            const half* pcs = reinterpret_cast<const half*>(&cs);
+            // ⚠️ **Do not hoist this branch outward to skip the decode above.** Doing
+            // exactly that, on the theory that a site which does not inject should not
+            // pay for the shuffle, was measured on 2026-08-28 and **cost 0.7 % on `ln1`
+            // and 3.0 % on `both`** (`logs/reinject-ab-branch-guarded.log`), while
+            // taking the shipped arm from 250 to 254 registers. A branch around the two
+            // loads is a scheduling barrier: ptxas can no longer lift them out of the
+            // unrolled row loop, and their L2 latency stops hiding behind the
+            // shuffle reduction of the previous row. The dead decode is cheaper than
+            // the lost pipelining.
+            uint4 es = {}, et = {};
+            if (inject) {
+                es = ldg16(rj.emb + EmbOff::square + sq_i * Dm + lane * 8);
+                et = ldg16(rj.emb + EmbOff::type_special + ts_i * Dm + lane * 8);
+            }
+            const half* pe = reinterpret_cast<const half*>(&es);
+            const half* pt = reinterpret_cast<const half*>(&et);
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            float x = __half2float(v[j]);
-            sum += x;
-            sq += x * x;
+            for (int j = 0; j < 8; ++j) {
+                // The grouping mirrors `BrokefishNet.mix`:
+                // (square + type_special + color_turn) + (clock + rep), with the last
+                // two folded into `cs` above. At c = 0 every added term is an exact
+                // zero, so a re-injecting kernel with untrained coefficients is the
+                // old kernel to the bit.
+                xm[j] = __half2float(v[j])
+                        + (c_sq * __half2float(pe[j]) + c_ts * __half2float(pt[j]))
+                        + __half2float(pcs[j]);
+                sum += xm[j];
+                sq += xm[j] * xm[j];
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                float x = __half2float(v[j]);
+                sum += x;
+                sq += x * x;
+            }
         }
 #pragma unroll
         for (int off = 16; off; off >>= 1) {
@@ -425,7 +571,7 @@ __device__ __forceinline__ void layernorm(half* dst, const half* src, const half
         half out[8];
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
-            const float xn = (__half2float(v[j]) - mean) * rstd;
+            const float xn = ((RJ ? xm[j] : __half2float(v[j])) - mean) * rstd;
             if constexpr (AFFINE)
                 out[j] = __float2half(xn * __half2float(gv[j]) + __half2float(bv[j]));
             else
@@ -433,6 +579,15 @@ __device__ __forceinline__ void layernorm(half* dst, const half* src, const half
         }
         *reinterpret_cast<uint4*>(dst + a_idx(row, lane * 8)) = *reinterpret_cast<uint4*>(out);
     }
+}
+
+/// The non-injecting form, so that `norm_f` and every pre-B2 caller keep the signature
+/// they had. `RJ = false` deletes every reference to the context before ptxas sees it.
+template <bool AFFINE, int ROWS>
+__device__ __forceinline__ void layernorm(half* dst, const half* src, const half* gamma,
+                                          const half* beta, float eps, int warp, int lane) {
+    RjCtx none{};
+    layernorm<AFFINE, ROWS, false>(dst, src, gamma, beta, eps, warp, lane, none, 0);
 }
 
 // Add a bias to a [2][4] block of D fragments. Element (m, n) of the fragment
@@ -1028,7 +1183,7 @@ struct Timer {
 // assuming the FLOP share carries over. `QOUT` implies `QATT`: quantising the
 // projection while leaving QKV in fp16 is the strictly worse half of the trade.
 template <bool FP8, bool INT8, bool TWOB, bool PROF = false, bool QATT = false,
-          bool QOUT = QATT>
+          bool QOUT = QATT, bool RJ = false>
 __global__ __launch_bounds__(THREADS, TWOB ? 1 : 2) void encoder_kernel(
     half* __restrict__ y, const half* __restrict__ weights,
     const uint8_t* __restrict__ wq8, const float* __restrict__ sq8,
@@ -1047,7 +1202,11 @@ __global__ __launch_bounds__(THREADS, TWOB ? 1 : 2) void encoder_kernel(
     const uint8_t* __restrict__ rep_ptr, const half* __restrict__ emb,
     const half* __restrict__ tail, half* __restrict__ policy,
     half* __restrict__ promo, float* __restrict__ value,
-    int n_layers, float eps, int debug_stage, int n_boards, int n_value, int vmode) {
+    int n_layers, float eps, int debug_stage, int n_boards, int n_value, int vmode,
+    // Per-layer input re-injection. `rj_coef` is `[sites][kRjStride]` halves and
+    // `rj_mode` is 1 for the attention norm alone, 2 for both norms of a block; the
+    // template flag is what decides whether any of it is compiled in at all.
+    const half* __restrict__ rj_coef = nullptr, int rj_mode = 0) {
     static_assert(!(FP8 && INT8), "the FFN is quantised once, in one format");
     static_assert(!QATT || INT8, "QKVO quantisation is int8 only; e4m3 was measured "
                                  "3x worse at that site before it was built");
@@ -1083,6 +1242,12 @@ __global__ __launch_bounds__(THREADS, TWOB ? 1 : 2) void encoder_kernel(
     // same scope does not compile, and the debug stages jump to `dump`.
     prof::Timer<PROF> tm(b0, warp, lane);
 
+    // One re-injection context for the whole stack: the pointers and the CTA's board
+    // window do not move between layers, only the site index does. Same reason as
+    // `tm` for living up here.
+    const RjCtx rj{boards, control, rep_ptr, emb, RJ ? rj_coef : nullptr, b0, nb};
+    const bool rj_both = RJ && rj_mode == 2;
+
     // One 32-bit word per board says which slots hold a live piece (spec 7.3). Dead
     // keys leave the softmax as -inf; dead rows are computed and never read.
     uint32_t alive[BPC];
@@ -1112,6 +1277,8 @@ __global__ __launch_bounds__(THREADS, TWOB ? 1 : 2) void encoder_kernel(
     tm.mark(prof::kPrologue);
     if (debug_stage == 9) goto dump;      // the gather alone, nothing else run
 
+    // One context for the whole stack: the pointers and the CTA's board window do not
+    // move between layers, only the site index does.
     for (int layer = 0; layer < n_layers; ++layer) {
         const half* W = weights + (size_t)layer * Off::stride;
         const uint8_t* Wq = Q8 ? wq8 + (size_t)layer * QOff::stride : nullptr;
@@ -1119,7 +1286,8 @@ __global__ __launch_bounds__(THREADS, TWOB ? 1 : 2) void encoder_kernel(
 
         // The affine slots hold ones and zeros: gamma lives in w_qkv's input axis and
         // beta in b_qkv, folded there by `FusedEncoder._fold_norm`.
-        layernorm<false, TB>(bufB, bufA, W + Off::ln1_w, W + Off::ln1_b, eps, warp, lane);
+        layernorm<false, TB, RJ>(bufB, bufA, W + Off::ln1_w, W + Off::ln1_b, eps,
+                                 warp, lane, rj, rj_both ? layer * 2 : layer);
 
         if (debug_stage == 1) { __syncthreads(); goto dump; }
         // Cross-warp handoff. layernorm writes bufB by row (warp w owns rows
@@ -1217,7 +1385,8 @@ __global__ __launch_bounds__(THREADS, TWOB ? 1 : 2) void encoder_kernel(
         residual_rows<TB>(bufA, scratch, warp, lane);
 
         if (debug_stage == 2) goto dump;
-        layernorm<false, TB>(bufB, bufA, W + Off::ln2_w, W + Off::ln2_b, eps, warp, lane);
+        layernorm<false, TB, RJ>(bufB, bufA, W + Off::ln2_w, W + Off::ln2_b, eps,
+                                 warp, lane, rj, rj_both ? layer * 2 + 1 : -1);
         if (debug_stage == 3) { __syncthreads(); goto dump; }
         __syncthreads();
         tm.mark(prof::kRes1Ln2);
@@ -1411,23 +1580,23 @@ T* ptr_or_null(const torch::Tensor& t) {
 // kernel; `csrc/tests/README.md` records the ptxas report that proves it.
 bool g_profile = false;
 template <bool FP8, bool INT8, bool TWOB, bool PROF, bool QATT = false,
-          bool QOUT = QATT>
+          bool QOUT = QATT, bool RJ = false>
 void launch_one(int n_boards, size_t smem, half* y, const half* weights,
                 const uint8_t* wq8, const float* sq8, const int8_t* alive,
                 const uint16_t* boards, const int16_t* control, const uint8_t* rep,
                 const half* emb, const half* tail, half* policy, half* promo,
                 float* value, int n_layers, float eps, int debug_stage, int n_value,
-                int vmode) {
+                int vmode, const half* rj_coef = nullptr, int rj_mode = 0) {
     constexpr bool Q8 = FP8 || INT8;
     constexpr int BPC = brokefish::Lay<TWOB>::BPC;
     const int grid = (n_boards + BPC - 1) / BPC;
-    cudaFuncSetAttribute(brokefish::encoder_kernel<FP8, INT8, TWOB, PROF, QATT, QOUT>,
+    cudaFuncSetAttribute(brokefish::encoder_kernel<FP8, INT8, TWOB, PROF, QATT, QOUT, RJ>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-    brokefish::encoder_kernel<FP8, INT8, TWOB, PROF, QATT, QOUT>
+    brokefish::encoder_kernel<FP8, INT8, TWOB, PROF, QATT, QOUT, RJ>
         <<<grid, brokefish::THREADS, smem>>>(
         y, weights, Q8 ? wq8 : nullptr, Q8 ? sq8 : nullptr, alive, boards, control,
         rep, emb, tail, policy, promo, value, n_layers, eps, debug_stage, n_boards,
-        n_value, vmode);
+        n_value, vmode, RJ ? rj_coef : nullptr, RJ ? rj_mode : 0);
 }
 
 // `quant`: 0 = fp16, 1 = e4m3, 2 = int8. ⚠️ An explicit mode rather than a property of
@@ -1441,7 +1610,7 @@ void launch(int n_boards, int quant, bool twob, half* y, const half* weights,
             const uint16_t* boards, const int16_t* control, const uint8_t* rep,
             const half* emb, const half* tail, half* policy, half* promo, float* value,
             int n_layers, float eps, int debug_stage, int n_value = 1,
-            int vmode = 0) {
+            int vmode = 0, const half* rj_coef = nullptr, int rj_mode = 0) {
     const size_t smem = twob ? brokefish::Lay<true>::BYTES : brokefish::Lay<false>::BYTES;
     const bool have_slab = (wq8 != nullptr) && (sq8 != nullptr);
     TORCH_CHECK(quant == 0 || have_slab,
@@ -1463,6 +1632,39 @@ void launch(int n_boards, int quant, bool twob, half* y, const half* weights,
     // int8's s32 accumulators fit at and a one-board arm is a configuration nobody
     // would run. They share a slab: mode 4 carries `w_o`'s slot unused, 64 KB a layer,
     // which is the price of one stride instead of two.
+    // ⚠️ **Re-injection gets its own arm and only two configurations.** It doubles
+    // every instantiation it touches, and the two that matter are the one every number
+    // is measured in (int8, two boards) and the fp16 one-board reference the
+    // correctness tests and `nn/validate.py` run through. A third would cost build time
+    // for a configuration nobody would run, which is the same rule the quant arms below
+    // already follow.
+    if (rj_coef != nullptr) {
+        TORCH_CHECK(boards != nullptr,
+                    "input re-injection needs the board words at every layer, so it "
+                    "runs only on the boards-to-logits path, not on the activation-in "
+                    "entry point");
+        TORCH_CHECK(rj_mode == 1 || rj_mode == 2,
+                    "rj_mode is 1 (the attention norm) or 2 (both norms of a block), "
+                    "got ", rj_mode);
+        if (quant == 3 && twob) {
+            launch_one<false, true, true, false, true, true, true>(
+                n_boards, smem, y, weights, wq8, sq8, alive, boards, control, rep, emb,
+                tail, policy, promo, value, n_layers, eps, debug_stage, n_value, vmode,
+                rj_coef, rj_mode);
+        } else if (quant == 0 && !twob) {
+            launch_one<false, false, false, false, false, false, true>(
+                n_boards, smem, y, weights, wq8, sq8, alive, boards, control, rep, emb,
+                tail, policy, promo, value, n_layers, eps, debug_stage, n_value, vmode,
+                rj_coef, rj_mode);
+        } else {
+            TORCH_CHECK(false, "input re-injection is built for quant 3 with two "
+                               "boards per CTA and for quant 0 with one; got quant ",
+                        quant, ", twob ", (int)twob);
+        }
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return;
+    }
+
     if (quant == 3 || quant == 4) {
         TORCH_CHECK(twob, "quant ", quant, " is built for two boards per CTA");
         const bool qout = quant == 3;
@@ -1519,7 +1721,8 @@ void model_forward(torch::Tensor boards, torch::Tensor control, torch::Tensor re
                    torch::Tensor policy, torch::Tensor promo, torch::Tensor value,
                    torch::Tensor y, int64_t n_layers, double eps, int64_t debug_stage,
                    torch::Tensor wq8, torch::Tensor sq8, int64_t quant, int64_t twob,
-                   int64_t n_value, int64_t vmode) {
+                   int64_t n_value, int64_t vmode, torch::Tensor rj_coef,
+                   int64_t rj_mode) {
     TORCH_CHECK(boards.is_cuda() && boards.scalar_type() == torch::kShort
                 && boards.is_contiguous() && boards.dim() == 2
                 && boards.size(1) == brokefish::T,
@@ -1599,6 +1802,17 @@ void model_forward(torch::Tensor boards, torch::Tensor control, torch::Tensor re
 
     TORCH_CHECK(!twob || quant != 1,
                 "two boards per CTA is built for int8 and fp16 only, got quant ", quant);
+    if (rj_coef.numel()) {
+        TORCH_CHECK(rj_coef.is_cuda() && rj_coef.scalar_type() == torch::kHalf
+                    && rj_coef.is_contiguous(),
+                    "the re-injection coefficients must be fp16 cuda contiguous");
+        const int64_t sites = n_layers * (rj_mode == 2 ? 2 : 1);
+        TORCH_CHECK(rj_coef.numel() == sites * brokefish::kRjStride,
+                    "at rj_mode ", rj_mode, " the coefficient slab is [", sites, "][",
+                    brokefish::kRjStride, "] halves, got ", rj_coef.numel());
+    } else {
+        TORCH_CHECK(rj_mode == 0, "rj_mode ", rj_mode, " without coefficients");
+    }
     launch((int)n, (int)quant, twob != 0, ptr_or_null<half>(y),
            ptr_or_null<const half>(weights),
            ptr_or_null<const uint8_t>(wq8), ptr_or_null<const float>(sq8), nullptr,
@@ -1606,7 +1820,8 @@ void model_forward(torch::Tensor boards, torch::Tensor control, torch::Tensor re
            ptr_or_null<const uint8_t>(rep), ptr_or_null<const half>(emb),
            ptr_or_null<const half>(tail), ptr_or_null<half>(policy),
            ptr_or_null<half>(promo), ptr_or_null<float>(value),
-           (int)n_layers, (float)eps, (int)debug_stage, (int)n_value, (int)vmode);
+           (int)n_layers, (float)eps, (int)debug_stage, (int)n_value, (int)vmode,
+           ptr_or_null<const half>(rj_coef), (int)rj_mode);
 }
 
 // ---------------------------------------------------------------------------
@@ -1654,7 +1869,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("emb"), py::arg("tail"), py::arg("policy"), py::arg("promo"),
           py::arg("value"), py::arg("y"), py::arg("n_layers"), py::arg("eps"),
           py::arg("debug_stage"), py::arg("wq8"), py::arg("sq8"), py::arg("quant") = 0,
-          py::arg("twob") = 0, py::arg("n_value") = 1, py::arg("vmode") = 0);
+          py::arg("twob") = 0, py::arg("n_value") = 1, py::arg("vmode") = 0,
+          py::arg("rj_coef") = torch::empty({0}, torch::dtype(torch::kHalf)),
+          py::arg("rj_mode") = 0);
     m.def("int8_q_max", []() {
         return std::pair<double, double>{(double)brokefish::int8q::kQMaxS,
                                          (double)brokefish::int8q::kQMaxU};

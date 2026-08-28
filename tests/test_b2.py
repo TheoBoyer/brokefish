@@ -710,3 +710,116 @@ def test_every_value_head_round_trips_through_the_loader():
     with pytest.raises(ValueError, match="unknown value_mode"):
         value_head_of({"value_mode": torch.tensor(99)})
     assert VALUE_MODE_ID["pooled"] == 1, "the pooled id is on disk and cannot move"
+
+
+# -- per-layer input re-injection (2026-08-28) ----------------------------
+#
+# The mode changes what each block's LayerNorm is *given* -- `h + sum_k c[site,k] * E_k`
+# over the five tables of spec 7.2 -- and nothing else. Two properties carry the whole
+# thing, and the first is the one to read: at `c = 0` the kernel must be the old kernel
+# to the bit, because that is what makes an A/B of this flag an A/B of one variable and
+# not of a re-randomised network.
+
+def _rj_pair(mode: str, seed: int = 0, **enc_kw):
+    """(net without re-injection, net with it and `c = 0`), same weights."""
+    torch.manual_seed(seed)
+    base = BrokefishNet().cuda().half().eval()
+    torch.manual_seed(seed)
+    net = BrokefishNet(reinject=mode).cuda().half().eval()
+    net.load_state_dict(base.state_dict(), strict=False)     # reinject_c stays zero
+    return ((base, encoder_impl("cuda")(base, **enc_kw)),
+            (net, encoder_impl("cuda")(net, **enc_kw)))
+
+
+def test_reinject_at_zero_is_the_old_kernel():
+    """**Bit exact**, in both configurations the mode is built for.
+
+    ⚠️ The batch is odd on purpose: 1027 boards leaves the last two-board CTA with one
+    real board and a duplicate of `b0`, and the re-injection preamble reads the board
+    words itself rather than inheriting them from the prologue -- so it has its own
+    chance to get that clamp wrong.
+    """
+    if "cuda" not in IMPLS:
+        print("  no cuda implementation, skipping"); return
+    boards, control, rep = random_positions(1027, plies=40, seed=11)
+    for enc_kw in ({}, {"int8": True}):
+        for mode in ("ln1", "both"):
+            (_, plain), (_, rj) = _rj_pair(mode, **enc_kw)
+            assert rj.rj_mode == {"ln1": 1, "both": 2}[mode]
+            want = [t.clone() for t in plain.forward_full(boards, control, rep)]
+            got = [t.clone() for t in rj.forward_full(boards, control, rep)]
+            for name, a, b in zip(("policy", "promo", "value"), want, got):
+                assert torch.equal(a, b), (
+                    f"{mode} at c=0 with {enc_kw or 'fp16'}: {name} moved by "
+                    f"{(a.float() - b.float()).abs().max().item():.3e}")
+
+
+def test_reinject_matches_torch_and_actually_moves_the_network():
+    """Nonzero coefficients: the kernel tracks the oracle, and the oracle has moved."""
+    if "cuda" not in IMPLS:
+        print("  no cuda implementation, skipping"); return
+    boards, control, rep = positions(256, plies=40, seed=7)
+    for mode in ("ln1", "both"):
+        torch.manual_seed(3)
+        net = BrokefishNet(reinject=mode).cuda().half().eval()
+        with torch.no_grad():
+            base = [t.clone() for t in net(boards, control, rep)]
+            net.reinject_c.normal_(0.0, 0.25)
+            want = net(boards, control, rep)
+        got = encoder_impl("cuda")(net).forward_full(boards, control, rep)
+        for name, a, b in zip(("policy", "promo"), got[:2], want[:2]):
+            assert _rel(a, b) < REL_TOL, f"{mode}: {name} rel {_rel(a, b):.2e}"
+        assert (got[2] - want[2]).abs().max().item() < VALUE_TOL, f"{mode}: value"
+        # and it is not a no-op: the coefficients have to reach the logits
+        assert _rel(want[0], base[0]) > 0.05, (
+            f"{mode}: c ~ N(0, 0.25) barely moved the policy, so this test would pass "
+            f"against a kernel that ignored the coefficients")
+
+
+def test_reinject_round_trips_through_the_loader():
+    """A checkpoint carries its own mode, and an old one still means `none`."""
+    from brokefish.nn.model import net_for_state, reinject_of, REINJECT_MODE_ID
+
+    for mode in ("none", "ln1", "both"):
+        net = BrokefishNet(reinject=mode)
+        state = {k: v.clone() for k, v in net.state_dict().items()}
+        assert reinject_of(state) == mode
+        got = net_for_state(state)
+        got.load_state_dict(state)
+        assert got.reinject == mode and got.n_sites == net.n_sites
+    assert reinject_of({}) == "none", "a pre-2026-08-28 checkpoint injects nothing"
+    with pytest.raises(ValueError, match="unknown reinject_mode"):
+        reinject_of({"reinject_mode": torch.tensor(99)})
+    assert REINJECT_MODE_ID["ln1"] == 1, "the ids are on disk and cannot move"
+
+
+def test_reinject_refuses_the_configurations_it_is_not_built_for():
+    """⚠️ Refuses rather than silently dropping the injection.
+
+    Only two arms are instantiated -- int8 quant 3 at two boards per CTA, which is what
+    self-play runs, and fp16 at one board, which is what these tests run. A third would
+    be paid for in build time on every compile. The failure mode this guards against is
+    a `FusedEncoder` that packs the coefficients and then runs a kernel compiled without
+    them, which would produce a plausible network that is not the one that was trained.
+    """
+    if "cuda" not in IMPLS:
+        print("  no cuda implementation, skipping"); return
+    torch.manual_seed(0)
+    net = BrokefishNet(reinject="ln1").cuda().half().eval()
+    with pytest.raises(NotImplementedError, match="re-injection is built for"):
+        encoder_impl("cuda")(net, two_boards=True)          # fp16 at two boards
+    with pytest.raises(NotImplementedError, match="re-injection is built for"):
+        encoder_impl("cuda")(net, int8=True, int8_scheme="ffn")   # quant 2
+    # and the arms that are built do not refuse
+    assert encoder_impl("cuda")(net).rj_mode == 1
+    assert encoder_impl("cuda")(net, int8=True).rj_mode == 1
+
+
+def test_the_triton_backbone_refuses_re_injection():
+    """It cannot express it: the mix enters every block's norm, and the Triton path
+    hands the backbone `x` once and gets the stack's output back."""
+    from brokefish.nn.model import full_forward_via_backbone
+
+    net = BrokefishNet(reinject="ln1")
+    with pytest.raises(NotImplementedError, match="does not implement per-layer"):
+        full_forward_via_backbone(net, None, None, None, None)

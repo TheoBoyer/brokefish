@@ -330,6 +330,35 @@ five embedding tables of §7.2, 512 in `norm_f` and 17,664 in the three heads of
 That total is the one the cost curve is plotted against, so it is worth stating
 rather than leaving as a sum a reader has to do.
 
+#### 7.1a The block input has a second form, off by default
+
+⚠️ Added 2026-08-28, as an **option**: `--reinject` gives each block's LayerNorm
+
+$$\mathrm{LN}\Big(h_\ell + \sum_{k=1}^{5} c_{\ell k} E_k\Big)$$
+
+instead of `LN(h_ℓ)`, where the five `E_k` are the embedding lookups of §7.2 at the same
+indices the prologue used and `c` is a learned scalar per (site, source). `ln1` is the
+attention norm of every block, 8 sites and **40 parameters**; `both` adds the FFN norm,
+16 sites and 80. `none` is the default and is the architecture every number on the
+ledger was produced by.
+
+**The residual stream is unchanged**: the mix enters the norm's argument only, so
+`h_{ℓ+1} = h_ℓ + attn(·) + ffn(·)` still holds exactly. The coefficient on `h_ℓ` is
+fixed at 1 and nothing is lost by that -- LayerNorm is scale-invariant, so only the
+ratio between the residual and the injected term is observable.
+
+⚠️ **The coefficients are zero-initialised and the kernel is bit-identical to `none` at
+`c = 0`**, on both the fp16 and the int8 path. That is a contract, not an accident: it
+is what lets a checkpoint written without re-injection be loaded into a net with it, and
+what makes an A/B of the flag an A/B of one variable.
+
+⚠️ **The source order is normative** -- square, type_special, color_turn, clock, rep --
+because `c` is indexed by it in the `state_dict` and in the kernel's coefficient slab.
+It is the order of `EmbOff` in `csrc/encoder.cu` and of `PackedWeights.EMB_TABLES`.
+
+The measured cost is +3.8 % of evals/s at `ln1` and +5.2 % at `both`
+(`ledger/perf.md`, `journal/2026-08-28-input-reinjection.md`).
+
 ### 7.2 Token features
 
 The token embedding is a sum of table lookups, so each feature costs one gather:

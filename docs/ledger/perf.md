@@ -1285,3 +1285,62 @@ thread, once per board, inside an epilogue that is 0.3 % of the network.
 
 ⚠️ Absolute numbers here are higher than the rows above because this is
 `forward_full` alone with no tree, not the MCTS loop. Only the ratio is a measurement.
+
+---
+
+## Per-layer input re-injection: +3.8 % at `ln1`, +5.2 % at both norms, 2026-08-28
+
+`--reinject` puts `h + sum_k c[site, k] * E_k` into a block's LayerNorm instead of `h`,
+over the five embedding tables of spec §7.2, with a learned scalar per (site, source).
+
+**Interleaved and order-balanced, in the real MCTS**, `n = 800`, `B = 4096`, int8
+quant 3 at two boards per CTA, 6 rounds. ⚠️ **Both arms carry the same weights and the
+re-injecting one has `c = 0`**, so the two searches expand bit-identical trees and the
+only difference measured is the gather inside `layernorm`. One search object with the
+model callable swapped between arms: two trees at this size would be 5.6 GiB.
+
+| arm | s/move | useful evals/s | cost | run 1 |
+|---|---:|---:|---:|---:|
+| none | 36.712 | 87 916 | — | — |
+| **`ln1`** (8 sites) | 38.107 | 84 698 | **+3.80 %** | +4.19 % |
+| `both` (16 sites) | 38.620 | 83 572 | **+5.20 %** | +5.75 % |
+
+Two independent runs of the same binary, on a card whose clock drifts ~3 %: call it
+**+4 % and +5.5 %**. `ln1` is inside the 5 % budget it was built to; `both` is not.
+
+**Predicted +4 to +8 % from traffic alone and measured +3.8 %**, so the loads hide
+better than the byte count suggests. The design that got there:
+
+- **Three of the five tables cost nothing per row.** `clock` and `rep` are indexed by
+  the board, and within a board `color_turn` takes only two of its four rows because
+  the side to move is fixed. All three are read once per LayerNorm and pre-mixed into
+  two slices per board, selected per row by the token's colour bit. Only `square` and
+  `type_special` are gathered per row: **two `LDG.128` per lane per row, not five.**
+- **32 KB per board per site**, against ~500 KB of weight traffic per board per layer.
+- **Zero shared memory and no registers.** The shipped arm goes 254 → **250 registers,
+  no spill**: the injection lives inside `layernorm`, where no `mma` accumulator is
+  live, and the eight floats it holds across the shuffle reduction cost less than they
+  free elsewhere. The 1,024 B of headroom in the two-board SMEM budget is untouched.
+- The tables are read with `__ldg` and are 40 KB in total, shared by every CTA on the
+  device. That is the argument for gathering them again at each site rather than
+  materialising a per-board mix: the basis is smaller than any combination of it.
+
+**Dead end, measured.** Guarding the whole per-row decode under `if (inject)` -- so a
+site that does not inject would not pay for the shuffle -- **cost 0.7 % on `ln1` and
+3.0 % on `both`** (`logs/reinject-ab-branch-guarded.log`) and took the shipped arm from
+250 to 254 registers. A branch around the two loads is a scheduling barrier: ptxas can
+no longer lift them out of the unrolled row loop and their L2 latency stops hiding
+behind the previous row's shuffle reduction. The dead decode is cheaper than the lost
+pipelining. Reverted, with the reason written where the branch would go back.
+
+**The training step pays the same order**, forward + backward on a 1024-row
+micro-batch, 10 order-balanced rounds: `none` 575.34 ms, **`ln1` 600.31 ms (+4.34 %)**,
+`both` 626.42 ms (+8.88 %). Torch gathers the three per-token tables per site as
+`F.embedding` and pays their scatter-add backward; the coefficient scales the *table*
+rather than the gathered result, which keeps the graph free of five `[N, 32, d]`
+activations per site.
+
+⚠️ **Absolute evals/s here are not comparable to Gate 1a's 76 496.** This harness resets
+the tree before every timed move, where `bench_search` measures a move inside a
+continuing game, so `useful_frac` differs. Only the ratios inside one interleaved run
+are a measurement.

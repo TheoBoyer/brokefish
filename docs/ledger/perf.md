@@ -1488,7 +1488,16 @@ All against the `none` arm of the same build, `bench_phases --impl int8`, 512 CT
 | mode as a template parameter | — | +2.64 % |
 | the row mix in `half2` | 7,599 | +2.18 % |
 | **+ preamble in `half2`, hoisted out of the colour loop** | 7,216 | +2.11 % |
-| **+ the colour taken from the slot, not the word** | **6,982** | — |
+| **+ the colour taken from the slot, not the word** | **6,982** | **+1.87 %** |
+
+`logs/reinject-ab-slotcolour.log`: none 35.462 s/move and **91 015** useful evals/s,
+`ln1` 36.126 and **89 343**, `both` 36.791 and 87 728 (+3.75 %).
+
+⚠️ **The comparison that matters is against where the kernel started.** This morning's
+un-injected kernel ran at 90 035 useful evals/s; the *re-injecting* kernel now runs at
+**89 343**. Relative to the point the feature was measured against when it landed, it
+costs **0.8 %**, not 4.19 % -- 1.86 % of that came from the GEMM k-loop, which the
+feature did not need but which the profiling done for it found.
 
 Two things the last two rows buy, both from reading the code rather than the profiler:
 

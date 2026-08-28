@@ -128,24 +128,45 @@ __device__ __forceinline__ void quantise_row_int8(uint8_t* dst, int dst_pitch,
         // the second stall in this kernel's ncu profile at 2.17 cycles per issue.
         // Four independent chains of eight cost three extra `fmaxf` at the end and are
         // **bit-identical**, because max is associative and commutative and exact.
-        float m[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        __half2 m[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) m[i] = __float2half2_rn(0.0f);
+        // ⚠️ **A lane's sixteen columns are two 8-half chunks half a tile apart, not one
+        // contiguous run.** Contiguous slices put the eight lanes of a row at a
+        // **32-byte stride**, so their 16-byte accesses fold the 128-byte bank set
+        // exactly twice -- lanes 0 and 4 on banks 0-3, 1 and 5 on 8-11, and so on. A
+        // 2-way conflict on every load: 8 wavefronts where 4 suffice.
+        //
+        // Measured 2026-08-28, that was **the whole of this kernel's shared-memory
+        // conflicts**, and the arithmetic closes exactly: 7 quantise calls per layer x
+        // 8 loads per warp x 4 excessive x 8 warps x 8 layers x 128 CTAs = 1,835,008,
+        // against ncu's 1,835,008. At `j * (kTileK / 2) + col_group * 8` the eight
+        // lanes sit at a 16-byte stride and cover all 32 banks once: **259 conflicts**.
+        //
+        // ⚠️ It is worth **nothing** in wall clock, and it is kept anyway. At 16.7 %
+        // occupancy with 70 % of cycles having no eligible warp the LSU is not the
+        // limiter, so this buys no time today -- but it costs none either, and leaving
+        // 1.8M conflicts in place would put a false lead at the top of every future
+        // ncu report of this kernel.
+        static_assert(kPerLane == 2 * 8, "the two-chunk split assumes sixteen halves");
 #pragma unroll
         for (int t = 0; t < kTiles; ++t)
 #pragma unroll
             for (int j = 0; j < kPerLane / 8; ++j)
                 rb.q[t][j] = *reinterpret_cast<const uint4*>(
-                    s + t * kTileK + col_group * kPerLane + j * 8);
+                    s + t * kTileK + j * (kTileK / 2) + col_group * 8);
 #pragma unroll
         for (int t = 0; t < kTiles; ++t)
 #pragma unroll
-            for (int i = 0; i < kPerLane; ++i) {
+            for (int i = 0; i < kPerLane / 2; ++i) {
                 // For UNSIGNED the input is post-ReLU, so a plain max is the amax and
                 // a negative can only be a denormal artefact -- the convert saturates
                 // at 0 regardless.
-                const float a = __half2float(rb.h[t][i]);
-                m[i & 3] = fmaxf(m[i & 3], UNSIGNED ? a : fabsf(a));
+                const __half2 a = reinterpret_cast<const __half2*>(rb.h[t])[i];
+                m[i & 3] = __hmax2(m[i & 3], UNSIGNED ? a : __habs2(a));
             }
-        float mm = fmaxf(fmaxf(m[0], m[1]), fmaxf(m[2], m[3]));
+        const __half2 mh = __hmax2(__hmax2(m[0], m[1]), __hmax2(m[2], m[3]));
+        float mm = fmaxf(__half2float(__low2half(mh)), __half2float(__high2half(mh)));
 #pragma unroll
         for (int off = 1; off < 8; off <<= 1)
             mm = fmaxf(mm, __shfl_xor_sync(0xffffffffu, mm, off));
@@ -158,9 +179,15 @@ __device__ __forceinline__ void quantise_row_int8(uint8_t* dst, int dst_pitch,
 
 #pragma unroll
         for (int t = 0; t < kTiles; ++t) {
-            uint8_t* d = dst + (size_t)r * dst_pitch + t * kTileK + col_group * kPerLane;
 #pragma unroll
-            for (int i = 0; i < kPerLane; i += 4) {
+          for (int j = 0; j < kPerLane / 8; ++j) {
+            // The same mapping as the load, which is what keeps the bytes where the
+            // GEMM expects them: this lane owns columns `j * 64 + col_group * 8 + 0..7`.
+            // `- j * 8` cancels the `i` offset, which counts within the lane's sixteen.
+            uint8_t* d = dst + (size_t)r * dst_pitch + t * kTileK
+                       + j * (kTileK / 2) + col_group * 8 - j * 8;
+#pragma unroll
+            for (int i = j * 8; i < j * 8 + 8; i += 4) {
                 // ⚠️ fp32 scaling, for the same reason the e4m3 path gives: a row whose
                 // maximum is below 2^-14 makes an fp16 `inv` infinite and `0 * inf` is
                 // NaN. `cvt.rni.sat` cannot produce a NaN, but it can produce garbage
@@ -169,6 +196,7 @@ __device__ __forceinline__ void quantise_row_int8(uint8_t* dst, int dst_pitch,
                     __half2float(rb.h[t][i]) * inv, __half2float(rb.h[t][i + 1]) * inv,
                     __half2float(rb.h[t][i + 2]) * inv, __half2float(rb.h[t][i + 3]) * inv);
             }
+          }
         }
     }
 }
@@ -224,6 +252,9 @@ __device__ __forceinline__ void gemm_s8_row(uint32_t (&acc)[MT][4][2],
 
 #pragma unroll
         for (int p = 0; p < 4; ++p) {
+            // ⚠️ Not `__ldg`, and not `__restrict__` on `w` either. Both were measured
+            // on 2026-08-28 once the k-loop was unrolled and the quantiser's conflicts
+            // were gone: **387,786 -> 390,895 cycles per board, +0.80 %**.
             const uint2 bw = wp[(size_t)p * PS + (size_t)k32 * 32];
             const uint32_t b[2] = {bw.x, bw.y};
 #pragma unroll

@@ -1452,6 +1452,53 @@ the cycle count is the measurement and the wall clock is the corroboration).
 same loop is inside noise". That was measured against the *ping-pong* form of the loop,
 not this one; on the plain loop it is worth 1.86 %.
 
+### ⚠️ Retracted the same day: two of those three are worth 1.54 % *after* the unroll
+
+Théo asked why the bank-conflict fix was reverted if it was free -- shouldn't it be kept
+in case it interacts with later work? The answer is that it is not free and it is not a
+loss either: **it depends on what else has landed**, and the section below measured it
+on a kernel that no longer exists.
+
+First, the noise floor that section never established. `bench_phases` is
+**deterministic to 9 cycles** within one build (393,870 / 393,879 / 393,876 on three
+runs), so the differences below are all real. The +223 recorded for the conflict fix
+*was* a real regression -- on the rolled-k-loop kernel.
+
+Re-measured on HEAD, each stacked on the previous, `none` arm:
+
+| | cycles/board | vs previous |
+|---|---:|---:|
+| HEAD (k-loop unrolled by two) | 393,876 | — |
+| **+ conflict-free lane map** | 391,814 | **−0.52 %** |
+| **+ `__hmax2` amax** | 387,786 | **−1.03 %** |
+| + `__ldg`/`__restrict__` on the weights | 390,895 | +0.80 %, **reverted** |
+| + quantiser row loop unrolled by two | 389,113 | +0.34 %, **reverted** |
+| **kept** | **387,807** | **−1.54 % against HEAD** |
+
+⚠️ **The mechanism is the point.** While the k-loop was rolled, the kernel sat on ~250
+cycles of exposed L2 latency per iteration with two warps per scheduler; nothing else
+was the limiter, so taking work out of the quantiser bought nothing and its extra
+instructions were pure loss. Unrolling by two removed that stall -- and the LSU became
+enough of a limiter that 1.8M bank conflicts and 48 ALU ops per row per lane started to
+cost. **Same two changes, +0.06 % and +0.16 % before, −0.52 % and −1.03 % after.**
+
+Bank conflicts on the load path are now **0**, from 1,835,008. The injection's own delta
+comes along for the ride: 6,982 -> **6,822 cycles per board (+1.76 %)**.
+
+In the real MCTS (`logs/conflicts-ab.log`): none **93 726** useful evals/s, `ln1`
+**92 018** (+1.86 %), `both` 90 061 (+4.07 %). ⚠️ The wall-clock gain reads −2.6 % where
+the cycle count says −1.54 %; the card was idle through an unrelated reboot before this
+run and is cooler than it was for the earlier ones. **The cycle count is the
+measurement.** What the wall clock does establish is the thing that matters: the
+*re-injecting* kernel now runs at **92 018 evals/s against this morning's un-injected
+90 035**, so the feature has stopped costing anything at all relative to the baseline it
+was measured on when it landed.
+
+⚠️ And `__ldg` is now a genuine regression where it used to be neutral, so the ordering
+cuts both ways. The general lesson is not "these changes are good" but **"a neutral
+result on a latency-bound kernel is a statement about the current bottleneck, not about
+the change"** -- and it must be re-measured after anything that moves the bottleneck.
+
 ### Three things that removed real work and bought nothing
 
 All three measured on 2026-08-28, all reverted, and together they are the most useful
@@ -1459,7 +1506,13 @@ thing in this section: **at 16.7 % occupancy with 70 % of cycles having no eligi
 warp, the non-matmul phases are not on the critical path, and taking work out of them
 does not make the kernel faster.**
 
-| change | what it removed | quantise phases | whole kernel |
+⚠️ **Two of these three were retracted the same day** -- see the section above. They
+were measured before the k-loop was unrolled, and on the current kernel the first is
+worth −0.52 % and the second −1.03 %. What survives is the *reasoning being wrong*,
+which is the part worth keeping: a neutral result here was a statement about the
+bottleneck at the time.
+
+| change | what it removed | quantise phases | whole kernel, **then** |
 |---|---|---:|---:|
 | conflict-free lane map in `quantise_row_int8` | **all 1,835,008 shared bank conflicts** (-> 259) | −1,337 | 401,343 -> 401,566 |
 | `__hmax2` amax instead of fp32 `fmaxf` | 48 of ~140 ALU ops per row per lane | −642 | 401,343 -> 401,783 |

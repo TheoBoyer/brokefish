@@ -79,7 +79,16 @@ docs/       three kinds, and the kind is the directory. reference/ is normative 
 debugger/   the web viewer, the only part not importable from `brokefish`
 scripts/    one-off operational scripts and campaign chain scripts. ⚠️ It already
             existed and was missing from this list, which is how a `tools/` got
-            invented beside it on 2026-08-14. There is one directory for this
+            invented beside it on 2026-08-14. There is one directory for this.
+            ⚠️ **A ⚠️ in a script header is a *dated* claim with no date on it.**
+            `h2h-vs-ag.sh` prescribed 50-game segments for eleven days because
+            `serve_ag.py` leaked — and that leak was fixed the *same day* the warning
+            was written (`journal/2026-08-19-the-alphagateau-server-leak.md`). Nothing
+            in the file said so, so the workaround was believed and rebuilt. Two rules:
+            when a journal entry records a fix, the script prescribing the workaround
+            is updated **in that commit**; and before following an operational ⚠️,
+            re-verify it or find the entry that retired it. Journal entries are
+            append-only and may contradict each other by design — a script is not
 data/       cuda_testset (A1's dump), suites.pt (D1), lichess_db_puzzle.csv
 runs/<run>/ **everything one run produces, in one folder** (2026-08-14): the .log and
             .jsonl, checkpoints/, replay/, wandb/, and every league / curve / match it

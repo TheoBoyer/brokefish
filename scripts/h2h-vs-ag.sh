@@ -13,11 +13,16 @@
 # brokefish needs well under that: at B = 64, n = 128 its tree is 856 x 129 x 64 = 7 MiB
 # on top of a 13 MiB fp16 net.
 #
-# ⚠️ **Run it in segments of <=50 games.** `serve_ag.py` leaks host RAM under this
-# workload -- measured 2026-08-19, the scope reached its 8 GiB cap after 99 games
-# and one hour and was oom-killed mid-match, losing the second colour pool. The
-# leak is not the `_fastfen` one (this path is plain `from_fen`); it has not been
-# found. Restarting the server every segment bounds it at ~3 GiB.
+# ⚠️ **Segmenting is no longer needed -- this warning was stale for eleven days.**
+# It used to read "run it in segments of <=50 games", because `serve_ag.py` reached its
+# 8 GiB cap after 99 games and was oom-killed mid-match. That leak was found and fixed
+# **the same day** (`journal/2026-08-19-the-alphagateau-server-leak.md`): the server
+# called `mctx.gumbel_muzero_policy` from inside the request handler with no `jax.jit`
+# above it, so every request re-compiled an n_sim-deep search and every executable
+# stayed resident -- 81.2 MiB/request. The cached `_search` at `serve_ag.py:107` fixed
+# it to **0.2 MiB/request**, 400x, and RSS plateaus after the first request.
+# Re-verified 2026-08-30 on a live match: 1233.92 -> 1234.05 MiB over 50 s of serving.
+# A 200-game match runs in one call.
 #
 # Protocol is `logs/gate2-h2h-alphagateau.json`'s, unchanged, so the numbers compare
 # directly: n = 128 both sides, 200 games over 100 openings, 8 opening plies, 300-ply

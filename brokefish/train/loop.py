@@ -37,7 +37,7 @@ import math
 import os
 import time
 from dataclasses import asdict, dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -50,7 +50,8 @@ from brokefish.search import SearchConfig, search_impl
 from .buffer import ReplayBuffer
 from brokefish import paths
 from .log import Logger
-from .loss import TrainBatch, audit_labels, az_loss, l2_penalty, weight_decay_for
+from .loss import (TrainBatch, audit_labels, az_loss, l2_penalty, micro_batch_weights,
+                   value_rows_of, weight_decay_for)
 from .sync import PackedWeights, weight_fingerprint
 
 # §7.3. Fractions of total training rather than absolute steps, because AZ ran
@@ -306,6 +307,29 @@ class TrainConfig:
     # investigation names and which playout cap randomisation could only move at the
     # price of 1/p more reuse. 1 is every run before it, bit for bit.
     value_subsample: int = 1
+    # **Mixed value target** (2026-09-09). The value target is
+    # `(1 - a) * z + a * root_value`, the game outcome mixed with the search's own
+    # value of the root (search.md §10). `journal/2026-08-24-the-value-head-is-a-
+    # calibration-failure.md` and the offline harness of that day found the value
+    # head's deficit under Muon to be game-level memorisation of `z`, and a = 0.5
+    # lifted held-out game correlation 0.494 -> 0.591 on fixed data. 0.0 is every
+    # run before it, bit for bit: `az_loss` takes the old branch and never reads the
+    # field. On the WDL head the mix is a soft label, see `loss.wdl_max_entropy`.
+    target_mix: float = 0.0
+    # **Split gradient** (2026-09-09, muon only). The policy loss reaches every
+    # parameter through the run's optimiser as before; the value loss's gradient on
+    # the trunk -- embeddings, encoder, `norm_f`, everything but the three heads --
+    # goes through a separate AdamW at `split_grad_lr`, while `value.weight` itself
+    # stays in the main optimiser's AdamW group. The harness of 2026-08-24 found this
+    # also removes the memorisation (0.594 / 0.355). ⚠️ It costs a second backward
+    # pass through the trunk per micro-batch, ~1.7x the gradient step's compute.
+    # `False` leaves `train_step` on the single joint backward it always ran.
+    split_grad: bool = False
+    # The rate of the split AdamW. `None` follows `aux_lr` as a ratio to `lr`, so
+    # warmup and cosine apply to it too. It carries `weight_decay = 0`: the main
+    # optimiser already decays the trunk once per step, and a second decay would
+    # double it silently.
+    split_grad_lr: Optional[float] = None
     # ⚠️ **Where the value head reads from**, and therefore which frame it predicts in.
     # `king` is spec §7.4's row select of the side-to-move king, predicting the mover's
     # result. `pooled` is the masked mean of every live token of both colours,
@@ -455,6 +479,75 @@ def no_decay(name: str) -> bool:
     return name.endswith("reinject_c")
 
 
+def split_grad_params(net: torch.nn.Module):
+    """``(trunk, value_head)`` for `--split-grad`: the trunk is every parameter that
+    is not one of the three readout heads -- the five embeddings, the encoder,
+    `norm_f`, the re-injection scalars. ``policy.*`` and ``promo.*`` are in neither
+    list: the value loss does not reach them and the policy backward already fills
+    their `.grad`."""
+    trunk, head = [], []
+    for name, p in net.named_parameters():
+        if not p.requires_grad:
+            continue
+        if name.startswith("value."):
+            head.append(p)
+        elif not (name.startswith("policy.") or name.startswith("promo.")):
+            trunk.append(p)
+    return trunk, head
+
+
+def backward_split(policy_total: torch.Tensor, value_total: torch.Tensor,
+                   trunk: List[torch.nn.Parameter], value_head: List[torch.nn.Parameter],
+                   value_grads: List[Optional[torch.Tensor]]) -> None:
+    """Two backward passes over one forward, into two gradient stores.
+
+    The policy term goes through ``backward`` and lands in ``.grad`` as it always
+    has. The value term is differentiated with ``torch.autograd.grad``, which touches
+    ``.grad`` not at all: its share on the trunk is summed into ``value_grads`` (one
+    slot per trunk parameter, ``None`` until the first micro-batch), and its share on
+    the value head -- which the policy term never reaches -- is added to that head's
+    ``.grad``, so the main optimiser still trains it. The sum of the two stores is the
+    joint gradient exactly (`test_train.py::test_split_grad_is_exact_under_sgd`).
+
+    Cost: the second pass re-traverses the whole trunk, so a gradient step is about
+    1.7x its joint-backward compute; the first pass keeps the graph alive for the
+    second, so the micro-batch's activations are freed one pass later than before.
+    """
+    policy_total.backward(retain_graph=True)
+    grads = torch.autograd.grad(value_total, list(trunk) + list(value_head),
+                                allow_unused=True)
+    n = len(trunk)
+    for p, g in zip(value_head, grads[n:]):
+        if g is not None:
+            p.grad = g if p.grad is None else p.grad + g
+    for i, g in enumerate(grads[:n]):
+        if g is None:
+            continue
+        value_grads[i] = g if value_grads[i] is None else value_grads[i].add_(g)
+
+
+def step_with_grads(opt: torch.optim.Optimizer, params: List[torch.nn.Parameter],
+                    grads: List[Optional[torch.Tensor]], grad_clip: float = 0.0):
+    """Step ``opt`` on ``params`` with ``grads`` standing in for ``.grad``.
+
+    ``.grad`` is lent for the duration of the step and handed back as ``None``,
+    so the main optimiser -- which shares these parameters -- never sees this
+    gradient. Returns the pre-clip norm of ``grads``, as a 0-d tensor."""
+    norm = torch.sqrt(sum((g.float() ** 2).sum() for g in grads if g is not None))
+    if grad_clip > 0:
+        # Same rule as `clip_grad_norm_`: scale by `clip / (norm + 1e-6)`, at most 1.
+        coef = (grad_clip / (norm + 1e-6)).clamp(max=1.0)
+        for g in grads:
+            if g is not None:
+                g.mul_(coef.to(g.dtype))
+    for p, g in zip(params, grads):
+        p.grad = g
+    opt.step()
+    for p in params:
+        p.grad = None
+    return norm
+
+
 def build_optimizer(net: torch.nn.Module, cfg: TrainConfig) -> torch.optim.Optimizer:
     """AGZ's optimiser, or ablation 1's.
 
@@ -580,6 +673,26 @@ class Trainer:
                                 value_head=cfg.value_head,
                                 reinject=cfg.reinject).to(self.device)  # fp32, §8.2
         self.opt = build_optimizer(self.net, cfg)
+        # `--split-grad`: the trunk's value gradient has an optimiser of its own.
+        self.opt_value: Optional[torch.optim.Optimizer] = None
+        self.split_trunk: List[torch.nn.Parameter] = []
+        self.split_value_head: List[torch.nn.Parameter] = []
+        if cfg.split_grad:
+            if cfg.optimizer != "muon":
+                raise ValueError(
+                    f"--split-grad is only meaningful under --optimizer muon, got "
+                    f"{cfg.optimizer!r}. Under AdamW the update is not linear in the "
+                    f"gradient, so Adam(g_policy) + Adam(g_value) is a different "
+                    f"optimiser from Adam(g_policy + g_value) and not the ablation the "
+                    f"flag names; under SGD with momentum or weight decay it is not a "
+                    f"no-op either")
+            self.split_trunk, self.split_value_head = split_grad_params(self.net)
+            peak = cfg.lr_schedule[0][1]
+            split_lr = cfg.aux_lr if cfg.split_grad_lr is None else cfg.split_grad_lr
+            self.opt_value = torch.optim.AdamW(
+                [{"params": self.split_trunk, "lr": split_lr,
+                  "lr_scale": (split_lr / peak) if peak else 1.0}],
+                lr=split_lr, betas=cfg.betas, weight_decay=0.0)
         # ⚠️ `self.net` stays the **raw** module and only the call is compiled.
         # `PackedWeights.pack`, §12 check 9 and every checkpoint path read the module
         # directly, and an `OptimizedModule` wrapper in their way would either break
@@ -846,6 +959,9 @@ class Trainer:
         # cosine -- still drives both.
         for group in self.opt.param_groups:
             group["lr"] = lr * group.get("lr_scale", 1.0)
+        if self.opt_value is not None:
+            for group in self.opt_value.param_groups:
+                group["lr"] = lr * group.get("lr_scale", 1.0)
 
         if batch is None:
             batch = self.buffer.sample(cfg.batch, device=self.device)
@@ -853,22 +969,37 @@ class Trainer:
         if cfg.audit_every and self.step % cfg.audit_every == 0:
             audit_labels(batch, self.env)
         self.opt.zero_grad(set_to_none=True)
+        # `--split-grad`: the trunk's value gradient accumulates here, not in `.grad`.
+        value_grads: List[Optional[torch.Tensor]] = [None] * len(self.split_trunk)
 
-        keys = ("policy", "value", "kl", "entropy", "total")
+        keys = ("policy", "kl", "entropy")
         parts_sum = None
         total_n = len(batch)
+        # Stays a device tensor: the per-step synchronisation is the one at the end.
+        total_value_rows = value_rows_of(batch)
         for i in range(math.ceil(total_n / cfg.micro_batch)):
             mb = batch.slice(i * cfg.micro_batch, (i + 1) * cfg.micro_batch)
             with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16,
                                 enabled=cfg.autocast):
                 parts = az_loss(self.fwd, mb, strict=cfg.strict_labels,
-                                value_weight=cfg.value_weight)
-            # §7.2: four micro-batch means each scaled by 1/4 sum to the gradient of
-            # the mean over 4096. The network is pre-norm LayerNorm with no batch
-            # statistics anywhere, so this is batch 4096 and not an approximation.
-            scaled = len(mb) / total_n
-            (parts.total * scaled).backward()
+                                value_weight=cfg.value_weight,
+                                target_mix=cfg.target_mix)
+            # §7.2: micro-batch means, each scaled by its share of the whole batch,
+            # sum to the gradient of the mean over 4096. The network is pre-norm
+            # LayerNorm with no batch statistics anywhere, so this is batch 4096 and
+            # not an approximation -- **provided each term is scaled by the count it
+            # is a mean over**: rows for the policy, value-supervised rows for the
+            # value. One scale for both was exact only with every row supervised
+            # (`micro_batch_weights`, review §3).
+            scaled, w_value = micro_batch_weights(parts, len(mb), total_n, total_value_rows)
+            if self.opt_value is None:
+                (parts.policy * scaled + parts.value * w_value).backward()
+            else:
+                backward_split(parts.policy * scaled, parts.value * w_value,
+                               self.split_trunk, self.split_value_head, value_grads)
             keep = {k: getattr(parts, k).detach() * scaled for k in keys}
+            keep["value"] = parts.value.detach() * w_value
+            keep["total"] = keep["policy"] + keep["value"]
             # Over the whole batch, not just the last micro-batch: saturation is the
             # mechanism that killed the value head at lr = 0.2 and a quarter of the
             # batch is a quarter of the evidence.
@@ -901,12 +1032,22 @@ class Trainer:
         if cfg.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(self.net.parameters(), cfg.grad_clip)
         self.opt.step()
+        if self.opt_value is not None:
+            # The trunk's value gradient, clipped on its own norm under the same
+            # bound, stepped by its own AdamW after the main optimiser has read and
+            # cleared nothing of it: `.grad` never held it.
+            value_grad_norm = step_with_grads(self.opt_value, self.split_trunk,
+                                              value_grads, cfg.grad_clip)
         self.step += 1
 
         out = {k: float(v) for k, v in parts_sum.items()}
         out["l2"] = float(l2_penalty(self.net, cfg.l2))
         out["lr"] = lr
         out["grad_norm"] = float(grad_norm)
+        if self.opt_value is not None:
+            # Under `--split-grad`, `grad_norm` is the policy gradient plus the value
+            # head's own; the trunk's value gradient is this one.
+            out["grad_norm_value_trunk"] = float(value_grad_norm)
         out["weight_norm"] = float(weight_norm)
         out["staleness"] = float((self.weight_gen - batch.weight_gen.float()).mean())
         out.update(self._head_health())
@@ -1031,6 +1172,8 @@ class Trainer:
         return {
             "config": asdict(self.cfg), "config_hash": self.cfg.hash(),
             "net": self.net.state_dict(), "opt": self.opt.state_dict(),
+            "opt_value": (None if self.opt_value is None
+                          else self.opt_value.state_dict()),
             "step": self.step, "weight_gen": self.weight_gen,
             "generation": self.generation, "carry": self.carry,
             "games_completed": self.games_completed,
@@ -1070,6 +1213,11 @@ class Trainer:
                 f"--allow-config-change if that is really what you want")
         self.net.load_state_dict(blob["net"])
         self.opt.load_state_dict(blob["opt"])
+        # A checkpoint without `opt_value` is only reachable across a config change
+        # (`split_grad` is in the hash); the second AdamW then starts from zero
+        # moments, which is what it would have done had the flag been set at this step.
+        if self.opt_value is not None and blob.get("opt_value") is not None:
+            self.opt_value.load_state_dict(blob["opt_value"])
         for key in ("step", "weight_gen", "generation", "carry", "games_completed",
                     "positions_generated", "samples_drawn", "samples_dropped_filling",
                     "games_capped"):
@@ -1328,7 +1476,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "vector, so the head's input scale is fixed by the norm rather "
                         "than drifting with how spread the token cloud is -- measured "
                         "on t12h-wdb, |mean(LN(h))| fell 15.47 -> 10.86 over a run "
-                        "while |value.weight| grew 42 %.")
+                        "while |value.weight| grew 42 %%.")
     p.add_argument("--value-classes", type=int, default=TrainConfig.value_classes,
                    choices=(1, 3),
                    help="the value head's shape. 1 (default) is spec 7.4's scalar "
@@ -1346,6 +1494,21 @@ def build_parser() -> argparse.ArgumentParser:
                         "k-th ply), the policy loss over all of them. Moves how often "
                         "one game's outcome bit is shown to the value head and nothing "
                         "else. 1 = every record, the historical loss")
+    p.add_argument("--target-mix", type=float, default=TrainConfig.target_mix,
+                   metavar="ALPHA",
+                   help="value target = (1 - ALPHA) * z + ALPHA * root_value, the "
+                        "outcome mixed with the search's own root value (search.md "
+                        "10). 0 (default) is the historical loss, bit for bit. On the "
+                        "WDL head the mix is a soft label against the max-entropy "
+                        "W/D/L distribution with root_value as expectation")
+    p.add_argument("--split-grad", action="store_true",
+                   help="muon only: the value loss's gradient on the trunk goes "
+                        "through a separate AdamW (rate --split-grad-lr, no weight "
+                        "decay); the policy gradient and the value head stay in the "
+                        "main optimiser. COST: a second backward pass through the "
+                        "trunk per micro-batch, about 1.7x the gradient step")
+    p.add_argument("--split-grad-lr", type=float, default=None,
+                   help="rate of the split AdamW; default follows --aux-lr")
     p.add_argument("--reinject", choices=REINJECT_MODES, default=TrainConfig.reinject,
                    help="re-inject the five input embeddings into every block's "
                         "LayerNorm with a learned scalar per (site, source). `ln1` is "
@@ -1452,6 +1615,8 @@ def config_from_args(args) -> TrainConfig:
         value_weight=args.value_weight,
         value_classes=args.value_classes,
         value_subsample=args.value_subsample,
+        target_mix=args.target_mix, split_grad=args.split_grad,
+        split_grad_lr=args.split_grad_lr,
         value_head=args.value_head,
         reinject=args.reinject,
         total_steps=args.total_steps, euros_per_hour=args.euros_per_hour,

@@ -90,16 +90,22 @@ class TrainBatch:
     #: [N] float32 in {0, 1}: which rows the value loss is taken over. ``None`` is
     #: every row (the buffer writes it; hand-built batches may omit it).
     value_mask: Optional[torch.Tensor] = None
+    #: [N] float32 in [-1, 1]: the search's own value of the root, search.md §10's
+    #: `root_value`, **in the same frame as `value`** -- the side to move at the
+    #: record (`test_train.py::test_root_value_and_z_share_a_frame`). ``None`` when
+    #: the batch was hand-built without it; only read under ``target_mix > 0``.
+    root_value: Optional[torch.Tensor] = None
 
     def __len__(self) -> int:
         return int(self.board.shape[0])
 
     def slice(self, lo: int, hi: int) -> "TrainBatch":
         m = None if self.value_mask is None else self.value_mask[lo:hi]
+        r = None if self.root_value is None else self.root_value[lo:hi]
         return TrainBatch(*(t[lo:hi] for t in (
             self.board, self.control, self.rep, self.policy_move,
             self.policy_prob, self.policy_len, self.value, self.weight_gen)),
-            value_mask=m)
+            value_mask=m, root_value=r)
 
 
 @dataclass
@@ -125,6 +131,72 @@ class LossParts:
     #: and drifts across a game in a way a single king token never did. This is the
     #: cheap proxy for that drift; it is not the pooled vector's own norm.
     value_logit_rms: Optional[torch.Tensor] = None
+    #: 0-d float: how many rows of this (micro-)batch the value term averaged over
+    #: -- the mask's sum, or N without a mask. `value` is the mean over these rows,
+    #: so accumulating it across micro-batches weights it by this and **not** by the
+    #: row count; see `micro_batch_weights`.
+    value_rows: Optional[torch.Tensor] = None
+
+
+def value_rows_of(batch: TrainBatch) -> torch.Tensor:
+    """How many rows of ``batch`` the value loss is taken over, as a 0-d tensor."""
+    if batch.value_mask is None:
+        return torch.tensor(float(len(batch)), device=batch.board.device)
+    return batch.value_mask.float().sum()
+
+
+def micro_batch_weights(parts: LossParts, n_rows: int, total_rows: int,
+                        total_value_rows: torch.Tensor):
+    """The two scalars that make gradient accumulation exact (training.md §7.2).
+
+    Returns ``(w_policy, w_value)``. ``parts.policy`` (and ``entropy``, ``kl``) is a
+    mean over the micro-batch's rows, so ``n_rows / total_rows`` of it is its share
+    of the mean over the whole batch. ``parts.value`` is a mean over the
+    **value-supervised** rows only, so its share is ``value_rows / total_value_rows``.
+    ⚠️ Scaling both by the row count -- what `train_step` did until 2026-09-09 --
+    is exact for the policy and wrong for the value whenever the supervised
+    fraction differs between micro-batches: a micro-batch holding one supervised row
+    got the same weight as one holding two, and `docs/core-algorithm-review.md` §3
+    shows the value gradient cancelling to zero on four rows where the whole-batch
+    gradient is -2/3. A whole batch with no supervised row gives ``w_value = 0``
+    everywhere, which is the only weight that batch's value term can have.
+    """
+    w_policy = n_rows / total_rows
+    rows = parts.value_rows
+    if rows is None:
+        rows = torch.tensor(float(n_rows), device=total_value_rows.device)
+    w_value = rows / total_value_rows.clamp(min=1.0)
+    return w_policy, w_value
+
+
+def wdl_max_entropy(r: torch.Tensor) -> torch.Tensor:
+    """``[N] in [-1, 1]`` to ``[N, 3]``: the maximum-entropy win/draw/loss distribution
+    whose expectation ``p(win) - p(loss)`` is ``r``. Columns are (loss, draw, win),
+    the class order `az_loss` trains the WDL head in.
+
+    The record stores the search's root value as one scalar and not as three
+    probabilities, so a soft WDL label built from it has to pick *some* distribution
+    with that expectation. Maximum entropy is the one that adds no information the
+    scalar does not carry. It is well defined and unique: on the support ``{-1, 0, +1}``
+    the max-entropy distribution with a fixed mean is the exponential family
+    ``p_k ∝ exp(lambda k)``, which has ``p_draw^2 = p_win p_loss``. With
+    ``s = p_win + p_loss`` that is ``(s^2 - r^2) / 4 = (1 - s)^2``, whose root in
+    ``[|r|, 1]`` is
+
+        s = (4 - sqrt(4 - 3 r^2)) / 3
+
+    so ``p_draw = 1 - s``, ``p_win = (s + r) / 2``, ``p_loss = (s - r) / 2``. No
+    solve for ``lambda``, no clamp: ``r = 0`` gives the uniform third, ``r = +-1``
+    the point mass, and the radicand is at least 1 on the whole range.
+
+    ⚠️ What it is not: the search's actual draw probability. A root the search rates
+    at 0 is given a draw mass of 1/3, whether it is a dead draw or a wild position
+    the tree cannot decide. The scalar cannot tell the two apart, and storing the
+    three probabilities is a record-format change this function is here to avoid.
+    """
+    r = r.float()
+    s = (4.0 - torch.sqrt(4.0 - 3.0 * r * r)) / 3.0
+    return torch.stack([(s - r) / 2.0, 1.0 - s, (s + r) / 2.0], dim=-1)
 
 
 def decode_labels(policy_move: torch.Tensor):
@@ -178,8 +250,19 @@ def edge_logits(policy_logits: torch.Tensor, promo_logits: torch.Tensor,
 
 
 def az_loss(net, batch: TrainBatch, strict: bool = True,
-            value_weight: float = 1.0) -> LossParts:
+            value_weight: float = 1.0, target_mix: float = 0.0) -> LossParts:
     """AZ eq. (1) without the L2 term, for one (micro-)batch.
+
+    ``target_mix`` is ``--target-mix``: the value target becomes
+    ``(1 - a) * z + a * root_value``, the outcome mixed with the search's own value
+    of the root (search.md §10, `journal/2026-08-24-the-value-head-is-a-calibration-
+    failure.md`). ``0.0`` is every run on the ledger and takes the branch that
+    existed before the flag, so it is bit-identical rather than merely equal, and
+    reads ``batch.root_value`` not at all. On the scalar head the mix is a plain
+    regression target. On the WDL head it is a soft label,
+    ``(1 - a) * onehot(z) + a * q(root_value)``, with ``q`` the maximum-entropy
+    distribution of :func:`wdl_max_entropy`, trained with the soft-label
+    cross-entropy ``-sum_k p_k log softmax_k``.
 
     ⚠️ **The value term has two forms and the network picks which.** At
     ``net.n_value == 1`` it is AZ's ``(z - v)^2`` on the scalar tanh head, unchanged
@@ -263,19 +346,51 @@ def az_loss(net, batch: TrainBatch, strict: bool = True,
         # The value term is a mean over the *masked* rows: with every row marked this
         # is the plain mean and the loss is unchanged; with 1 in k marked, the term
         # keeps its magnitude and the unmarked rows contribute no value gradient at
-        # all. ⚠️ Per micro-batch, so the per-micro-batch weighting of `train_step`
-        # (by row count) is exact for the policy and approximate for the value by the
-        # mask's fluctuation across micro-batches -- a 2 % effect at 1 in 4 over 1024.
+        # all. Per micro-batch, so `train_step` weights it by `value_rows` and not by
+        # the row count -- `micro_batch_weights` -- or the accumulated gradient is not
+        # the whole batch's (`docs/core-algorithm-review.md` §3).
         mask = batch.value_mask
         if mask is None:
             mask = torch.ones_like(v)
         mask = mask.float()
-        m_sum = mask.sum().clamp(min=1.0)
+        value_rows = mask.sum()
+        m_sum = value_rows.clamp(min=1.0)
+        if not 0.0 <= target_mix <= 1.0:
+            raise ValueError(f"target_mix must be in [0, 1], got {target_mix}")
+        if target_mix > 0.0 and batch.root_value is None:
+            raise ValueError(
+                "target_mix > 0 needs `batch.root_value`, and this batch carries none. "
+                "`ReplayBuffer.sample` writes it; a hand-built TrainBatch has to")
+        # Both `z` and `root_value` are in the mover's frame and in [-1, 1] (§10,
+        # pinned by `test_root_value_and_z_share_a_frame`), so the mix is a convex
+        # combination in one frame, and flipping it into White's for the pooled head
+        # is the same `flip` on both. The branch keeps `target_mix = 0` on the exact
+        # arithmetic of every earlier run: `1.0 * z + 0.0 * r` is `z` in fp32 too,
+        # but only while `r` is finite, and a bit-identical claim should not rest on that.
+        if target_mix > 0.0:
+            z_mix = (1.0 - target_mix) * batch.value + target_mix * batch.root_value.float()
+        else:
+            z_mix = batch.value
         if n_value == 1:
             # `v * flip` un-does `heads`' flip, i.e. it is the head's own output again.
-            tgt = batch.value if flip is None else batch.value * flip
+            tgt = z_mix if flip is None else z_mix * flip
             pred = v if flip is None else v * flip
             value_loss = value_weight * (((tgt - pred) ** 2) * mask).sum() / m_sum
+        elif target_mix > 0.0:
+            # Soft label: the outcome's one-hot mixed with the max-entropy WDL
+            # distribution that has the search's root value as its expectation. `z`
+            # itself still has to be a game outcome, the same check as below.
+            z = batch.value if flip is None else batch.value * flip
+            r = batch.root_value.float() if flip is None else batch.root_value.float() * flip
+            cls = (z + 1.0).round()
+            if not bool(((cls - (z + 1.0)).abs() < 1e-6).all()):
+                raise AssertionError(
+                    "a value target is not in {-1, 0, +1}, so it has no class index "
+                    "to mix the search's value into")
+            onehot = F.one_hot(cls.long(), 3).float()
+            p = (1.0 - target_mix) * onehot + target_mix * wdl_max_entropy(r)
+            logp = torch.log_softmax(value_logits.float(), dim=-1)
+            value_loss = value_weight * (-(p * logp).sum(-1) * mask).sum() / m_sum
         else:
             # ⚠️ `batch.value` is exactly {-1, 0, +1} by construction -- `buffer.py:253`
             # writes `-result * s_rec * s_end` and every factor is a sign -- so `+1` is
@@ -296,7 +411,8 @@ def az_loss(net, batch: TrainBatch, strict: bool = True,
     return LossParts(total=policy_loss + value_loss, policy=policy_loss,
                      value=value_loss, entropy=entropy, kl=policy_loss - entropy,
                      value_pred=v.detach(), n_value=n_value,
-                     value_logit_rms=value_logits.detach().float().pow(2).mean().sqrt())
+                     value_logit_rms=value_logits.detach().float().pow(2).mean().sqrt(),
+                     value_rows=value_rows.detach())
 
 
 def _check(batch: TrainBatch, valid: torch.Tensor, logit: torch.Tensor) -> None:

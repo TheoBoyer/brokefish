@@ -344,7 +344,8 @@ class ReplayBuffer:
             policy_prob=to("policy_prob", torch.float16),
             policy_len=to("policy_len", torch.uint8), value=to("value", torch.float32),
             weight_gen=to("weight_gen", torch.int32),
-            value_mask=to("value_mask", torch.float32))
+            value_mask=to("value_mask", torch.float32),
+            root_value=to("root_value", torch.float32))
 
     # -- reporting and persistence ------------------------------------------ #
 

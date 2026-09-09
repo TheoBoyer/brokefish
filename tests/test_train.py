@@ -304,6 +304,43 @@ def test_gradient_accumulation_is_exact_in_double():
         assert rel < 1e-11, f"{32 // micro} x {micro}: relative difference {rel:.3e}"
 
 
+def test_gradient_accumulation_is_exact_under_a_value_mask():
+    """§7.2 with value supervision subsampled: the value term is a mean over the
+    *masked* rows, so its micro-batch weight is the masked count's share and not
+    the row count's. `docs/core-algorithm-review.md` §3 has the four-row case where
+    the old single scale cancelled a −2/3 gradient to zero; this is the same claim
+    at the identity's tolerance, with the supervised fraction moving from 1/2 to 0
+    to 1 across the micro-batches, and a proof that the old weighting *does* differ,
+    so the test is not vacuous."""
+    from dataclasses import replace
+    from brokefish.train.loss import micro_batch_weights, value_rows_of
+
+    batch, _, _ = make_batch(32, seed=6)
+    mask = torch.ones(32, device=DEVICE)
+    mask[4:16] = 0.0                            # micro 8: 4 / 0 / 8 / 8 supervised rows
+    batch = replace(batch, value_mask=mask)
+    net = BrokefishNet().to(DEVICE).double()
+
+    def grad(micro, exact):
+        net.zero_grad(set_to_none=True)
+        n, total_value = len(batch), value_rows_of(batch)
+        for i in range(n // micro):
+            mb = batch.slice(i * micro, (i + 1) * micro)
+            parts = az_loss(net, mb)
+            w_p, w_v = micro_batch_weights(parts, len(mb), n, total_value)
+            if not exact:
+                w_v = w_p                        # the pre-2026-09-09 weighting
+            (parts.policy * w_p + parts.value * w_v).backward()
+        return torch.cat([p.grad.detach().reshape(-1) for p in net.parameters()])
+
+    whole = grad(32, exact=True)
+    for micro in (8, 16):
+        rel = float((whole - grad(micro, exact=True)).norm() / whole.norm())
+        assert rel < 1e-11, f"{32 // micro} x {micro}: relative difference {rel:.3e}"
+    rel_old = float((whole - grad(8, exact=False)).norm() / whole.norm())
+    assert rel_old > 1e-3, f"the row-count weighting would have passed: {rel_old:.3e}"
+
+
 def test_gradient_accumulation_holds_in_the_precision_it_actually_runs_at():
     """The same identity in fp32, at the tolerance the hardware allows.
 
@@ -1516,3 +1553,248 @@ def test_value_head_reaches_the_network_and_the_config_hash():
     net = BrokefishNet(n_value=3, value_head="pooled")
     assert net.value_absolute and "value_mode" in net.state_dict()
     assert not BrokefishNet(n_value=3).value_absolute
+
+
+# --------------------------------------------------------------------------
+# `--target-mix` and `--split-grad`, 2026-09-09. Two flags, both off by default, both
+# leaving every earlier run's arithmetic bit-identical when off -- which is the first
+# thing each block below asserts, with `torch.equal` and not a tolerance.
+
+
+def _with_root_value(batch, root_value):
+    from dataclasses import replace
+    return replace(batch, root_value=root_value)
+
+
+@pytest.mark.parametrize("n_value", [1, 3])
+def test_target_mix_at_zero_is_the_old_loss_bit_for_bit(n_value):
+    """`target_mix = 0.0` takes the branch that existed before the flag: same loss,
+    same gradient, `torch.equal`, whether or not the batch carries a `root_value`."""
+    batch, _, _ = make_batch(16, seed=31)
+    torch.manual_seed(0)
+    rv = torch.rand(16, device=DEVICE) * 2 - 1
+    net = BrokefishNet(n_value=n_value).to(DEVICE)
+
+    def loss_and_grad(b, **kw):
+        net.zero_grad(set_to_none=True)
+        parts = az_loss(net, b, **kw)
+        parts.total.backward()
+        return parts.total.detach().clone(), torch.cat(
+            [p.grad.reshape(-1).clone() for p in net.parameters()])
+
+    old_l, old_g = loss_and_grad(batch)
+    new_l, new_g = loss_and_grad(_with_root_value(batch, rv), target_mix=0.0)
+    assert torch.equal(old_l, new_l) and torch.equal(old_g, new_g)
+    mixed_l, _ = loss_and_grad(_with_root_value(batch, rv), target_mix=0.5)
+    assert not torch.equal(old_l, mixed_l), "the mix did not reach the loss"
+
+
+def test_target_mix_at_one_regresses_onto_root_value():
+    """Scalar head: at `a = 1` the target is `root_value`, at `a = 0.5` the midpoint,
+    and the value mask still selects the rows."""
+    batch, _, _ = make_batch(16, seed=32)
+    n = len(batch)
+    torch.manual_seed(1)
+    raw = torch.randn(n, device=DEVICE)
+    rv = torch.rand(n, device=DEVICE) * 2 - 1
+    net = ConstNet(torch.randn(n, 32, 64, device=DEVICE),
+                   torch.randn(n, 32, 4, device=DEVICE), raw)
+    b = _with_root_value(batch, rv)
+    want = ((rv - torch.tanh(raw)) ** 2).mean()
+    assert float(az_loss(net, b, target_mix=1.0).value) == pytest.approx(float(want), rel=1e-6)
+    tgt = 0.5 * batch.value + 0.5 * rv
+    want = ((tgt - torch.tanh(raw)) ** 2).mean()
+    assert float(az_loss(net, b, target_mix=0.5).value) == pytest.approx(float(want), rel=1e-6)
+
+    from dataclasses import replace
+    mask = (torch.arange(n, device=DEVICE) % 3 == 0).float()
+    want = (((tgt - torch.tanh(raw)) ** 2) * mask).sum() / mask.sum()
+    parts = az_loss(net, replace(b, value_mask=mask), target_mix=0.5)
+    assert float(parts.value) == pytest.approx(float(want), rel=1e-6)
+    assert float(parts.value_rows) == float(mask.sum())
+
+    with pytest.raises(ValueError, match="root_value"):
+        az_loss(net, batch, target_mix=0.5)
+    with pytest.raises(ValueError, match="in \\[0, 1\\]"):
+        az_loss(net, b, target_mix=1.5)
+
+
+def test_the_max_entropy_wdl_map_has_the_right_expectation():
+    """`wdl_max_entropy`: a distribution, with `p(win) - p(loss) = r`, geometric
+    (`p_draw^2 = p_win p_loss`, the exponential family's signature), uniform at 0 and
+    a point mass at +-1."""
+    from brokefish.train.loss import wdl_max_entropy
+
+    r = torch.linspace(-1, 1, 201, device=DEVICE, dtype=torch.float64)
+    p = wdl_max_entropy(r).double()
+    assert bool((p >= 0).all())
+    torch.testing.assert_close(p.sum(-1), torch.ones_like(r))
+    torch.testing.assert_close(p[:, 2] - p[:, 0], r)
+    torch.testing.assert_close(p[:, 1] ** 2, p[:, 0] * p[:, 2], atol=1e-6, rtol=0)
+    torch.testing.assert_close(p[100], torch.full((3,), 1 / 3, dtype=torch.float64, device=DEVICE))
+    torch.testing.assert_close(p[-1], torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64, device=DEVICE))
+    torch.testing.assert_close(p[0], torch.tensor([1.0, 0.0, 0.0], dtype=torch.float64, device=DEVICE))
+    # Maximum entropy among distributions with that mean: perturb along the one
+    # direction that keeps the mean and the mass, and the entropy must not rise.
+    q = p[50] + 1e-3 * torch.tensor([1.0, -2.0, 1.0], dtype=torch.float64, device=DEVICE)
+    H = lambda x: float(-(x * x.log()).sum())
+    assert H(p[50]) > H(q)
+
+
+def test_target_mix_on_the_wdl_head_is_a_soft_label():
+    """At `a = 1` and `root_value = 0` the label is uniform, so the loss is the
+    mean of `-log softmax`; at `a = 1` and `root_value = +1` it is the hard win
+    class; at `a = 0.5` it is the average of the two cross-entropies."""
+    batch, _, _ = make_batch(8, seed=33)
+    n = len(batch)
+    torch.manual_seed(2)
+    logits = torch.randn(n, 3, device=DEVICE)
+    net = ConstNet(torch.randn(n, 32, 64, device=DEVICE),
+                   torch.randn(n, 32, 4, device=DEVICE), logits)
+    logp = torch.log_softmax(logits, -1)
+
+    b0 = _with_root_value(batch, torch.zeros(n, device=DEVICE))
+    want = (-logp.mean(-1)).mean()
+    assert float(az_loss(net, b0, target_mix=1.0).value) == pytest.approx(float(want), rel=1e-6)
+
+    b1 = _with_root_value(batch, torch.ones(n, device=DEVICE))
+    want = (-logp[:, 2]).mean()
+    assert float(az_loss(net, b1, target_mix=1.0).value) == pytest.approx(float(want), rel=1e-6)
+
+    ce_z = torch.nn.functional.cross_entropy(logits, (batch.value + 1).long())
+    want = 0.5 * ce_z + 0.5 * (-logp[:, 2]).mean()
+    assert float(az_loss(net, b1, target_mix=0.5).value) == pytest.approx(float(want), rel=1e-6)
+
+    soft = b1.slice(0, n)
+    soft.value = torch.full((n,), 0.37, device=DEVICE)
+    with pytest.raises(AssertionError, match="not in"):
+        az_loss(net, soft, target_mix=0.5)
+
+
+def test_root_value_and_z_share_a_frame():
+    """§10: `root_value` is the search's value **for the side to move at the record**,
+    in [-1, 1], which is the frame `z` is written in by `_close`. Pinned on the one
+    position where both are known exactly: a mate in one, where the search's root
+    value is +1 under the collapse and the game closes with `z = +1` on that record
+    -- and where an inverted frame on either side would give -1."""
+    fen = "6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1"
+    b, c = env.from_fen(fen)
+    b, c = b.to(DEVICE).expand(4, -1).contiguous(), c.to(DEVICE).expand(4).contiguous()
+    torch.manual_seed(0)
+    net = BrokefishNet().to(DEVICE).eval()
+    with torch.no_grad():
+        s = Search(SearchConfig(n=16, B=4, E=64, terminal_collapse=True),
+                   evaluate=make_evaluator(net), device=DEVICE, seed=0)
+        s.reset(b, c)
+        rec = s.self_play_move()
+    assert bool(rec.done.all()) and bool((rec.result == -1).all())
+    assert float(rec.root_value.min()) > 0.999
+
+    buf = ReplayBuffer(window_games=8, mean_plies=4, seed=0)
+    buf.append(rec)
+    batch = buf.sample(4, device=DEVICE)
+    assert batch.root_value is not None
+    assert torch.equal(batch.value, torch.ones(4, device=DEVICE))
+    assert float(batch.root_value.min()) > 0.999
+    # The same record, black to move, so the frame flips on both sides at once.
+    fen_b = "4r1k1/5ppp/8/8/8/8/5PPP/6K1 b - - 0 1"
+    b, c = env.from_fen(fen_b)
+    b, c = b.to(DEVICE).expand(4, -1).contiguous(), c.to(DEVICE).expand(4).contiguous()
+    with torch.no_grad():
+        s.reset(b, c)
+        rec = s.self_play_move()
+    assert bool(rec.done.all()) and float(rec.root_value.min()) > 0.999
+    buf.append(rec)
+    batch = buf.sample(8, device=DEVICE)
+    assert torch.equal(batch.value, torch.ones(8, device=DEVICE))
+    # And the range, over ordinary positions.
+    batch, rec, _ = make_batch(32, seed=34)
+    assert float(rec.root_value.abs().max()) <= 1.0
+
+
+def test_split_grad_is_exact_under_sgd():
+    """`backward_split` + `step_with_grads` against one joint backward and one SGD
+    step, in double, over two micro-batches. Plain SGD is linear in the gradient, so
+    the two-optimiser step equals the one-optimiser step exactly; anything but
+    round-off says the split dropped, doubled or misrouted a gradient."""
+    from brokefish.train.loop import backward_split, split_grad_params, step_with_grads
+
+    batch, _, _ = make_batch(16, seed=35)
+    torch.manual_seed(3)
+    net = BrokefishNet().to(DEVICE).double()
+    lr = 0.05
+
+    def run(split):
+        torch.manual_seed(3)
+        m = BrokefishNet().to(DEVICE).double()
+        m.load_state_dict(net.state_dict())
+        trunk, head = split_grad_params(m)
+        main = torch.optim.SGD(m.parameters(), lr=lr)
+        aux = torch.optim.SGD(trunk, lr=lr)
+        m.zero_grad(set_to_none=True)
+        value_grads = [None] * len(trunk)
+        for i in range(2):
+            mb = batch.slice(8 * i, 8 * i + 8)
+            parts = az_loss(m, mb)
+            if split:
+                backward_split(parts.policy * 0.5, parts.value * 0.5, trunk, head, value_grads)
+            else:
+                (parts.policy * 0.5 + parts.value * 0.5).backward()
+        if split:
+            assert all(g is not None for g in value_grads)
+            assert all(p.grad is not None for p in head), "the value head lost its gradient"
+            assert m.policy.weight.grad is not None
+            joint_grad = torch.cat([p.grad.reshape(-1) for p in m.parameters()])
+            main.step()
+            step_with_grads(aux, trunk, value_grads)
+            assert all(p.grad is None for p in trunk)
+        else:
+            joint_grad = torch.cat([p.grad.reshape(-1) for p in m.parameters()])
+            main.step()
+        return torch.cat([p.detach().reshape(-1) for p in m.parameters()]), joint_grad
+
+    joint, g_joint = run(split=False)
+    split, g_policy = run(split=True)
+    rel = float((joint - split).norm() / (joint - torch.cat(
+        [p.detach().reshape(-1) for p in net.parameters()])).norm())
+    assert rel < 1e-11, f"split step differs from the joint one by {rel:.3e} of the update"
+    # And the split really moved gradient out of `.grad`: what the main optimiser saw
+    # is not the joint gradient.
+    assert float((g_joint - g_policy).norm() / g_joint.norm()) > 1e-3
+
+
+def test_the_flags_reach_the_config_hash_and_split_grad_needs_muon(tmp_path):
+    from dataclasses import replace
+
+    cfg = TrainConfig()
+    assert cfg.target_mix == 0.0 and not cfg.split_grad
+    assert replace(cfg, target_mix=0.5).hash() != cfg.hash()
+    assert replace(cfg, split_grad=True).hash() != cfg.hash()
+    assert replace(cfg, split_grad_lr=3e-4).hash() != cfg.hash()
+    with pytest.raises(ValueError, match="muon"):
+        _smoke_trainer(tmp_path, "split-adamw", optimizer="adamw", split_grad=True)
+
+
+def test_split_grad_trains_under_muon_and_checkpoints_its_optimiser(tmp_path):
+    """The whole `train_step` path under `--split-grad --optimizer muon`: the step
+    runs, the trunk's value gradient is reported, the weights move, `.grad` is left
+    clean on the trunk, and the second AdamW is in the checkpoint."""
+    trainer = _smoke_trainer(tmp_path, "split-muon", optimizer="muon", split_grad=True,
+                             lr_schedule=((0, 0.02),), target_mix=0.5)
+    while trainer.buffer.n_records < 8:
+        trainer.self_play_phase()
+    before = weight_fingerprint(trainer.net)
+    out = trainer.train_step()
+    assert out["grad_norm_value_trunk"] > 0 and out["grad_norm"] > 0
+    assert weight_fingerprint(trainer.net) != before
+    assert all(p.grad is None for p in trainer.split_trunk)
+    state = trainer.state_dict()
+    assert state["opt_value"] is not None and len(state["opt_value"]["state"]) > 0
+    ckpt = str(tmp_path / "s.pt")
+    trainer.save_checkpoint(ckpt)
+    again = _smoke_trainer(tmp_path, "split-muon2", optimizer="muon", split_grad=True,
+                           lr_schedule=((0, 0.02),), target_mix=0.5)
+    again.load_checkpoint(ckpt)
+    assert len(again.opt_value.state_dict()["state"]) == len(state["opt_value"]["state"])
+    trainer.log.close()
+    again.log.close()

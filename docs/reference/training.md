@@ -535,6 +535,13 @@ an approximation of batch 4096 — it is batch 4096:
   composition;
 - the loss is a mean over samples, so four micro-batch losses each scaled by ¼ sum to
   the gradient of the mean over 4096, up to floating-point accumulation order;
+  ⚠️ **each term by the count it is a mean over.** The policy term is a mean over the
+  micro-batch's rows; the value term is a mean over its *value-supervised* rows
+  (`value_mask`, §5.1). Its weight is therefore that micro-batch's supervised count
+  over the whole batch's, not ¼: with one scale for both, a micro-batch holding one
+  supervised row weighed as much as one holding two, and the accumulated value gradient
+  was not the whole batch's (`loss.py:micro_batch_weights`, fixed 2026-09-09,
+  `docs/core-algorithm-review.md` §3). With every row supervised the two scales coincide;
 - cost is one persistent fp32 gradient buffer, 6,383,360 × 4 B = **25.5 MB**, and
   *fewer* optimiser steps than batch 1024.
 

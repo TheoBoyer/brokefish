@@ -436,6 +436,30 @@ def test_legal_moves(boards):
         assert_legal_moves_equal(board, b[0], movegen(b, c)[0][0])
 
 
+# A third white rook: the surplus one lands in a pawn slot, and its castling right
+# is decided by its square and the FEN, not by which slot it fell into. Only the
+# queenside right is given, and the b1 rook blocks it.
+THREE_ROOKS = "4k3/8/8/8/8/8/8/RR2K2R w Q - 0 1"
+
+
+@pytest.mark.parametrize("importer", ["from_fen", "from_board"])
+def test_a_third_rook_does_not_grant_a_castle(importer):
+    """`docs/core-algorithm-review.md` §2: both importers left `special` clear on a
+    rook stored in a pawn slot, and `movegen` -- which compares the whole word --
+    then read the h1 rook as unmoved and generated e1g1, an illegal castle."""
+    board = chess.Board(THREE_ROOKS)
+    b, c = from_fen(board.fen()) if importer == "from_fen" else from_board(board)
+    assert castling_rights(b)[0].tolist() == [False, True, False, False]
+    assert_legal_moves_equal(board, b[0], movegen(b, c)[0][0])
+    assert_board_equal(board, to_chess_board(b[0], c[0]))
+    # And the two importers agree on every live word, `special` included. Captured
+    # slots are left out: `from_fen` zeroes them and `from_board` keeps their pad,
+    # which is a pre-existing difference in dead words and not a rights one.
+    other, _ = from_board(board) if importer == "from_fen" else from_fen(board.fen())
+    live = (b & (1 << 11)) == 0
+    assert torch.equal(b[live], other[live]), (b.tolist(), other.tolist())
+
+
 def test_state_transitions(boards, plies: int):
     rng = random.Random(0)
     for board in boards:

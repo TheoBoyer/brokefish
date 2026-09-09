@@ -403,8 +403,11 @@ def test_two_boards_per_cta_is_bit_identical_to_one(n):
     guard. The odd sizes are the guard: at n = 3 the last CTA holds one real board and
     one duplicate, whose outputs must be computed and never written."""
     net = BrokefishNet().cuda().half().eval()
-    one = FusedEncoder(copy.deepcopy(net), int8=True, two_boards=False)
-    two = FusedEncoder(copy.deepcopy(net), int8=True)
+    # `"ffn"` by name: the default scheme, `"all"`, is instantiated at two boards per
+    # CTA only, so it cannot be the one-board side of this comparison. The claim is
+    # about the CTA split, not the scheme, and `"ffn"` exists on both sides.
+    one = FusedEncoder(copy.deepcopy(net), int8=True, two_boards=False, int8_scheme="ffn")
+    two = FusedEncoder(copy.deepcopy(net), int8=True, int8_scheme="ffn")
     b, c, r = random_positions(n, plies=20, seed=n)
     with torch.no_grad():
         p1, q1, v1 = (t.clone() for t in one.forward_full(b, c, r))
@@ -425,8 +428,8 @@ def test_two_boards_rejects_fp8():
 
 def test_two_boards_runs_the_debug_stages():
     net = BrokefishNet().cuda().half().eval()
-    one = FusedEncoder(copy.deepcopy(net), int8=True, two_boards=False)
-    two = FusedEncoder(copy.deepcopy(net), int8=True)
+    one = FusedEncoder(copy.deepcopy(net), int8=True, two_boards=False, int8_scheme="ffn")
+    two = FusedEncoder(copy.deepcopy(net), int8=True, int8_scheme="ffn")
     b, c, r = random_positions(33, plies=20, seed=11)
     with torch.no_grad():
         for stage in (9, 1, 2, 3, 8):

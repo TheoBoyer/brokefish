@@ -104,6 +104,18 @@ def visit_table(m_max: int, n: int, device) -> torch.Tensor:
     return torch.tensor(rows, dtype=torch.int32, device=device)
 
 
+#: The floor under a stored prior, before `log` in `edge_logits` and before the
+#: prior-weighted mean in `completed_q`. `edge_prior` is fp16, whose smallest
+#: positive value is the subnormal 2^-24, so this clamp moves **only a hard zero**:
+#: every positive prior the tree can hold is at or above it and passes unchanged.
+#: ⚠️ Until 2026-09-09 this was `torch.finfo(torch.float16).tiny` = 2^-14, the
+#: smallest *normal* fp16 -- which also flattened every prior in [2^-24, 2^-14)
+#: onto one logit. At the start position that made a 1e-5 edge and a 1e-6 edge
+#: tie, and sequential halving then considered the wrong one
+#: (`docs/core-algorithm-review.md` §1). `csrc/search.cuh:kPriorFloor` is the
+#: same number, and `tests/test_search_cuda.py` holds the two together.
+PRIOR_FLOOR = 2.0 ** -24
+
 # -- the Q transform ------------------------------------------------------- #
 
 def completed_q(q01: torch.Tensor, nvis: torch.Tensor, valid: torch.Tensor,
@@ -126,11 +138,19 @@ def completed_q(q01: torch.Tensor, nvis: torch.Tensor, valid: torch.Tensor,
     """
     visited = valid & (nvis > 0)
     zero = torch.zeros_like(q01)
+    # `mctx._compute_mixed_value` guards the priors *before* the weighted mean, and
+    # so does this. A visited edge whose fp16 prior rounded to a hard zero would
+    # otherwise contribute nothing to `weighted_q` while still counting in
+    # `sum_visits`, which pulls `v_mix` toward 0 -- a loss -- whatever its Q said
+    # (`docs/core-algorithm-review.md` §4). The same floor as `edge_logits`, so an
+    # edge that can be selected is an edge whose evidence is weighed.
+    prior = prior.float().clamp(min=PRIOR_FLOOR)
 
     sum_visits = torch.where(valid, nvis, zero).sum(-1)
     sum_probs = torch.where(visited, prior, zero).sum(-1)
-    # The `where` on the denominator is `mctx`'s: the numerator is already zero
-    # wherever `sum_probs` is, so this only keeps 0/0 out of the graph.
+    # The `where` on the denominator is `mctx`'s. With the floor above it only
+    # fires when nothing is visited, where the numerator is zero anyway, so this
+    # keeps 0/0 out of the graph and nothing else.
     denom = torch.where(sum_probs > 0, sum_probs, torch.ones_like(sum_probs))
     weighted_q = torch.where(visited, prior * q01 / denom[:, None], zero).sum(-1)
     v_mix = (node_value01 + sum_visits * weighted_q) / (sum_visits + 1.0)
@@ -154,10 +174,11 @@ def edge_logits(prior: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
     `_expand` writes a softmax renormalised over the kept edges, so `log(prior)`
     is the logits up to an additive constant — and every use of this is inside a
     softmax or an argmax, both shift-invariant. The clamp is load-bearing:
-    `edge_prior` is fp16 and underflows to a hard zero below ~6e-8, which would
-    put `-inf` on a *legal* move and make it unreachable at every budget.
+    `edge_prior` is fp16 and underflows to a hard zero below 2^-24 ~ 6e-8, which
+    would put `-inf` on a *legal* move and make it unreachable at every budget.
+    It is `PRIOR_FLOOR` and not `finfo(float16).tiny`: see the constant.
     """
-    p = prior.float().clamp(min=torch.finfo(torch.float16).tiny)
+    p = prior.float().clamp(min=PRIOR_FLOOR)
     lg = torch.log(p)
     return torch.where(valid, lg, torch.full_like(lg, float("-inf")))
 

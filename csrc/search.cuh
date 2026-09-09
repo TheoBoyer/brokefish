@@ -331,11 +331,17 @@ __device__ inline float warp_min_f(float x) {
     return x;
 }
 
-// `torch.finfo(torch.float16).tiny`, the clamp under the logit recovery. ⚠️ Not
-// cosmetic: `edge_prior` is fp16 and underflows to a hard zero below this, and a
-// `-inf` logit on a *legal* move is unreachable at every budget -- the same
-// absorbing state the FPU bug was, one level up. See `gumbel.edge_logits`.
-constexpr float kHalfTiny = 6.103515625e-05f;
+// `gumbel.PRIOR_FLOOR` = 2^-24, the smallest positive fp16 (a subnormal): the
+// floor under a stored prior before the logit recovery and before the weighted
+// mean in the completion value. ⚠️ Not cosmetic: `edge_prior` is fp16 and
+// underflows to a hard zero below this, and a `-inf` logit on a *legal* move is
+// unreachable at every budget -- the same absorbing state the FPU bug was, one
+// level up. ⚠️ It was `finfo(float16).tiny` = 2^-14, the smallest *normal* fp16,
+// until 2026-09-09; that also flattened every representable prior below 6e-5 onto
+// one logit, and sequential halving then considered the wrong edge
+// (`docs/core-algorithm-review.md` §1). Every positive fp16 is >= 2^-24, so the
+// clamp now touches only the hard zero.
+constexpr float kPriorFloor = 5.9604644775390625e-08f;
 // `mctx.seq_halving.score_considered`'s floor, which keeps a row from being all
 // `-inf` before the visit-count penalty is applied.
 constexpr float kLowLogit = -1e9f;
@@ -383,7 +389,9 @@ __device__ inline int gumbel_argmax(const int16_t* nvis, const __half* prior,
         const int e = lane + 32 * j;
         own[j] = e < nedges;
         nv[j] = own[j] ? (int)nvis[e] : 0;
-        pr[j] = own[j] ? __half2float(prior[e]) : 0.0f;
+        // Floored once, here, so the weighted mean below and the logit recovery
+        // further down see the same prior -- `gumbel.completed_q` does the same.
+        pr[j] = own[j] ? fmaxf(__half2float(prior[e]), kPriorFloor) : 0.0f;
         qv[j] = own[j] ? qs[e] : 0.0f;
         // Non-negative integers summing to at most `n`, so fp32 is exact whatever
         // the reduction order -- the same argument `puct_argmax` makes for doing it
@@ -396,8 +404,11 @@ __device__ inline int gumbel_argmax(const int16_t* nvis, const __half* prior,
     const float max_visits = warp_max_f(own_maxv);
     const float sum_probs = warp_sum_f(own_probs);
 
-    // `mctx._compute_mixed_value`. The `where` on the denominator is theirs: the
-    // numerator is already zero wherever `sum_probs` is, so this only keeps 0/0 out.
+    // `mctx._compute_mixed_value`. The `where` on the denominator is theirs; with
+    // the floor on `pr` it only fires when nothing is visited, where the numerator
+    // is zero anyway, so this keeps 0/0 out and nothing else. Without the floor a
+    // visited edge at a hard-zero prior counted in `sum_visits` and not in `own_wq`,
+    // pulling `v_mix` toward a loss whatever its Q said (review §4).
     const float denom = sum_probs > 0.0f ? sum_probs : 1.0f;
     float own_wq = 0.0f;
 #pragma unroll
@@ -455,7 +466,7 @@ __device__ inline int gumbel_argmax(const int16_t* nvis, const __half* prior,
         float own_lg[kEPerLane], own_max = -INFINITY;
 #pragma unroll
         for (int j = 0; j < kEPerLane; ++j) {
-            own_lg[j] = own[j] ? logf(fmaxf(pr[j], kHalfTiny)) : -INFINITY;
+            own_lg[j] = own[j] ? logf(pr[j]) : -INFINITY;
             own_max = fmaxf(own_max, own_lg[j]);
         }
         const float lmax = warp_max_f(own_max);
@@ -474,7 +485,7 @@ __device__ inline int gumbel_argmax(const int16_t* nvis, const __half* prior,
         float own_z[kEPerLane], own_max = -INFINITY;
 #pragma unroll
         for (int j = 0; j < kEPerLane; ++j) {
-            own_z[j] = own[j] ? logf(fmaxf(pr[j], kHalfTiny))
+            own_z[j] = own[j] ? logf(pr[j])
                                     + vscale * ((comp[j] - lo) / span)
                               : -INFINITY;
             own_max = fmaxf(own_max, own_z[j]);

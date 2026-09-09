@@ -268,6 +268,54 @@ def test_an_unreachable_prior_does_not_become_an_impossible_move():
     assert float(lg[0, 2]) < float(lg[0, 0])
 
 
+def test_small_priors_keep_their_order():
+    """`edge_logits` flattens nothing an fp16 prior can hold.
+
+    The floor used to be `finfo(float16).tiny` = 2^-14, the smallest *normal*
+    fp16 -- but the format goes on down to the subnormal 2^-24, so every prior in
+    [6e-8, 6e-5) collapsed onto one logit. At the start position, a 1e-5 edge and a
+    1e-6 edge tied, and halving considered the wrong one
+    (`docs/core-algorithm-review.md` §1). A representable prior must keep its
+    ordering; only the hard zero is moved.
+    """
+    row = [1e-6] * 20
+    row[19] = 1e-5
+    row[0] = 1.0 - sum(row[1:])
+    prior = torch.tensor([row], device=DEVICE, dtype=torch.float16)
+    assert float(prior[0, 19]) > float(prior[0, 1]) > 0.0, "fp16 holds both"
+    valid = torch.ones((1, 20), dtype=torch.bool, device=DEVICE)
+    lg = G.edge_logits(prior.float(), valid)
+    assert float(lg[0, 19]) > float(lg[0, 1]), (float(lg[0, 19]), float(lg[0, 1]))
+    assert lg[0, :].topk(2).indices.tolist() == [0, 19]
+    # The hard zero still gets a finite logit, and the floor sits below every
+    # positive fp16 -- the two properties that fix the number.
+    assert G.PRIOR_FLOOR == 2.0 ** -24
+    assert float(torch.tensor(G.PRIOR_FLOOR, dtype=torch.float16)) == G.PRIOR_FLOOR
+
+
+def test_a_visited_edge_at_zero_prior_still_weighs_in_the_completion():
+    """`completed_q` guards the priors before the weighted mean, as `mctx` does.
+
+    Selection gives a legal move a finite logit whatever its prior, so it can be
+    visited at a hard-zero prior. Its Q then has to reach `v_mix`: with the raw
+    prior the weighted mean was 0 while `sum_visits` still counted the visit, and
+    the completion value of every unvisited sibling was pulled toward a loss --
+    here to 0.25 where the one visited edge was a win and the answer is 0.75
+    (`docs/core-algorithm-review.md` §4).
+    """
+    q = torch.tensor([[1.0, 0.0]], device=DEVICE)
+    nvis = torch.tensor([[1.0, 0.0]], device=DEVICE)
+    valid = torch.ones((1, 2), dtype=torch.bool, device=DEVICE)
+    prior = torch.tensor([[0.0, 1.0]], device=DEVICE)
+    value = torch.tensor([0.5], device=DEVICE)
+    _, completed = G.completed_q(q, nvis, valid, value, prior)
+    assert abs(float(completed[0, 0]) - 1.0) < 1e-6
+    assert abs(float(completed[0, 1]) - 0.75) < 1e-6, float(completed[0, 1])
+    # More evidence of the win moves the completion toward it, not away.
+    _, more = G.completed_q(q, nvis * 9, valid, value, prior)
+    assert float(more[0, 1]) > float(completed[0, 1])
+
+
 # -- 4. the claim ---------------------------------------------------------- #
 
 def test_the_search_improves_on_the_prior():

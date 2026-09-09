@@ -752,16 +752,19 @@ def from_board(c_board) -> Tuple[torch.Tensor, torch.Tensor]:
     board[:, 16:32] |= COLOR
 
     # `special` records the loss of a right, so it is set when the right is gone.
+    # Over **every live rook by its type bits**, not over the two rook slots: a
+    # third rook lives in a pawn slot, and the move generators compare the whole
+    # piece word (`movegen.cuh:unmoved_rook_word`), so a promoted rook on h1 with
+    # `special` clear granted a kingside castle the position did not have
+    # (`docs/core-algorithm-review.md` §2). `castling_rights` is python-chess's
+    # bitboard of the rook squares that hold a right, so one shift per word covers
+    # both colours and every square.
     rights = torch.tensor(c_board.castling_rights, dtype=torch.uint64).view(torch.int64)
-    if len(w_rooks) > 0:
-        board[0, 12] |= ((~rights >> w_rooks[0]) & 1) << 9
-    if len(w_rooks) > 1:
-        board[0, 13] |= ((~rights >> w_rooks[1]) & 1) << 9
+    words = board[0]
+    live_rook = ((words & CAPTURED) == 0) & (((words >> 6) & 0b111) == ROOK)
+    lost = (~rights >> (words & SQUARE)) & 1
+    board[0] |= torch.where(live_rook, lost, torch.zeros_like(lost)) << 9
     board[0, 15] |= ((rights & 0b10000001) == 0) << 9
-    if len(b_rooks) > 0:
-        board[0, 28] |= ((~rights >> b_rooks[0]) & 1) << 9
-    if len(b_rooks) > 1:
-        board[0, 29] |= ((~rights >> b_rooks[1]) & 1) << 9
     board[0, 31] |= (((rights >> 56) & 0b10000001) == 0) << 9
 
     control = torch.tensor([(1 if c_board.turn else -1) * (c_board.halfmove_clock + 1)],
@@ -796,23 +799,34 @@ def from_fen(fen: str) -> Tuple[torch.Tensor, torch.Tensor]:
             row -= 1
             col = 0
         else:
+            # The piece's own type and colour, kept apart from `char`, which is
+            # rewritten to the pawn letter below when the piece overflows into a
+            # pawn slot. The rights branch used to read `char` after that rewrite,
+            # so a third rook was filed as a pawn and never lost its right
+            # (`docs/core-algorithm-review.md` §2).
+            kind, white = char.lower(), char.isupper()
             i, o, n = next_slot[char]
             if i >= n:  # promoted material goes into a pawn slot
-                original = "p" if char.islower() else "P"
+                original = "P" if white else "p"
                 i, o, n = next_slot[original]
-                board[0, o + i] += _TYPE_FROM_CHAR[char.lower()] << 6
+                board[0, o + i] += _TYPE_FROM_CHAR[kind] << 6
                 char = original
             square = row * 8 + col
             board[0, o + i] &= ~(CAPTURED | SQUARE) & 0xFFF
             board[0, o + i] += square
-            if char.lower() == "p" and square == ep_square:
+            if kind == "p" and square == ep_square:
                 board[0, o + i] |= SPECIAL
-            if char.lower() == "r":
-                right = "qk"[int(square % 8 == 7)]
-                right = right.upper() if char.isupper() else right
-                if right not in castle:
+            if kind == "r":
+                # A rook holds a right only on its own corner, with the letter in
+                # the FEN. Anywhere else `special` is set, which is also what `step`
+                # leaves on any rook that has moved, so an imported position hashes
+                # like the self-play position it is (same rule as `from_board`).
+                rank, file = square // 8, square % 8
+                on_corner = rank == (0 if white else 7) and file in (0, 7)
+                letter = "k" if file == 7 else "q"
+                if not (on_corner and (letter.upper() if white else letter) in castle):
                     board[0, o + i] |= SPECIAL
-            if char.lower() == "k":
+            if kind == "k":
                 rights = "KQ" if char.isupper() else "kq"
                 if not (rights[0] in castle or rights[1] in castle):
                     board[0, o + i] |= SPECIAL

@@ -721,7 +721,14 @@ def test_agrees_at_the_full_budget():
     ref, cu, probe = _pair(boards, control, n=800, eps=0.25, stats=True)
     _run(ref, cu, label="full budget ")
     counters = cu.device_counters()
-    assert counters["max_depth"] > 8, \
+    # ⚠️ The bound is calibrated to the search's first-play urgency. On these 64
+    # positions the reference reaches depth 13 with an untried edge scored as a loss
+    # (`FPU_DRAW = 0`, the search this test was written on, 2026-07-30) and depth 8
+    # with it scored as a draw (`FPU_DRAW = 0.5`, since 2026-08-02: the tree is wider
+    # and shallower, 63 leaves at depth 7 and 2 at depth 8). The `> 8` this used to
+    # assert was the old search's number, and this slow test had not run since.
+    # Measured 2026-09-09, `docs/journal/2026-09-09-core-algorithm-review-fixes.md`.
+    assert counters["max_depth"] >= 7, \
         f"the deepest path was {counters['max_depth']}, so this was not a deep run"
     _report(probe, f"n=800 (max depth {counters['max_depth']})")
 

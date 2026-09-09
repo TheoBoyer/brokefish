@@ -93,3 +93,34 @@ blunder rate against ourselves is still unmeasured.
 
 The per-position table is `logs/blunder_dissect.csv`, 532 rows. Nothing here reaches
 a training path or selects a checkpoint.
+
+## Same day: the `c_scale` knob, measured and closed for evaluation
+
+The PRIOR class pointed at the interior scale, so `blunder_dissect.py --c-scale` and
+`serve_brokefish.py --c-scale` were added and the 24 h network re-run over the same
+positions at three values. Among the non-forced positions, those with an alternative
+that does not lose ≥3, the count that still hangs material:
+
+| `c_scale` | hang at n=128, 24 h (of 148) | 12 h (of 143) | hang at n=1024, 24 h | 12 h |
+|---|---:|---:|---:|---:|
+| 0.1, mctx | 137 | 102 | 103 | 77 |
+| 0.3 | 112 | 84 | 101 | 76 |
+| 1.0, the paper | **99** | **78** | 96 | 74 |
+
+At n=128 the paper's value removes a quarter of the fixable hanging moves on both
+networks and lands where n=1024 lands at the mctx value, so the interior collapse is
+real and it is a small-budget effect. Then the same network against itself, 200 games
+at n=128, `scripts/h2h-cscale.sh`:
+
+| A vs B at 0.1 | W-D-L | score | 95 % Wilson | Elo |
+|---|---|---:|---|---:|
+| `c_scale = 1.0` | 66-48-86 | 0.450 | [0.383, 0.519] | −35 |
+| `c_scale = 0.3` | 65-57-78 | 0.4675 | [0.400, 0.537] | −23 |
+
+Both intervals contain parity and both point the same way: the search that hangs
+fewer pieces plays weaker chess. A larger σ makes the interior rule trust the value
+head's first good reply harder, which finds the refutation of a hanging move and
+loses whatever a wider interior search was buying elsewhere. The knob stays at
+mctx's 0.1 for this network. Whether a network *trained* under a larger scale would
+differ is a self-play question this does not answer, and nothing here argues for
+spending 12 hours on it ahead of the value target.

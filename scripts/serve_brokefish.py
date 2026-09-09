@@ -52,8 +52,12 @@ class Engine:
 
     def __init__(self, ckpt: str, device: str = "cuda", impl: str = "cuda",
                  trace_path: str = None, gumbel: bool = True, gumbel_m: int = 16,
-                 terminal_collapse: bool = True):
+                 terminal_collapse: bool = True, c_scale: float = None):
         self.ckpt, self.device, self.impl = ckpt, device, impl
+        # `None` is `SearchConfig`'s default, mctx's 0.1. The 2026-09-09 dissection
+        # found the paper's 1.0 removes a quarter of the fixable hanging moves at
+        # n = 128, and this is how the net effect in play is measured.
+        self.c_scale = c_scale
         # ⚠️ The defaults are the **training** configuration -- every run in this line
         # trained with `--gumbel --gumbel-m 16 --sims 128 --terminal-collapse` -- so a
         # match here plays the engine the network was trained for. `eval_config(n, B)`
@@ -78,9 +82,10 @@ class Engine:
             # `eval_config` is the protocol, not a preference: eps = 0, tau_plies = 0
             # and gumbel_scale = 0, so play is deterministic and all diversity comes
             # from the arbiter's openings (`evaluation.md` §5.4, `match.py`'s header).
+            extra = {} if self.c_scale is None else {"c_scale": self.c_scale}
             cfg = eval_config(n, b, E=96, gumbel=self.gumbel,
                               gumbel_m=self.gumbel_m,
-                              terminal_collapse=self.terminal_collapse)
+                              terminal_collapse=self.terminal_collapse, **extra)
             s = search_impl(self.impl)(cfg, self.evaluate, env=cenv,
                                        device=self.device, seed=0)
             self._searches[key] = s
@@ -232,13 +237,15 @@ def main():
                         "what eval/league.py rates every checkpoint under")
     p.add_argument("--gumbel-m", type=int, default=16)
     p.add_argument("--no-collapse", action="store_true")
+    p.add_argument("--c-scale", type=float, default=None,
+                   help="Gumbel's interior sigma scale; mctx's 0.1 by default, the paper's 1.0")
     p.add_argument("--trace", default=None,
                    help="JSONL: one root table per position per move")
     a = p.parse_args()
 
     engine = Engine(a.ckpt, device=a.device, impl=a.impl, trace_path=a.trace,
                     gumbel=not a.puct, gumbel_m=a.gumbel_m,
-                    terminal_collapse=not a.no_collapse)
+                    terminal_collapse=not a.no_collapse, c_scale=a.c_scale)
     # One warm request: the fused encoder and the tree allocate on first use, and
     # the arbiter's timeout should not have to cover a build.
     engine.moves(["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"], 8)

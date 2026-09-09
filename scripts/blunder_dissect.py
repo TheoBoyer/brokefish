@@ -223,7 +223,7 @@ class Prober:
     """One network, one search per budget, the tree read after each move."""
 
     def __init__(self, ckpt: str, budgets: List[int], batch: int,
-                 device: str = "cuda", int8: bool = False):
+                 device: str = "cuda", int8: bool = False, c_scale: Optional[float] = None):
         import torch
         from brokefish.env import cuda_impl as cenv
         from brokefish.eval.layer0 import load_net_state
@@ -240,8 +240,9 @@ class Prober:
         self.evaluate = encoder_impl("cuda")(self.net, int8=int8).forward_full
         self.searches = {}
         for n in budgets:
+            extra = {} if c_scale is None else {"c_scale": c_scale}
             cfg = eval_config(n, batch, E=E_CAP, gumbel=True, gumbel_m=16,
-                              terminal_collapse=True)
+                              terminal_collapse=True, **extra)
             self.searches[n] = search_impl("cuda")(cfg, self.evaluate, env=cenv,
                                                    device=device, seed=0)
         self.prior_search = self.searches[min(budgets)]
@@ -331,9 +332,9 @@ def classify(bl: Blunder, lo: int, hi: int) -> str:
 
 
 def dissect(blunders: List[Blunder], ckpt: str, budgets: List[int], batch: int,
-            device: str, int8: bool, log) -> None:
+            device: str, int8: bool, log, c_scale: Optional[float] = None) -> None:
     lo, hi = min(budgets), max(budgets)
-    prober = Prober(ckpt, budgets, batch, device=device, int8=int8)
+    prober = Prober(ckpt, budgets, batch, device=device, int8=int8, c_scale=c_scale)
     t0 = time.time()
     for start in range(0, len(blunders), batch):
         chunk = blunders[start:start + batch]
@@ -426,6 +427,10 @@ def main() -> None:
     ap.add_argument("--count-only", action="store_true")
     ap.add_argument("--recapture", default="square", choices=("square", "any"),
                     help="what counts as capturing back; see RECAPTURE")
+    ap.add_argument("--c-scale", type=float, default=None,
+                    help="Gumbel's interior sigma scale, mctx's 0.1 by default; the paper's "
+                         "is 1.0 on Q in [-1, 1]. The PRIOR class of the 2026-09-09 "
+                         "dissection is the refutation starved of visits at 0.1")
     ap.add_argument("--out", default="logs/blunder_dissect.csv")
     a = ap.parse_args()
     budgets = sorted(int(x) for x in a.budgets.split(","))
@@ -454,7 +459,7 @@ def main() -> None:
               file=log, flush=True)
         print(f"  searching with {ckpt} at n = {budgets}, B = {a.batch}",
               file=log, flush=True)
-        dissect(ours, ckpt, budgets, a.batch, a.device, a.int8, log)
+        dissect(ours, ckpt, budgets, a.batch, a.device, a.int8, log, c_scale=a.c_scale)
         lo, hi = min(budgets), max(budgets)
         for bl in ours:
             bl.probe["repro"] = bl.probe[f"played{lo}"] == bl.move

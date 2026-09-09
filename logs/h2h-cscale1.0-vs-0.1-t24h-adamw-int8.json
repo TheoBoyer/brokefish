@@ -1,0 +1,28 @@
+{
+  "a": {
+    "engine": "brokefish",
+    "ckpt": "runs/t24h-adamw-int8/checkpoints/t24h-adamw-int8.pt",
+    "device": "cuda"
+  },
+  "b": {
+    "engine": "brokefish",
+    "ckpt": "runs/t24h-adamw-int8/checkpoints/t24h-adamw-int8.pt",
+    "device": "cuda"
+  },
+  "n_a": 128,
+  "n_b": 128,
+  "games": 200,
+  "wins": 66,
+  "draws": 48,
+  "losses": 86,
+  "score": 0.45,
+  "ci95": [
+    0.38263948633754313,
+    0.519245114254289
+  ],
+  "elo": -34.86007028756008,
+  "seed": 0,
+  "opening_plies": 8,
+  "max_plies": 300,
+  "mean_plies": 79.24
+}

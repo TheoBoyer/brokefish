@@ -69,6 +69,13 @@ LABEL = {
     "t12h-vw2": "Muon wd.09 vw2.0 int8-all gumbel",
     "t24h-fp8": "AdamW fp8 PUCT, 24 h",
     "t24h-muon": "Muon wd.01 fp8 PUCT, 24 h",
+    "t12h-reinject": "t12h-wdl + reinject ln1",
+    "t12h-reinject-both": "t12h-wdl + reinject both",
+    "t12h-reinject-both-lr3": "reinject both, lr 3e-3",
+    "t12h-reinject-both-lr6": "reinject both, lr 6e-3, warmup 180",
+    "t24h-reinject-lr6": "reinject both, lr 6e-3, 24 h",
+    "t12h-muon-wdl-vs4": "Muon wd.09 WDL, value-subsample 4",
+    "t12h-muon-wdl-pcr": "Muon wd.09 WDL, PCR",
 }
 
 

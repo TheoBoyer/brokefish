@@ -1,0 +1,20 @@
+# The web debugger's server, `debugger/`, and nothing else. Kept apart from
+# `requirements.lock` on purpose: that file is served by the cu132 index alone and
+# must stay that way (its header says why), while these wheels come from PyPI.
+# Nothing in the `brokefish` package imports them, so a training or evaluation
+# machine never needs this file. Versions are the ones in `.venv` since 2026-07-30,
+# recorded 2026-09-09.
+#
+#   uv pip install --python .venv/bin/python --no-deps -r requirements-debugger.lock
+#
+fastapi==0.141.1
+starlette==1.3.1
+uvicorn==0.52.0
+h11==0.16.0
+anyio==4.14.2
+idna==3.18
+click==8.4.2
+pydantic==2.13.4
+pydantic-core==2.46.4
+annotated-types==0.8.0
+typing-inspection==0.4.2

@@ -124,3 +124,32 @@ loses whatever a wider interior search was buying elsewhere. The knob stays at
 mctx's 0.1 for this network. Whether a network *trained* under a larger scale would
 differ is a self-play question this does not answer, and nothing here argues for
 spending 12 hours on it ahead of the value target.
+
+## Same day: the rule inputs add nothing the trunk does not have, linearly
+
+Roadmap E1.11's instrument, run before any kernel work. `scripts/value_ceiling.py`,
+40 000 records drawn from `t24h-reinject-lr6`'s replay and frozen to
+`data/pinned-40k-2026-09-09.pt`, 32k/8k split, ridge OLS, held-out Pearson with z:
+
+| features | `t12h-wdl` | `t24h-adamw-int8` | `t24h-reinject-lr6` |
+|---|---:|---:|---:|
+| material difference alone | 0.506 | 0.506 | 0.506 |
+| trunk, the value head's input | 0.533 | 0.549 | 0.575 |
+| trunk + 32 attacked bits | 0.533 | 0.549 | 0.575 |
+| trunk + own/their attacked counts + material | 0.539 | 0.550 | 0.575 |
+| trunk + all 2080 rule inputs | 0.527 | 0.541 | 0.566 |
+| 2080 rule inputs alone | 0.350 | | |
+
+The attacked bit moves the ceiling by 0.000 on all three networks; the full bitsets
+overfit and lose 0.008. Two other readings from the same table. A one-number material
+count sits within 0.03 to 0.07 of every trunk, and the trunk's advantage over it grows
+with training. And the 2026-08-24 ceiling of 0.596-0.607 is not reproduced here
+because this is a harder set, drawn from stronger self-play, on which every network
+scores lower and in the expected order.
+
+⚠️ What this does and does not settle. A linear probe on raw inputs is a lower bound;
+"is this piece defended" is a conjunction the trunk would compute, and a probe on the
+inputs cannot see whether it does. What the measurement was preregistered to decide
+is narrower: the E1.11 kernel work was to follow a rising ceiling, and the ceiling did
+not rise, so it does not follow. Representation moves below the value head in the
+08-19 hypothesis order, and the value target is the next run.

@@ -119,6 +119,39 @@ REINJECT_MODE_ID = {"ln1": 1, "both": 2}
 #: integers, so this order is part of the file format.
 N_SOURCES = 5
 
+#: **Rule-derived piece inputs** (2026-09-09, prototype, torch model only). With
+#: ``rule_features=True`` every token's embedding sum gains two more table lookups
+#: the environment already computes and the search already holds:
+#:
+#: * ``emb_dest``: a ``[64, d]`` table **summed over the set bits of the token's own
+#:   legal-destination word** -- slot ``p``'s row of the ``[N, 32]`` movegen mask, one
+#:   row per destination square, the same embedding-sum convention as spec 7.2. A
+#:   piece of the side not to move, and a captured slot, have an all-zero word and
+#:   contribute nothing.
+#: * ``emb_attacked``: a ``[2, d]`` table indexed by whether the piece **stands on a
+#:   square the other colour controls**, read off `env.control_map` at the piece's
+#:   own square, for both colours (a hanging piece is a fact about the position
+#:   whoever is to move). Captured slots are forced to contribute nothing here too,
+#:   since their word decodes to a1 and a1 may well be attacked.
+#:
+#: Both are *rules*, not opinions: legality and attack are what the movegen computes
+#: to play the game at all, so the tabula rasa boundary (CLAUDE.md) is not crossed.
+#: The hypothesis they exist to test is the representation one of
+#: `journal/2026-08-19-the-league-does-not-transfer.md`: a 2.1x uncompensated-blunder
+#: rate against AlphaGateau, whose input carries an attack map.
+#:
+#: ⚠️ **Zero-initialised, so ``rule_features=True`` untrained is the old network to
+#: the bit**, exactly as ``reinject`` is: the flag is an A/B of one variable, and any
+#: checkpoint on the ledger loads into it with ``strict=False`` and the two tables at
+#: zero. The marker rides beside the tables so `net_for_state` can rebuild the shape.
+#:
+#: ⚠️ **No fused implementation knows about these tables.** `cuda_impl.PackedWeights`
+#: packs five tables by name and would silently serve the old network; the guard is
+#: in `full_forward_via_backbone` for Triton and by the marker for anything that
+#: reads it. Torch only, for now: the measurement plan is offline.
+N_DEST, N_ATTACKED = 64, 2
+RULE_FEATURES_ID = 1
+
 
 def wdl_to_scalar(logits: torch.Tensor) -> torch.Tensor:
     """``[N, 3]`` logits to the ``[N]`` scalar in ``[-1, 1]`` every consumer expects.
@@ -192,11 +225,27 @@ def reinject_of(state: dict) -> str:
                      f"knows {REINJECT_MODE_ID}")
 
 
+def rule_features_of(state: dict) -> bool:
+    """Whether a ``state_dict`` carries the rule-derived piece inputs.
+
+    Absence is the legacy answer, as for the other two markers: every checkpoint
+    written before 2026-09-09 has neither the tables nor the marker.
+    """
+    if "rule_features_mode" not in state:
+        return False
+    got = int(state["rule_features_mode"])
+    if got != RULE_FEATURES_ID:
+        raise ValueError(f"unknown rule_features_mode {got} in this state_dict; this "
+                         f"build knows {RULE_FEATURES_ID}")
+    return True
+
+
 def net_for_state(state: dict, **kw) -> "BrokefishNet":
     """An empty net shaped to hold ``state``. Load into it; do not skip the load."""
     return BrokefishNet(n_value=n_value_of(state),
                         value_head=value_head_of(state),
-                        reinject=reinject_of(state), **kw)
+                        reinject=reinject_of(state),
+                        rule_features=rule_features_of(state), **kw)
 
 
 def decode_boards(boards: torch.Tensor):
@@ -227,7 +276,7 @@ class BrokefishNet(nn.Module):
     def __init__(self, d_model: int = D_MODEL, n_layers: int = N_LAYERS,
                  n_heads: int = N_HEADS, d_ff: int = D_FF, eps: float = 1e-5,
                  n_value: int = N_VALUE_SCALAR, value_head: str = "king",
-                 reinject: str = "none"):
+                 reinject: str = "none", rule_features: bool = False):
         super().__init__()
         if n_value not in VALUE_CLASSES:
             raise ValueError(f"n_value must be one of {VALUE_CLASSES} "
@@ -243,6 +292,7 @@ class BrokefishNet(nn.Module):
         self.value_head = value_head
         self.reinject = reinject
         self.n_sites = 0 if reinject == "none" else n_layers * (2 if reinject == "both" else 1)
+        self.rule_features = bool(rule_features)
 
         self.emb_square = nn.Embedding(N_SQUARE, d_model)
         self.emb_type_special = nn.Embedding(N_TYPE_SPECIAL, d_model)
@@ -292,6 +342,18 @@ class BrokefishNet(nn.Module):
             self.register_buffer("reinject_mode",
                                  torch.tensor(REINJECT_MODE_ID[reinject], dtype=torch.int64))
 
+        # Zeros, for the reason `reinject_c` is zeros: an untrained flag is the old
+        # network exactly, and an old checkpoint loads under `strict=False` with the
+        # tables inert. Created before the init loop below so they are not swept into
+        # it -- these two tables are the only ones that must *not* start random.
+        if self.rule_features:
+            self.emb_dest = nn.Embedding(N_DEST, d_model)
+            self.emb_attacked = nn.Embedding(N_ATTACKED, d_model)
+            nn.init.zeros_(self.emb_dest.weight)
+            nn.init.zeros_(self.emb_attacked.weight)
+            self.register_buffer("rule_features_mode",
+                                 torch.tensor(RULE_FEATURES_ID, dtype=torch.int64))
+
         std = d_model ** -0.5
         for mod in (self.emb_square, self.emb_type_special, self.emb_color_turn,
                     self.emb_clock, self.emb_rep,
@@ -300,8 +362,13 @@ class BrokefishNet(nn.Module):
 
     # -- stage 1 -----------------------------------------------------------
 
-    def embed(self, boards: torch.Tensor, control: torch.Tensor, rep: torch.Tensor):
+    def embed(self, boards: torch.Tensor, control: torch.Tensor, rep: torch.Tensor,
+              mask: Optional[torch.Tensor] = None):
         """``[N, 32] uint16`` boards to ``[N, 32, d]`` tokens, plus the live mask.
+
+        ``mask`` is the ``[N, 32] int64`` legality word per slot, read only when
+        ``rule_features`` is on and computed by `env.movegen` here when not given
+        (see :meth:`rule_embed` for why it is an argument at all).
 
         The summation order is normative -- square, type_special, color_turn,
         clock, rep, left-associative -- because in fp16 a different order is a
@@ -325,7 +392,65 @@ class BrokefishNet(nn.Module):
         x = x + self.emb_type_special(idx[1])
         x = x + self.emb_color_turn(idx[2])
         x = x + per_board[:, None, :]
+        if self.rule_features:
+            x = x + self.rule_embed(boards, control, alive, mask)
         return x, alive
+
+    def rule_inputs(self, boards: torch.Tensor, control: torch.Tensor,
+                    alive: torch.Tensor, mask: Optional[torch.Tensor] = None):
+        """The two rule-derived inputs: ``(dest [N, 32, 64] bool, attacked [N, 32] long)``.
+
+        ``dest[n, p, s]`` is bit ``s`` of slot ``p``'s legality word; ``attacked[n, p]``
+        is 1 when the live piece in slot ``p`` stands on a square the *other colour*
+        controls. Both are zero on a captured slot: the movegen already zeroes a dead
+        slot's word, and the attack bit is ANDed with ``alive`` because a dead word
+        decodes to a1 (CLAUDE.md) and a1 is attacked in plenty of positions.
+
+        ⚠️ **The mask is an argument rather than an ``env`` because it is data the
+        caller usually holds already.** The search computes ``env.movegen`` on every
+        position before it calls the net (`search/torch_impl.py:424`) and the fused
+        search keeps the same word in its tree, so passing it costs nothing there; the
+        training record stores no mask (`train/buffer.py:RECORD`), so the loss has
+        nothing to pass and this method computes it. Taking an ``env`` would put a
+        module-level dependency into the oracle and still recompute what the search
+        already has. The pure torch movegen is ~35 board replays per position, so
+        ``mask=None`` on the hot path would be a mistake; on the torch oracle it is
+        the only correct default.
+
+        The attack map is `env.control_map`, one call per colour, restricted by
+        construction to occupied squares -- the only squares on which that map is an
+        attack map (its docstring). The int64 words carry uint64 patterns; the shift
+        is arithmetic, which is harmless because only bit 0 is read after it.
+        """
+        from brokefish.env import torch_impl as env  # the oracle depends on the oracle
+        if mask is None:
+            mask, _ = env.movegen(boards, control)
+        if tuple(mask.shape) != tuple(boards.shape):
+            raise ValueError(f"mask must be [N, 32] to match boards {tuple(boards.shape)}, "
+                             f"got {tuple(mask.shape)}")
+        dest = env.bitset_to_bool(mask)                          # [N, 32, 64]
+        _, color, _, _, square = decode_boards(boards)
+        by_white = env.control_map(boards, torch.zeros_like(control, dtype=torch.bool))
+        by_black = env.control_map(boards, torch.ones_like(control, dtype=torch.bool))
+        enemy = torch.where(color.bool(), by_white[:, None], by_black[:, None])  # [N, 32]
+        attacked = ((enemy >> square) & 1) * alive.long()
+        return dest, attacked
+
+    def rule_embed(self, boards: torch.Tensor, control: torch.Tensor,
+                   alive: torch.Tensor, mask: Optional[torch.Tensor] = None
+                   ) -> torch.Tensor:
+        """``[N, 32, d]``: the sum of ``emb_dest`` over the set destination bits, plus
+        the ``emb_attacked`` row, zero on captured slots.
+
+        The bit-sum is a ``[N, 32, 64] @ [64, d]`` matmul over a 0/1 matrix, which is
+        the embedding-sum of spec 7.2 written as one op; an ``embedding_bag`` over the
+        set bits is the same arithmetic with a data-dependent shape.
+        """
+        dest, attacked = self.rule_inputs(boards, control, alive, mask)
+        w = self.emb_dest.weight
+        r = dest.to(w.dtype) @ w
+        r = r + self.emb_attacked(attacked)
+        return r * alive.unsqueeze(-1).to(w.dtype)
 
     def embed_indices(self, boards: torch.Tensor, control: torch.Tensor,
                       rep: torch.Tensor):
@@ -494,13 +619,18 @@ class BrokefishNet(nn.Module):
     # -- the whole thing ---------------------------------------------------
 
     def forward(self, boards: torch.Tensor, control: torch.Tensor, rep: torch.Tensor,
-                with_logits: bool = False):  # noqa: D401
+                with_logits: bool = False,
+                mask: Optional[torch.Tensor] = None):  # noqa: D401
         """The 3-tuple ``(policy, promo, value)`` -- ``value`` is ``[N]`` fp32 in
         ``[-1, 1]`` whatever the head is, which is why nothing downstream changed.
 
         ``with_logits`` appends the raw ``[N, n_value]`` head output as a fourth
         element. Only the loss wants it, and only because a classifier is trained on
         logits while the search is fed a scalar.
+
+        ``mask`` is the ``[N, 32] int64`` legality word per slot. It is read only
+        when ``rule_features`` is on, and computed here when it is not given; a net
+        without the flag ignores it, so a caller may always pass what it has.
         """
         idx, alive = self.embed_indices(boards, control, rep)
         per_board = self.emb_clock(idx[3]) + self.emb_rep(idx[4])
@@ -508,6 +638,8 @@ class BrokefishNet(nn.Module):
         x = x + self.emb_type_special(idx[1])
         x = x + self.emb_color_turn(idx[2])
         x = x + per_board[:, None, :]
+        if self.rule_features:
+            x = x + self.rule_embed(boards, control, alive, mask)
         h = self.encode(x, alive, idx)
         return self.heads(self.norm_f(h), control, alive=alive,
                           with_logits=with_logits, h_raw=h)
@@ -530,6 +662,11 @@ def full_forward_via_backbone(net: BrokefishNet, backbone, boards, control, rep,
             "It is a stack-level change -- the mix enters every block's LayerNorm -- "
             "so a fused backbone that only sees `x` cannot express it. Use "
             "`--impl cuda` or `--impl torch`")
+    if net.rule_features:
+        raise NotImplementedError(
+            "no fused implementation carries the rule-derived piece inputs "
+            "(`emb_dest`, `emb_attacked`); they are a torch-only prototype. Use "
+            "`--impl torch`")
     x, alive = net.embed(boards, control, rep)
     h = backbone(x, alive)
     return net.heads(net.norm_f(h), control, alive=alive, with_logits=with_logits,

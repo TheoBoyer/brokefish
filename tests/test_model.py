@@ -357,6 +357,216 @@ def test_rejects_unsupported_width(impl):
     raise AssertionError("expected ValueError for d_model != 256")
 
 
+
+# -- rule-derived piece inputs (2026-09-09) --------------------------------
+#
+# `BrokefishNet(rule_features=True)` adds two zero-initialised tables to the token
+# embedding sum: `emb_dest`, summed over the set bits of the slot's own legality word,
+# and `emb_attacked`, indexed by whether the live piece stands on a square the other
+# colour controls. Torch only. Four properties carry it: off is the old network to
+# the bit; a captured slot contributes nothing; slot i reads row i of the mask; and an
+# old checkpoint loads into the flagged net with the tables at zero.
+
+def _rule_positions(n: int = 64, plies: int = 40, seed: int = 21):
+    from tests.boards import random_positions
+    return random_positions(n, plies=plies, seed=seed)
+
+
+def _rule_pair(seed: int = 5):
+    """(net without the flag, net with it and the tables at zero), same weights."""
+    from brokefish.nn.model import BrokefishNet
+    torch.manual_seed(seed)
+    base = BrokefishNet().cuda().eval()
+    net = BrokefishNet(rule_features=True).cuda().eval()
+    missing = net.load_state_dict(base.state_dict(), strict=False)
+    assert set(missing.missing_keys) == {"emb_dest.weight", "emb_attacked.weight",
+                                         "rule_features_mode"}, missing
+    assert not missing.unexpected_keys
+    return base, net
+
+
+def test_rule_features_off_is_bit_identical_and_never_calls_movegen():
+    """Off is the default, adds no key to the state_dict, ignores a passed mask and
+    does not touch the environment; on at zero is the same forward to the bit."""
+    from brokefish.env import torch_impl as env
+    from brokefish.nn.model import BrokefishNet
+
+    boards, control, rep = _rule_positions()
+    mask, _ = env.movegen(boards, control)
+    base, net = _rule_pair()
+    assert not BrokefishNet().rule_features
+    assert not any(k.startswith(("emb_dest", "emb_attacked", "rule_features"))
+                   for k in base.state_dict())
+
+    orig = env.movegen
+    calls = []
+    env.movegen = lambda *a, **k: (calls.append(1), orig(*a, **k))[1]
+    try:
+        with torch.no_grad():
+            off = base(boards, control, rep)
+            off_with_mask = base(boards, control, rep, mask=mask)
+            on = net(boards, control, rep, mask=mask)
+            on_own_mask = net(boards, control, rep)
+    finally:
+        env.movegen = orig
+    assert len(calls) == 1, "only the flagged net without a mask may call movegen"
+    for name, a, b, c, d in zip(("policy", "promo", "value"), off, off_with_mask, on,
+                                on_own_mask):
+        assert torch.equal(a, b), f"{name}: the off net read the mask argument"
+        assert torch.equal(a, c), f"{name}: zero tables moved the output"
+        assert torch.equal(a, d), f"{name}: the net's own movegen differs"
+
+
+def test_rule_features_captured_slot_contributes_nothing():
+    """With random tables, the added vector is exactly zero on every dead slot, and a
+    garbage mask row on a dead slot changes no output."""
+    from brokefish.env import torch_impl as env
+    from brokefish.nn.model import decode_boards
+
+    boards, control, rep = _rule_positions(n=96, plies=60, seed=3)
+    mask, _ = env.movegen(boards, control)
+    base, net = _rule_pair()
+    with torch.no_grad():
+        net.emb_dest.weight.normal_(0.0, 0.5)
+        net.emb_attacked.weight.normal_(0.0, 0.5)
+        x_off, alive = base.embed(boards, control, rep)
+        x_on, _ = net.embed(boards, control, rep, mask=mask)
+    dead = ~alive
+    assert dead.any(), "the batch has no captured slot, so the test is vacuous"
+    assert (decode_boards(boards)[0] == 1).equal(dead)
+    added = x_on - x_off
+    assert torch.equal(added[dead], torch.zeros_like(added[dead]))
+    assert (added[alive] != 0).any(), "live slots got nothing; the tables are unread"
+
+    # A dead slot's word is zero in the movegen mask; feed it every bit instead.
+    dirty = torch.where(dead, torch.full_like(mask, -1), mask)
+    with torch.no_grad():
+        clean_out = net(boards, control, rep, mask=mask)
+        dirty_out = net(boards, control, rep, mask=dirty)
+    for name, a, b in zip(("policy", "promo", "value"), clean_out, dirty_out):
+        assert torch.equal(a, b), f"{name}: a dead slot's mask row reached the output"
+
+
+def test_rule_features_slot_i_reads_mask_row_i():
+    """Flipping bits in row i moves token i's embedding by exactly the rows of
+    `emb_dest` that were flipped, and no other token."""
+    from brokefish.env import torch_impl as env
+
+    boards, control, rep = _rule_positions(n=32, plies=20, seed=8)
+    mask, _ = env.movegen(boards, control)
+    base, net = _rule_pair(seed=9)
+    with torch.no_grad():
+        net.emb_dest.weight.normal_(0.0, 0.5)
+        net.emb_attacked.weight.normal_(0.0, 0.5)
+        _, alive = base.embed(boards, control, rep)
+    gen = torch.Generator().manual_seed(0)
+    checked = 0
+    for n in range(boards.shape[0]):
+        live = alive[n].nonzero().flatten().tolist()
+        i = live[int(torch.randint(len(live), (1,), generator=gen))]
+        # bits 3 and 63: one ordinary square and the sign bit, which is h8
+        sq = [3, 63] if (n % 2 == 0) else [int(torch.randint(64, (1,), generator=gen))]
+        flip = mask[n].clone()
+        for s in sq:
+            flip[i] ^= (1 << s) if s < 63 else torch.iinfo(torch.int64).min
+        with torch.no_grad():
+            x0, _ = net.embed(boards[n:n + 1], control[n:n + 1], rep[n:n + 1],
+                              mask=mask[n:n + 1])
+            x1, _ = net.embed(boards[n:n + 1], control[n:n + 1], rep[n:n + 1],
+                              mask=flip[None])
+        delta = (x1 - x0)[0]
+        others = torch.ones(T, dtype=torch.bool, device=delta.device)
+        others[i] = False
+        assert torch.equal(delta[others], torch.zeros_like(delta[others])), \
+            f"board {n}: flipping slot {i}'s row moved another token"
+        want = torch.zeros_like(delta[i])
+        for s in sq:
+            was_set = ((mask[n, i] >> s) & 1).item() == 1
+            want = want + (-1.0 if was_set else 1.0) * net.emb_dest.weight[s]
+        assert torch.allclose(delta[i], want, atol=1e-5, rtol=1e-5), \
+            f"board {n}: slot {i}'s change is not the flipped rows of emb_dest"
+        checked += 1
+    assert checked == boards.shape[0]
+
+
+def test_rule_features_attacked_bit_matches_python_chess():
+    """The second input against the oracle: a live piece is flagged iff python-chess
+    says its square is attacked by the other colour. Both colours, whoever moves."""
+    import chess
+    from brokefish.env import torch_impl as env
+    from brokefish.env.interop import to_chess_board
+    from brokefish.nn.model import decode_boards
+
+    boards, control, rep = _rule_positions(n=128, plies=50, seed=13)
+    mask, _ = env.movegen(boards, control)
+    _, net = _rule_pair()
+    with torch.no_grad():
+        _, alive = net.embed_indices(boards, control, rep)
+        _, attacked = net.rule_inputs(boards, control, alive, mask)
+    captured, color, _, _, square = decode_boards(boards)
+    ones = zeros = 0
+    for n in range(boards.shape[0]):
+        b = to_chess_board(boards[n].cpu(), control[n].cpu())
+        for p in range(T):
+            if captured[n, p]:
+                assert attacked[n, p].item() == 0, f"board {n}: dead slot {p} flagged"
+                continue
+            mine_is_black = bool(color[n, p].item())
+            want = b.is_attacked_by(chess.WHITE if mine_is_black else chess.BLACK,
+                                    int(square[n, p].item()))
+            got = bool(attacked[n, p].item())
+            assert got == want, (f"board {n} slot {p} on {chess.square_name(int(square[n, p]))}: "
+                                 f"got {got}, python-chess says {want}\n{b}")
+            ones += want; zeros += not want
+    assert ones > 0 and zeros > 0, "the batch does not exercise both rows"
+
+
+def test_rule_features_checkpoint_round_trip_and_legacy_load():
+    """A checkpoint without the tables loads into a flagged net with the tables at
+    zero and the same forward; a flagged checkpoint rebuilds through `net_for_state`;
+    the marker says so; a strict load into the wrong shape refuses."""
+    import pytest
+    from brokefish.nn.model import (BrokefishNet, net_for_state, rule_features_of,
+                                    RULE_FEATURES_ID)
+
+    boards, control, rep = _rule_positions(n=16, plies=30, seed=2)
+    torch.manual_seed(1)
+    old = BrokefishNet(n_value=3)
+    legacy = {k: v.clone() for k, v in old.state_dict().items()}
+    assert rule_features_of(legacy) is False
+    assert net_for_state(legacy).rule_features is False
+
+    new = BrokefishNet(n_value=3, rule_features=True)
+    new.load_state_dict(legacy, strict=False)
+    assert torch.equal(new.emb_dest.weight, torch.zeros_like(new.emb_dest.weight))
+    assert torch.equal(new.emb_attacked.weight, torch.zeros_like(new.emb_attacked.weight))
+    with torch.no_grad():
+        a = old.cuda()(boards, control, rep)
+        b = new.cuda()(boards, control, rep)
+    for x, y in zip(a, b):
+        assert torch.equal(x, y)
+
+    with torch.no_grad():
+        new.emb_dest.weight.normal_()
+    state = {k: v.clone() for k, v in new.state_dict().items()}
+    assert rule_features_of(state) is True
+    assert int(state["rule_features_mode"]) == RULE_FEATURES_ID == 1, "on disk, cannot move"
+    got = net_for_state(state)
+    got.load_state_dict(state)                       # strict
+    assert got.rule_features and got.n_value == 3
+    with torch.no_grad():
+        c = got.cuda()(boards, control, rep)
+        d = new(boards, control, rep)
+    assert torch.equal(got.emb_dest.weight, new.emb_dest.weight)
+    for x, y in zip(c, d):
+        assert torch.equal(x, y), "the round-tripped net is not the net that was saved"
+    assert not torch.equal(c[0], b[0]), "a random emb_dest left the policy unmoved"
+    with pytest.raises(RuntimeError):
+        BrokefishNet(n_value=3).load_state_dict(state)          # unexpected keys
+    with pytest.raises(ValueError, match="unknown rule_features_mode"):
+        rule_features_of({"rule_features_mode": torch.tensor(7)})
+
+
 if __name__ == "__main__":
     print(f"implementations: {', '.join(IMPLS) or 'none'}")
     for name, reason in why_unavailable().items():

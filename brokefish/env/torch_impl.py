@@ -226,6 +226,31 @@ def _king_is_attacked(boards: torch.Tensor, defender_is_black: torch.Tensor
     return bitset, ((bitset >> king_square[..., None]) & 1).any(-1)
 
 
+def control_map(boards: torch.Tensor, by_black: torch.Tensor) -> torch.Tensor:
+    """``[N] int64`` bitboard of the squares the colour ``by_black`` controls.
+
+    The union over that colour's 32 words of the control-mode first-order mask,
+    which is exactly the map `movegen` and `_king_is_attacked` test the king square
+    against. Pure: reads the boards and nothing else, and no existing signature
+    changed for it (2026-09-09, the piece-token rule features in `nn/model.py`).
+
+    ⚠️ **Exact on occupied squares only.** Control mode makes pawn diagonals
+    unconditional and keeps defended own pieces set, which is what an attack map
+    wants, but it also keeps pawn *pushes* and castling destinations, which are not
+    attacks. Both require an empty target square, so a reader that only asks about
+    a square with a piece on it -- a king, or any token -- never sees them. Do not
+    read this map at an empty square and call the answer "attacked".
+
+    The words are ``int64`` carrying ``uint64`` patterns (h8 is bit 63, the sign
+    bit), so they are combined with OR and never summed.
+    """
+    bitset, _ = first_order_mask(boards, by_black, control_mode=True)
+    out = bitset[:, 0]
+    for p in range(1, bitset.shape[1]):
+        out = out | bitset[:, p]
+    return out
+
+
 def movegen(boards: torch.Tensor, control: torch.Tensor
             ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fully legal moves and check status, per [spec §4.1](../../docs/spec.md).

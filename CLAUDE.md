@@ -117,7 +117,9 @@ is the plan and the open decisions, and `docs/journal/` is how each row was reac
 | E0 | **sims per target is a first-order lever**, `docs/roadmap.md` Track E | n=128 reaches the landmark on **2.7-3.0× fewer positions**; slope 25 → 332 Elo/decade |
 | E-muon | **the optimiser is free Elo/h**, `docs/journal/2026-08-07-muon-curve.md` | Muon+Polar: **+143 ± 26 Elo at step 1905**, **~1.4× less wall clock** to any rating 200-400. ⚠️ vs an unscreened AdamW rate; `weight_norm` 109 → 369 |
 | E1.2 | **PCR works, modestly**, `docs/journal/2026-08-08-pcr-and-the-rebased-scale.md` | `t12h-pcr`: **+36 ± 70 Elo at equal wall clock**, 3.7-6.0× on positions — ⚠️ of which 3.24× is just the record rate; net **1.14-1.85×** |
-| E-search | **the evaluation budget is an axis, not a constant** — league rebased on random play, `evaluation.md` §5.1a | search is **−9 Elo/doubling untrained, +155 trained**; ⚠️ Gate 2's slope is **+408/+703/+793 per decade at n = 16/64/256** |
+| E-search | **the evaluation budget is an axis, not a constant** — league rebased on random play, `evaluation.md` §5.1a | search is **−9 Elo/doubling untrained, +155 trained**; ⚠️ Gate 2's slope is **+408/+703/+793 per decade at n = 16/64/256**, on the PUCT league |
+| E1.8 | **input re-injection is a null**, `docs/journal/2026-09-09-reinjection-is-a-null.md` | five runs, the compute-matched 24 h arm scores **0.4300** against `t24h-adamw-int8` in the direct match |
+| — | ⚠️ **every league before 2026-08-22 rated PUCT; every run since `t12h-gumbel` trained Gumbel** | `t12h-wdl` −14 → +121 once re-rated. ⚠️ The fit's phantom prior compresses a 100-player league by ~25 % (`evaluation.md` §5.4.5, 2026-09-09) |
 | — | the debugger, the AGZ oracle, `docs/journal/2026-07-30-fidelity.md` | trees agree exactly at n=512 |
 
 Four traps belonging to no single component, each with its story in `docs/ledger/state.md`:

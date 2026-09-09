@@ -163,6 +163,18 @@ dominate, so 100 games resolves ±37 Elo — enough only if the claimed margin c
 
 Opened 2026-08-01, after the `t12h-n128` run.
 
+⚠️ **Every Elo number in this section dated before 2026-08-22 is a PUCT-league rating
+of a network that trained under Gumbel** (`journal/2026-08-22-the-league-was-on-the-wrong-protocol.md`).
+Each delta was internally fair, both arms rated alike, but re-rating `t12h-wdl` under
+the training protocol moved its headline from −14 to +121, so none of these numbers
+has been confirmed on the instrument that matters. Re-rate before building on one.
+⚠️ The league fit's phantom prior compresses a 100-player league by ~25 % and the
+compression scales with pool size (`evaluation.md` §5.4.5, 2026-09-09), so every
+slope in this section is low by roughly that much and levels from leagues of
+different sizes do not compare. The `converged: False` flag on every saved fit cost
+under 0.2 Elo and is fixed. ⚠️ A single 12 h arm resolves about ±100 Elo in the fit and ±35 in a
+200-game match; of the ~25 arms run since 08-01, most measured effects inside that.
+
 ⚠️ **The objective is Elo per hour. Sample efficiency is a proxy for it, and the two
 are not the same** — corrected 2026-08-01, because the first draft of this section
 stated the proxy as the objective and that inflates every conclusion in it.
@@ -245,6 +257,10 @@ clear their own cost factor.
 | **E1.4** | **free** — **Auxiliary policy target** — predict the **opponent's next** policy, `w_opp = 0.15` | KataGo §4.1: *"modest but clear benefit… nearly costless… deserves attention"*. **Fully game-agnostic**, unlike ownership and score | low |
 | **E1.5** | **free** — **Moves-left head** | lc0 ships one with its own loss weight; it is the chess analogue of E1.4 on the value side | low |
 | **E1.6** | **free** — **Stochastic weight averaging** — snapshot per ~250k samples, EMA of 4 at decay 0.75 | KataGo, main run | very low |
+| **E1.8** | ✅ **Measured null, 2026-09-09**, [the entry](journal/2026-09-09-reinjection-is-a-null.md). **Input re-injection**, `--reinject ln1 | both`: every block's LayerNorm sees the five input embeddings again through a learned scalar per (site, source). Five runs: fit deltas −15 / −43 / +69 / +111 / −77 at n=256, direct matches 0.4225 / 0.4525 / **0.4300** against `t24h-adamw-int8`, the last for the compute-matched 24 h arm. The coefficients grow without settling and buy nothing. Kernel cost +3.8 % / +5.2 % | Théo's hypothesis, 2026-08-28 | closed |
+| **E1.10** | **free** — **the interior Gumbel scale.** The blunder dissection ([2026-09-09](journal/2026-09-09-blunder-dissection.md)) finds a class of blunders where the refutation has prior 0.06-0.09 at the child and receives zero of ~240 visits: at `mctx`'s `c_scale = 0.1` the interior σ spans tens of logits once one reply is visited, and π' collapses onto it. The paper's value is 1.0 on Q in [-1, 1]; the knob exists (`SearchConfig.c_scale`) and has never been moved. A sims-matched A/B on the dissection set costs a minute, a self-play run costs 12 h | ours | minutes, then one run |
+| **E1.11** | **rule-derived token inputs** (`BrokefishNet(rule_features=True)`, built 2026-09-09, torch only): each piece token gets its own legal-destination bitset and an attacked-by-the-opponent bit, both from the rules and both already computed by the search. The instrument for the representation half of the blunder finding: measure the value ceiling on a pinned set with and without them before any run. ⚠️ Not in the fused kernels; `PackedWeights` would silently serve the old network | ours | a day for the kernel, if the ceiling moves |
+| **E1.9** | **free** — **`½ z + ½ root_value` value target** (`--target-mix`) and the policy/value gradient split (`--split-grad`). Both close Muon's value gap on fixed data ([2026-08-24](journal/2026-08-24-the-value-head-is-a-calibration-failure.md) and the offline harness of that day); `root_value` is the search's own number and sits inside the boundary. Built 2026-09-09, no run yet | ours | one run each |
 | **E1.7** | **free** — **Balanced win/loss sampling from the buffer** | ELF OpenGo App. C: the value head over-estimated one colour, causing premature resignation and collapsed replay diversity | low |
 
 KataGo's own summary of why this tier is the tier: *"enriching the training data with
@@ -416,9 +432,9 @@ when and why it was made is in [the build log](journal/2026-07-31-build-log.md).
 | **which calibration engines** | start of D4, and also due now. Criteria in D4 above; `evaluation.md` §11 |
 | whether the external anchor is a node in the league fit or a separate affine map | start of D2. Folding it in deletes the two-scale hazard but pulls D3 earlier |
 | preregistered superhuman threshold and configuration | start of D5, and it cannot move afterwards |
-| **simulations per move** | measured in C4. This is the one that decides whether the run fits the budget at all — see the Calendar |
+| **simulations per move** | E0 and E1.1 answered the self-play half (n = 128 since Track E; 64 is break-even, [2026-08-13](journal/2026-08-13-alphagateau-cadence.md)); `training.md` §13's budget still assumes n = 800 and needs restating |
 | adaptive budget by KL on completed Q | after C4, as an optimisation |
-| playout cap randomisation | unscheduled. `search.md` §11 prices it |
+| ~~playout cap randomisation~~ | built 2026-08-07, measured 2026-08-08 (E1.2), off by default |
 
 ## Risks
 

@@ -8,6 +8,95 @@ the traps that belong to no single component; everything else lives here.
 Every ⚠️ is a mistake that was actually made, or a design choice that reads as a bug
 and is not. Deleting one because it looks obvious is how it gets made again.
 
+## Since 2026-08-08
+
+The per-component bullets below stop on 2026-08-08. What landed after that has a
+journal entry each and, until 2026-09-09, no line here, so a reader of this file alone
+would ship the fp16 kernel under PUCT. One bullet per landed thing, newest first, with
+the number and the trap; the entry has the rest.
+
+- **The four review findings of 2026-09-09**, `journal/2026-09-09-core-algorithm-review-fixes.md`.
+  Gumbel's prior floor was `finfo(float16).tiny` = 2^-14, the smallest *normal* fp16,
+  so every prior in [6e-8, 6e-5) collapsed onto one logit and sequential halving
+  considered the wrong edge; now `gumbel.PRIOR_FLOOR` = `search.cuh:kPriorFloor` =
+  2^-24, and `completed_q` guards priors before the weighted mean as `mctx` does. A
+  third rook in a pawn slot kept its castling right in both importers. ⚠️ **Micro-batch
+  accumulation was not exact under a value mask**: the value term is a mean over the
+  supervised rows and `train_step` scaled it by the row count; `loss.micro_batch_weights`
+  now scales each term by the count it averages over. Only `t12h-muon-wdl-vs4` trained
+  under the old weighting. This retires the fp16-prior caveat in the fidelity bullet
+  below.
+- **Training longer is +70, not +237**, `journal/2026-09-09-two-matches-owed.md`.
+  `t24h-adamw-int8` vs `t12h-int8` in a direct 200-game match under Gumbel: 98-44-58,
+  **0.600, +70 Elo** [0.531, 0.665]; the PUCT league had +237 ± 79. `t12h-reuse2`
+  (double sample reuse) scores 0.3675 against `t24h-adamw-int8`, the weakest 12 h arm
+  on this instrument. ⚠️ `t12h-int8`'s step snapshots are gone, so no joint league
+  can span it any more; `scripts/chain-rerate-and-reuse2.sh` records both matches.
+- **The blunders are dissected**, `journal/2026-09-09-blunder-dissection.md`,
+  `scripts/blunder_dissect.py`, 54 s of card. Against AlphaGateau we hang material at
+  2.15× / 2.21× their rate. Of the reproduced blunders a third are flagged one ply
+  late, n=1024 fixes 14 %, and the rest split between an interior-search collapse
+  (refutation at prior 0.06-0.09, zero visits: `c_scale = 0.1` makes σ span tens of
+  logits) and a value head that does not see the hanging piece (raw value not lower
+  after the blunder in **41 %** of cases). ⚠️ `t12h-gumbel-004009.pt` is gone, so the
+  12 h side replays only 170 of 269. ⚠️ `eval/match.py` writes no PGN, so our blunder
+  rate against ourselves is unmeasured.
+- **Input re-injection is a measured null**, `journal/2026-09-09-reinjection-is-a-null.md`.
+  `--reinject ln1 | both` (2026-08-28, +3.8 % / +5.2 % of evals/s, bit-identical at
+  `c = 0`): five runs, fit deltas −15 / −43 / +69 / +111 / −77 Elo at n=256 with signs
+  that flip between budgets, and the direct matches at n=128 against `t24h-adamw-int8`
+  at 0.4225 / 0.4525 / **0.4300** for lr ×3, lr ×6 and the compute-matched 24 h arm.
+  Stays in the kernel as a mode; nothing should default to it.
+- **The value head fails by calibration, not capacity**, `journal/2026-08-24-the-value-head-is-a-calibration-failure.md`.
+  Eleven runs on one pinned 40k-record set: the linear ceiling on the head's own input
+  is 0.596-0.607 at every final checkpoint, and the **gap** to it orders every Elo
+  outcome (0.006 `t12h-wdl` +1681, 0.041 `t12h-prenorm` +1391, 0.051 `t12h-wdb` +1350,
+  0.078 `t12h-vw2` −231 vs control). A thousand-step head-only refit recovers all of it.
+  ⚠️ Not permission to select a checkpoint. The offline harness of the same day found
+  a `½ z + ½ root_value` target and a policy/value gradient split each close Muon's
+  gap on fixed data; neither had reached the loop before 2026-09-09.
+- ⚠️ **Every league before 2026-08-22 rated PUCT while every run since `t12h-gumbel`
+  trained Gumbel**, `journal/2026-08-22-the-league-was-on-the-wrong-protocol.md`.
+  `eval/league.py --gumbel` is the training protocol; re-rating `t12h-wdl` under it
+  moved its headline from −14 to +121. Every Elo in this file and in `roadmap.md`
+  Track E from before that date is on the mismatch, Gate 2's slope included. A PUCT
+  league and a Gumbel league are not joinable into one fit. ⚠️ Every joint fit in
+  `runs/` reported `converged: False` at the MM cap; measured 2026-09-09, that cost
+  under 0.2 Elo, and `elo.py` now converges by Newton (`bt-newton/v2`, same scale).
+  ⚠️ **The phantom prior compresses a 100-player league by ~25 %** and the pull
+  scales with pool size (`evaluation.md` §5.4.5): neighbouring differences are exact,
+  levels across leagues of different sizes are not comparable, and a slope read inside
+  one big league is low by about a quarter. Default unchanged, decision Théo's.
+- **Self-anchored Elo does not transfer**, `journal/2026-08-19-the-league-does-not-transfer.md`.
+  `t24h-adamw-int8` is +237 ± 79 over `t12h-int8` in the joint league and **+12.5 ± 34
+  against AlphaGateau's released checkpoint** (13-141-46, score 0.4175, −57.9 Elo at
+  n=128 both sides, `scripts/h2h-vs-ag.sh`). Uncompensated material losses at **2.1×
+  their rate** in both matches; the search cap is symmetric, so it is the network.
+  `evaluation.md` §6 calibration has never run and nothing maps our scale to a
+  published one.
+- **A win/draw/loss head as an option**, `--value-classes 3`,
+  `journal/2026-08-21-the-wdl-value-head.md`. Free in the kernel (the aux tile was
+  padded to 32 columns), same `[N]` scalar out, width read off `value.weight.shape[0]`
+  so `anchor.pt` still loads. `t12h-wdl` is the best 12 h recipe on the Gumbel league.
+- **int8 on all four matmuls, two boards per CTA, the shipping kernel**,
+  `journal/2026-08-14-int8-kernel-spec.md`, `2026-08-15-int8-run.md`. **88 148 evals/s**
+  on `forward_full` at 4096 boards, **78 258 useful evals/s** in the production MCTS,
+  ×1.37 over Gate 1a's 56 996; flip risk 4.43 % → 1.83 %. In a 12 h run it bought
+  1.10× the steps and **+20 ± 129 Elo**, a null; it is the default because it is free.
+  ⚠️ The `"all"` scheme is instantiated at two boards per CTA only, which is what made
+  eleven `test_quant.py` tests red until 2026-09-09. ⚠️ The `#pragma unroll 1` line
+  below is stale: the int8 k-loop ships unrolled by two, −1.86 % (`perf.md` 2026-08-28).
+- **Gumbel MuZero at the root, the interior and the target**, `--gumbel --gumbel-m 16`,
+  `journal/2026-08-11-gumbel.md`. **1425.7 Elo at 11.4 h against `t24h-fp8`'s 1348.5 at
+  23.7 h** on the PUCT league; +212 / +124 / +77 at n = 16 / 64 / 256, the paper's
+  shape. PUCT at n=128 searched to a mean depth of 2. Self-play runs at **n = 128**
+  since Track E; `search.md`'s n = 800 is the hill-climbing configuration, not the
+  operating one. `tests/test_search_cuda.py` holds the kernel to the reference under it.
+- **Muon**, `journal/2026-08-07-muon-curve.md`, `2026-08-14-muon-with-decay.md`: +143
+  ± 26 at step 1905 against an unscreened AdamW rate, then +22 / +156 / −51 with the
+  decay it needed, and the calibration finding above says its value head memorises the
+  outcome bit. Not the default. Every one of those numbers is on the PUCT league.
+
 ## State
 
 - `brokefish/nn/model.py` — **the whole network of spec §7, and the oracle**: five
@@ -51,8 +140,10 @@ and is not. Deleting one because it looks obvious is how it gets made again.
   **128/thread** (the kernel uses 116). Every further idea — fusing Q/K/V into
   one k-loop, deeper weight prefetch, `HCHUNK` 512 — breaks one of the two, so
   check both before writing code.
-  ⚠️ `#pragma unroll 1` on the k-loop is **measured, not incidental** — unroll 2
-  spills (−6.9 %), full unroll goes to local memory (−0.8 %).
+  ⚠️ `#pragma unroll 1` on the fp16 k-loop is **measured, not incidental** — unroll 2
+  spills (−6.9 %), full unroll goes to local memory (−0.8 %). ⚠️ On the int8 kernel's
+  plain k-loop the measurement went the other way, unroll 2 is −1.86 % and ships
+  (`perf.md`, 2026-08-28); the two loops are different code.
   ⚠️ `acc_dtype="fp32"` **raises NotImplementedError here**: the kernel only
   emits `f16.f16.f16.f16`, and silently returning an fp16-accumulated result
   would pass every tolerance test while defeating the flag's only purpose. Use
@@ -335,7 +426,10 @@ and is not. Deleting one because it looks obvious is how it gets made again.
   addition when AGZ had it, so it is a *deviation*; `tau_plies` may be plies where
   AGZ meant move pairs; and **fp16 priors flush to zero below 6e-8**, which is
   harmless at today's flat policy, unmeasured at a sharp one, and has no counter.
-  That last one turns from a caveat into a bug silently.
+  ⚠️ Retired 2026-09-09: the Gumbel path floors a stored prior at exactly that value
+  (`gumbel.PRIOR_FLOOR`), so a hard zero gets a finite logit and every positive prior
+  passes unchanged. The review found the floor had been 2^-14, which was the bug this
+  line predicted, in a different form.
 - `brokefish/env/notation.py` — **D0, the output side, done 2026-07-30**: `to_fen`,
   `to_uci`, `to_san`, `to_pgn` and a batched `GameRecorder`, the inverses of the
   `from_fen`/`parse_san`/`from_pgn` that already existed. Nothing could emit a game
@@ -600,5 +694,6 @@ and is not. Deleting one because it looks obvious is how it gets made again.
   pass of check 1, and `n = 16` targets have a mean `policy_len` of 3.5 against the
   much richer ones `n = 800` produces. `training.md` §7.3 has the table.
 - Cost accounting is in (`loop.py`'s euro counter, §10, two numbers: the curve's
-  x-axis and the project total). What is still **untouched** is everything downstream
-  of C2 — the checkpoint league, the Elo curve, C4's sims sweep.
+  x-axis and the project total). ⚠️ This bullet used to end "everything downstream of
+  C2 is untouched"; the D2 bullet above and `roadmap.md` Track E record the league,
+  three curves and the sims sweep, all measured from 2026-07-31 on. Deleted 2026-09-09.

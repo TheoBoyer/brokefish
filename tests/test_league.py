@@ -554,6 +554,81 @@ class TestEloFit:
         assert fit.predict("x", "anchor") == pytest.approx(1.0 - fit.predict("anchor", "x"))
         assert fit.predict("x", "x") == pytest.approx(0.5)
 
+    def test_a_real_sized_budget_ladder_league_converges(self):
+        """The graph that broke `bt-mm/v1`: ~100 players, four runs interleaved by
+        step, three budgets each, the untrained ladder, `random` at zero.
+
+        Every joint league of this shape hit the 10 000-sweep cap until 2026-09-09,
+        because the pool is tied to the pinned anchor only through `random`'s
+        lopsided games and the phantom, so its softest mode is the whole pool
+        sliding together and a coordinate iteration contracts it at ~0.998 per
+        sweep. This asserts two things the cap never did: the fit stops on its own
+        tolerance, and the point it stops at is the maximum of the likelihood, by
+        the stationarity identity every free player satisfies there, checked
+        without the optimiser's help.
+        """
+        rng = random.Random(20260909)
+        runs = ["a", "b", "c", "d"]
+        steps = [201 + 600 * i for i in range(8)]
+        budgets = (16, 64, 256)
+        pool = [league_mod.PoolEntry(name="random", step=0, path=None, run="", sims=0)]
+        pool += [league_mod.PoolEntry(name=f"init:n{k}", step=0, path="init", run="",
+                                      sims=k) for k in (1, 4, 16, 64)]
+        entries = [league_mod.PoolEntry(name=f"{r}@{st}:n{k}", step=st, path=f"{r}{st}",
+                                        run=r, sims=k)
+                   for r in runs for st in steps for k in budgets]
+        entries.sort(key=lambda e: (e.step, e.sims, e.run))
+        pool += entries
+        assert len(pool) == 101
+
+        def truth(e):
+            if e.path is None:
+                return 0.0
+            if e.run == "":
+                return 40.0 * math.log2(e.sims + 1)
+            speed = {"a": 1.0, "b": 1.1, "c": 0.9, "d": 1.05}[e.run]
+            return (1500.0 * (1.0 - math.exp(-speed * e.step / 3000.0))
+                    + 250.0 * math.log2(e.sims / 16.0))
+        true = {e.name: truth(e) for e in pool}
+        n = len(pool)
+        pairs = sorted(set(league_mod.sai_pairings(n, anchor_every=4))
+                       | set(league_mod.budget_ladder_pairs(pool))
+                       | set(league_mod.endpoint_pairs(pool)))
+        pairs = [(pool[i].name, pool[j].name) for i, j in pairs]
+        edges = _simulate(true, pairs, games=36, draw_rate=0.7, rng=rng)
+
+        fit = fit_elo(edges, anchor="random")
+        assert fit.converged, fit.iterations
+        assert fit.iterations < 40, fit.iterations
+
+        # Stationarity of the Bradley-Terry likelihood with the phantom: each free
+        # player's actual score equals its expected score under the fit.
+        gamma = {k: 10.0 ** (v / 400.0) for k, v in fit.elo.items()}
+        expected = {k: 0.0 for k in gamma}
+        for e in edges:
+            p = gamma[e.a] / (gamma[e.a] + gamma[e.b])
+            expected[e.a] += e.games * p
+            expected[e.b] += e.games * (1.0 - p)
+        for k in gamma:
+            if k == "random":
+                continue
+            expected[k] += gamma[k] / (gamma[k] + 1.0)      # prior = 1 vs Elo 0
+            actual = fit.score[k] + 0.5
+            assert abs(actual - expected[k]) < 1e-6, (k, actual, expected[k])
+
+        # And the optimum is the truth. ⚠️ Checked at a small prior on purpose: at
+        # `prior = 1` this graph's hundred phantoms, each pulling a 1000+ Elo player
+        # toward zero with the full half-point a saturated game carries, outweigh
+        # `random`'s ~200 informative games, and the whole pool sits hundreds of Elo
+        # too low (measured 2026-09-09, on this league and on the saved ones). That
+        # is a property of the prior, not of the optimiser, and it is not what this
+        # test is about; the default is unchanged and the finding is reported.
+        small = fit_elo(edges, anchor="random", prior=0.01)
+        assert small.converged and small.iterations < 40, small.iterations
+        misses = [k for k in gamma if k != "random"
+                  and abs(small.elo[k] - true[k]) > 4.0 * small.se[k] + 5.0]
+        assert len(misses) <= 2, misses
+
     def test_the_global_fit_beats_a_single_edge(self):
         """Why §5.2 wants one fit over the graph rather than a chain of matches."""
         rng = random.Random(3)

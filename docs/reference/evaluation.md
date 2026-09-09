@@ -403,13 +403,26 @@ v1 because it requires an online fit and the fixed calendar requires nothing.
 
 #### 5.4.5 The fit
 
-One global Bradley-Terry model over the whole graph, by minorization-maximization,
-never a chain (§5.2). Two departures from the textbook, both load-bearing:
+One global Bradley-Terry model over the whole graph, maximised by Newton's method on
+the exact log-likelihood after a short minorization-maximization warm start
+(`bt-newton/v2`, 2026-09-09; the MM scheme alone crawled along the pool's soft mode
+and hit its iteration cap on every real league, at a cost under 0.2 Elo), never a
+chain (§5.2). Two departures from the textbook, both load-bearing:
 
 - **the anchor is pinned, not fitted** — held at `gamma = 1`, i.e. Elo 0, so the
   scale means something across runs and "the anchor drifted" is a detectable event;
 - **a phantom opponent regularizes** — every player also plays `--prior` drawn
-  games against a phantom at Elo 0. A player who won every game has an infinite
+  games against a phantom at Elo 0. ⚠️ **The pull is not small for the pool**
+  (measured 2026-09-09, `elo.py`'s docstring): a phantom game against a player 1000
+  Elo above zero is saturated and pulls with its full half point, and a hundred of
+  them act on the pool's soft mode against the anchor's ~200 informative games.
+  `t24h-adamw-int8@10218:n256` reads 1831 at `prior = 1` and 2469 at 0.01, weak
+  players move ~170 and the top ~640, so it is a compression by about a quarter on
+  a 100-player league, scaling with pool size. Differences between neighbouring
+  players are unaffected (−76.7 at every prior). Levels from leagues of different
+  sizes are therefore not comparable even on one anchor, and an Elo-per-decade slope
+  read inside a big league is compressed. The default stays at 1 because changing it
+  changes what every recorded rating means; the decision is Théo's. A player who won every game has an infinite
   maximum-likelihood rating, and one will: the first real checkpoint against the
   random-init anchor is plausibly 100 %. At `prior = 1` against several hundred
   real games it moves a rating by well under an Elo point, and it shrinks *toward*

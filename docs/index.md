@@ -33,6 +33,11 @@ with any rating here; the match above needs no rating conversion
 
     Everything runs on a single GPU. The project does no distributed training.
 
+    Brokefish is also practice at running a whole project with a coding agent, as
+    engineering moves to agents: Claude Code wrote most of the code and of these pages
+    under my direction. The scope, the training boundary, the method and the decisions
+    are mine.
+
 ## What I found
 
 1. Self-anchored Elo does not transfer to an outside opponent. The 24 h run rated

@@ -12,12 +12,16 @@ reached. After 24 hours of training on an RTX 4060 Laptop, the current network s
 [AlphaGateau](https://arxiv.org/abs/2410.23753) model, which trained for 13.7 days on
 eight RTX A5000s.
 
+- What the experiments have found so far: [findings.md](findings.md)
+- Trained weights: [huggingface.co/Theob/Brokefish](https://huggingface.co/Theob/Brokefish)
+
 Training uses no human games, no games or evaluations from other engines, no
 pretrained weights and no opening books. The code knows the rules of chess and
 nothing about which positions are good.
 
 The project is also practice at running a whole project with a coding agent: Claude
-Code wrote most of the code and documentation under my direction.
+Code wrote most of the code and documentation under my direction. The scope, the
+training rules, the measurement method and the decisions are mine.
 
 ## Requirements
 

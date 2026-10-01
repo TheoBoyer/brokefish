@@ -20,8 +20,10 @@ pretrained weights and no opening books. The code knows the rules of chess and
 nothing about which positions are good.
 
 The project is also practice at running a whole project with a coding agent: Claude
-Code wrote most of the code and documentation under my direction. The scope, the
-training rules, the measurement method and the decisions are mine.
+Code wrote most of the code and documentation under my direction. I designed the
+board representation described below, which is what lets the whole loop stay on the
+GPU. The scope, the training rules, the measurement method and the decisions are also
+mine.
 
 ## Requirements
 
@@ -102,7 +104,10 @@ A web viewer for playing against a checkpoint and inspecting its search tree. Se
 **Board.** A position is 32 16-bit words, one per piece, plus a control word for side
 to move and the move counters. A piece keeps the same slot for the whole game. Move
 generation, move application and repetition detection are written in CUDA and run one
-warp per position.
+warp per position. Because a slot always holds the same piece, the network's i-th
+token, the i-th row of the legal-move mask and the i-th row of the policy all refer to
+that piece, so applying the rules to the network's output is a bitwise AND on the GPU,
+with no gather and no round trip to the CPU.
 
 **Network.** A transformer whose 32 input tokens are the 32 pieces: 8 layers, width
 256, 8 heads, 6.4 M parameters, about 400 MFLOPs per evaluation. For each piece it

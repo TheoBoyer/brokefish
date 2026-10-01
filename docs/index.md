@@ -14,8 +14,9 @@ against the money spent on compute.
       built and tested. The goal is not reached, and our ratings are not yet tied to a
       public Elo scale.
     - Everything runs on one GPU. Claude Code wrote most of the code and documentation
-      under my direction; the scope, the training rules, the measurement method and the
-      decisions are mine.
+      under my direction. I designed the board representation that keeps the whole loop
+      on the GPU, and the scope, the training rules, the measurement method and the
+      decisions are also mine.
 
 The code, installation and usage are in the
 [repository](https://github.com/TheoBoyer/brokefish). Trained weights are on
@@ -117,7 +118,10 @@ after the blunder).
 
 **Board.** A position is 32 16-bit words, one per piece, plus a control word for side
 to move and the move counters. A piece keeps the same slot for the whole game. Move
-generation runs in CUDA, one warp per position.
+generation runs in CUDA, one warp per position. Because a slot always holds the same
+piece, the network's i-th token, the i-th row of the legal-move mask and the i-th row
+of the policy all refer to that piece, so applying the rules to the network's output
+is a bitwise AND on the GPU, with no gather and no round trip to the CPU.
 
 **Network.** A transformer whose 32 input tokens are the 32 pieces: 8 layers, width
 256, 8 heads, 6.4 M parameters, about 400 MFLOPs per evaluation. For each piece it

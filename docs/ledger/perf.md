@@ -1218,7 +1218,7 @@ Everything in this section is the shipping configuration: `--int8`, which select
 boards per CTA on its own.
 
 **Bit-identity.** The three optimisations above (`cvt.pack`, one read per row with four
-accumulators, `uint4` loads) are together **bit-identical to `8ffb81b`** -- the
+accumulators, `uint4` loads) are together **bit-identical to `2278a48`** -- the
 pre-optimisation two-board kernel was rebuilt and its logits diffed against the current
 one over 1039 positions including the adversarial set: 2 127 872 policy elements,
 132 992 promo, 1039 value, **all equal**. And two boards per CTA remains bit-identical

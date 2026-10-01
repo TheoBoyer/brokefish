@@ -1,6 +1,6 @@
 # 2026-08-04 — the terminal collapse: a cost win, not a strength win
 
-`search.md` §6.6a. Landed in `ff6290b`, **off by default**.
+`search.md` §6.6a. Landed in `31ad5e2`, **off by default**.
 
 ## What was wrong
 

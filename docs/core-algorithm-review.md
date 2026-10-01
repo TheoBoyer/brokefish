@@ -1,7 +1,7 @@
 # Core algorithm review
 
 Date: 2026-09-09  
-Reviewed commit: `6989a97ef05ba7e80dcafb626e87f310bbbceca2`
+Reviewed commit: `f7443f9bc3efc8da21fb005a2b26a9d706f2482a`
 
 Scope: search, chess-state conversion and legal moves, and training-loss mathematics. Run resumption and checkpoint recovery are intentionally excluded. This document records confirmed findings; it does not implement fixes or claim that the remaining code is bug-free.
 

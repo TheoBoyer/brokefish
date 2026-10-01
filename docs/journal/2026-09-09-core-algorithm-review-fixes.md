@@ -1,6 +1,6 @@
 # 2026-09-09 — the four findings of the core-algorithm review, fixed
 
-`docs/core-algorithm-review.md` (reviewed commit `6989a97`) confirmed four defects in
+`docs/core-algorithm-review.md` (reviewed commit `f7443f9`) confirmed four defects in
 search, position import and the training loss, plus a stale test configuration. This
 entry records what changed and what did not. No number on the ledger moves: none of the
 four was measured for its effect on playing strength, and this entry does not claim one.

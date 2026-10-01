@@ -18,9 +18,9 @@ stops at step 1905 while the control runs to 2206.
 
 | | optimiser | peak lr | sims | base | self-play |
 |---|---|---|---|---|---|
-| `t7h-muon` | muon + aux adamw at lr × 0.05 | **2.0e-2** | 128 | `ad01c03` + 438 uncommitted lines | 18.6 s/gen |
-| `t7h-fp8` | adamw | 1.0e-3 | 128 | `ff6290b` + fp8 encoder | 19.6 s/gen |
-| `t7h-n128-collapse` | adamw | 1.0e-3 | 128 | `8ffb593` | 22.6 s/gen |
+| `t7h-muon` | muon + aux adamw at lr × 0.05 | **2.0e-2** | 128 | `b91c8a9` + 438 uncommitted lines | 18.6 s/gen |
+| `t7h-fp8` | adamw | 1.0e-3 | 128 | `31ad5e2` + fp8 encoder | 19.6 s/gen |
+| `t7h-n128-collapse` | adamw | 1.0e-3 | 128 | `78fb28a` | 22.6 s/gen |
 
 Everything else is the same configuration line: 1024 games in flight, batch 4096 in 4
 micro-batches, cadence 0.815 samples/position → 10 240 records and 2.04 steps per

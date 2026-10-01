@@ -124,7 +124,7 @@ permutation test above, the side-to-move row select, and the retro-compat load.
   Fixed here because it blocked verifying the new flag.
 - ⚠️ **11 tests in `tests/test_quant.py` are red on `main`** and have nothing to do
   with this work — confirmed by running them in a worktree at `HEAD`. `SCHEME` became
-  `"all"` (quant 3) in b6a79d0, and quant 3 is instantiated at two boards per CTA
+  `"all"` (quant 3) in 1350190, and quant 3 is instantiated at two boards per CTA
   only, so every `two_boards=False` construction now raises in the constructor. The
   tests that prove one board and two boards agree bit-for-bit are among them, which
   means **that invariant is currently unchecked.** Not fixed here.

@@ -108,5 +108,5 @@ on the standalone `core.cuh` driver — before promising what deleting any of th
 
 ## Landed
 
-Nothing. The kernel is reverted to Stage 1; `csrc/` is byte-identical to `cb92886`.
+Nothing. The kernel is reverted to Stage 1; `csrc/` is byte-identical to `8ac4306`.
 `bench/bench_phases.py` and the `prof` instrumentation, which are from Stage 2, stay.

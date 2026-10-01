@@ -15,7 +15,7 @@ over their own checkpoints with the pool mean pinned at 1000, so it cannot be co
 with any rating here; the match above needs no rating conversion
 ([reading the paper](journal/2026-08-09-alphagateau-read.md)).
 
-!!! info "Interim report, state as of 2026-09-09 (commit 5b24ad9)"
+!!! info "Interim report, state as of 2026-09-09 (commit deb845b)"
 
     The goal is to build the cheapest superhuman chess engine that learns from scratch,
     and to measure on the way a curve of Elo against euros spent, which has not been

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.png" alt="Brokefish logo" width="240">
+</p>
+
 # Brokefish
 
 Brokefish is a chess engine that learns only from games it plays against itself, in

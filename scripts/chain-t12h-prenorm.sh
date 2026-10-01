@@ -68,7 +68,7 @@
 #
 #   tail -f runs/t12h-prenorm/chain.log
 set -u
-cd ~/brokefish
+cd "$(dirname "$(readlink -f "$0")")/.."
 RUN=t12h-prenorm
 mkdir -p runs/$RUN
 LOG=runs/$RUN/chain.log

@@ -18,7 +18,9 @@
 #
 #   tail -f logs/puzzle-audit.log
 set -u
-cd ~/brokefish
+cd "$(dirname "$(readlink -f "$0")")/.."
+REPO=$PWD
+AG_DIR=${AG_DIR:-$REPO/../alphagateau}
 LOG=logs/puzzle-audit.log
 PY="uv run --no-project --python .venv/bin/python"
 say() { printf '\n\n=== %s  %s\n\n' "$(date '+%F %T')" "$*" | tee -a "$LOG"; }
@@ -35,10 +37,10 @@ say "1/2 done (exit $?)"
 
 # Restart AG's server so it picks up the n=0 path added after the match started.
 pkill -f serve_ag 2>/dev/null; sleep 3
-( cd ~/alphagateau && XLA_PYTHON_CLIENT_PREALLOCATE=false \
-  XLA_PYTHON_CLIENT_MEM_FRACTION=0.50 nohup .venv/bin/python serve_ag.py \
+( cd "$AG_DIR" && XLA_PYTHON_CLIENT_PREALLOCATE=false \
+  XLA_PYTHON_CLIENT_MEM_FRACTION=0.50 nohup .venv/bin/python "$REPO/scripts/alphagateau/serve_ag.py" \
   --ckpt models/chess_2024-08-20:00h13/000499.ckpt --port 8083 --pad 64 \
-  > ~/brokefish/logs/serve-ag-8083.log 2>&1 & )
+  > "$REPO"/logs/serve-ag-8083.log 2>&1 & )
 for i in $(seq 1 40); do grep -q "ready on" logs/serve-ag-8083.log && break; sleep 8; done
 tail -1 logs/serve-ag-8083.log | tee -a "$LOG"
 

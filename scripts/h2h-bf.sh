@@ -16,7 +16,7 @@
 # ⚠️ No `serve_ag` here, so no jit-boundary concern and no segmentation -- see that
 # script's header for why segmenting is retired generally.
 set -u
-cd ~/brokefish
+cd "$(dirname "$(readlink -f "$0")")/.."
 A=${1:?checkpoint A}; B=${2:?checkpoint B}; TAG=${3:?tag}; GAMES=${4:-200}; N=${5:-128}
 LOG=logs/h2h-$TAG.log
 PY="uv run --no-project --python .venv/bin/python"

@@ -49,7 +49,7 @@
 #
 # tail -f runs/t12h-target-mix/chain.log
 set -u
-cd ~/brokefish
+cd "$(dirname "$(readlink -f "$0")")/.."
 RUN=t12h-target-mix
 CTRL=t12h-wdl
 REF=runs/t24h-adamw-int8/checkpoints/t24h-adamw-int8.pt

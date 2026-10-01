@@ -96,7 +96,7 @@
 #
 #   tail -f runs/t12h-reinject/chain.log
 set -u
-cd ~/brokefish
+cd "$(dirname "$(readlink -f "$0")")/.."
 RUN=t12h-reinject
 CTRL=t12h-wdl
 mkdir -p runs/$RUN

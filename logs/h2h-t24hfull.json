@@ -1,0 +1,32 @@
+{
+  "a": {
+    "engine": "brokefish",
+    "ckpt": "runs/t24h-adamw-int8/checkpoints/t24h-adamw-int8.pt",
+    "device": "cuda"
+  },
+  "b": {
+    "engine": "alphagateau",
+    "ckpt": "models/chess_2024-08-20:00h13/000499.ckpt",
+    "device": "cuda:0",
+    "iteration": 499,
+    "frames": 65536000,
+    "layers": 5,
+    "inner": 128
+  },
+  "n_a": 128,
+  "n_b": 128,
+  "games": 200,
+  "wins": 13,
+  "draws": 141,
+  "losses": 46,
+  "score": 0.4175,
+  "ci95": [
+    0.35133738088308797,
+    0.4867722100934351
+  ],
+  "elo": -57.85577995137429,
+  "seed": 0,
+  "opening_plies": 8,
+  "max_plies": 300,
+  "mean_plies": 96.865
+}

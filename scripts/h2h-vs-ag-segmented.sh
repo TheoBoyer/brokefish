@@ -14,7 +14,7 @@
 # Every segment is colour-balanced on its own (the arbiter plays each opening twice,
 # once with each engine as White), so a partial run is still an unbiased estimate.
 set -u
-cd ~/brokefish
+cd "$(dirname "$(readlink -f "$0")")/.."
 CKPT=${1:?checkpoint}; TAG=${2:?tag}; SEGS=${3:-4}; PER=${4:-50}; N=${5:-128}
 for i in $(seq 1 "$SEGS"); do
   printf '\n######## segment %d/%d, seed 0, openings %d..%d, %d games\n' "$i" "$SEGS" $(( (i-1)*PER/2 )) $(( i*PER/2 - 1 )) "$PER"

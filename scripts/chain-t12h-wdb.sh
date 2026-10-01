@@ -79,7 +79,7 @@
 #
 #   tail -f runs/t12h-wdb/chain.log
 set -u
-cd ~/brokefish
+cd "$(dirname "$(readlink -f "$0")")/.."
 RUN=t12h-wdb
 mkdir -p runs/$RUN
 LOG=runs/$RUN/chain.log

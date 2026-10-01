@@ -1,5 +1,5 @@
 site_name: Brokefish
-site_description: The cheapest superhuman chessbot from scratch
+site_description: Interim report, as of 2026-09-09, on a chess engine learned from self-play on one laptop GPU, toward the cheapest superhuman engine from scratch
 # site_url and repo_url are unset on purpose: the repository is not published and the
 # domain is not chosen. Both are cosmetic (canonical link, "edit this page" button).
 
@@ -62,6 +62,40 @@ nav:
       - Performance: ledger/perf.md
   - Journal:
       - journal/index.md
+      - 2026-09-09 · Two matches that were owed: journal/2026-09-09-two-matches-owed.md
+      - 2026-09-09 · Where the blunders come from: journal/2026-09-09-blunder-dissection.md
+      - 2026-09-09 · Input re-injection is a null: journal/2026-09-09-reinjection-is-a-null.md
+      - 2026-09-09 · Core-algorithm review fixes: journal/2026-09-09-core-algorithm-review-fixes.md
+      - 2026-08-28 · Input re-injection: journal/2026-08-28-input-reinjection.md
+      - 2026-08-24 · The value head is a calibration failure: journal/2026-08-24-the-value-head-is-a-calibration-failure.md
+      - 2026-08-22 · The league was on the wrong protocol: journal/2026-08-22-the-league-was-on-the-wrong-protocol.md
+      - 2026-08-21 · Value head audit: journal/2026-08-21-value-head-audit.md
+      - 2026-08-21 · A win/draw/loss value head: journal/2026-08-21-the-wdl-value-head.md
+      - 2026-08-19 · The league does not transfer: journal/2026-08-19-the-league-does-not-transfer.md
+      - 2026-08-19 · The AlphaGateau server leak: journal/2026-08-19-the-alphagateau-server-leak.md
+      - 2026-08-15 · The int8 run: journal/2026-08-15-int8-run.md
+      - 2026-08-14 · int8 kernel specification: journal/2026-08-14-int8-kernel-spec.md
+      - 2026-08-14 · Muon with weight decay: journal/2026-08-14-muon-with-decay.md
+      - 2026-08-13 · fp8 attention and RL: journal/2026-08-13-fp8-attention-and-rl.md
+      - 2026-08-13 · Massive activations: journal/2026-08-13-massive-activations.md
+      - 2026-08-13 · AlphaGateau cadence: journal/2026-08-13-alphagateau-cadence.md
+      - 2026-08-11 · Gumbel: journal/2026-08-11-gumbel.md
+      - 2026-08-09 · Kernel design retrospective: journal/2026-08-09-kernel-design-retrospective.md
+      - 2026-08-09 · Reading AlphaGateau: journal/2026-08-09-alphagateau-read.md
+      - 2026-08-08 · PCR and the rebased scale: journal/2026-08-08-pcr-and-the-rebased-scale.md
+      - 2026-08-07 · Sims 256 from existing checkpoints: journal/2026-08-07-e11-sims-256.md
+      - 2026-08-07 · Muon on the curve: journal/2026-08-07-muon-curve.md
+      - 2026-08-05 · Muon survey: journal/2026-08-05-muon-survey.md
+      - 2026-08-05 · Redesign ceiling: journal/2026-08-05-redesign-ceiling.md
+      - 2026-08-05 · CODA fold: journal/2026-08-05-coda-fold.md
+      - 2026-08-05 · FFN handoff, a negative: journal/2026-08-05-ffn-handoff-negative.md
+      - 2026-08-05 · Phase decomposition: journal/2026-08-05-phase-decomposition.md
+      - 2026-08-05 · fp8, one scale per row: journal/2026-08-05-fp8-per-row.md
+      - 2026-08-04 · Encoder QA: journal/2026-08-04-encoder-qa.md
+      - 2026-08-04 · fp8 encoder: journal/2026-08-04-fp8-encoder.md
+      - 2026-08-04 · Terminal collapse: journal/2026-08-04-terminal-collapse.md
+      - 2026-07-31 · Building D2, the league: journal/2026-07-31-d2-league.md
+      - 2026-07-31 · The collapse of c2-8h: journal/2026-07-31-value-collapse.md
       - 2026-07-31 · Build log, A0 through D1: journal/2026-07-31-build-log.md
       - 2026-07-30 · Eval prior art: journal/2026-07-30-eval-prior-art.md
       - 2026-07-30 · Fidelity audit: journal/2026-07-30-fidelity.md

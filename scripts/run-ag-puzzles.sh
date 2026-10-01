@@ -7,7 +7,9 @@
 #
 #   tail -f logs/ag-puzzles.log
 set -u
-cd ~/brokefish
+cd "$(dirname "$(readlink -f "$0")")/.."
+REPO=$PWD
+AG_DIR=${AG_DIR:-$REPO/../alphagateau}
 LOG=logs/ag-puzzles.log
 PY="uv run --no-project --python .venv/bin/python"
 LIMIT=${1:-20000}
@@ -15,11 +17,11 @@ LIMIT=${1:-20000}
 start_server() {
   systemctl --user stop ag-puz.scope 2>/dev/null
   pkill -f serve_ag 2>/dev/null; sleep 3
-  ( cd ~/alphagateau && systemd-run --user --scope -p MemoryMax=10G \
+  ( cd "$AG_DIR" && systemd-run --user --scope -p MemoryMax=10G \
       --unit=ag-puz --quiet env XLA_PYTHON_CLIENT_PREALLOCATE=false \
-      XLA_PYTHON_CLIENT_MEM_FRACTION=0.35 .venv/bin/python serve_ag.py \
+      XLA_PYTHON_CLIENT_MEM_FRACTION=0.35 .venv/bin/python "$REPO/scripts/alphagateau/serve_ag.py" \
       --ckpt models/chess_2024-08-20:00h13/000499.ckpt --port 8085 --pad 64 \
-      --warm-n 0 > ~/brokefish/logs/serve-ag-puz.log 2>&1 & )
+      --warm-n 0 > "$REPO"/logs/serve-ag-puz.log 2>&1 & )
   for i in $(seq 1 40); do
     grep -q "ready on" logs/serve-ag-puz.log 2>/dev/null && return 0
     sleep 5

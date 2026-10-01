@@ -5,4 +5,4 @@ avoid_fifty              200  a mate in 1 is available at halfmove clock 99
 avoid_threefold          199  a mate in 1 is available and one reply repeats a position twice seen
 avoid_insufficient       200  a mate in 1 is available and so is a dead-drawn material split
 underpromotion           200  every mating move is a promotion to a knight, bishop or rook
--> ~/brokefish/data/suites.pt
+-> data/suites.pt

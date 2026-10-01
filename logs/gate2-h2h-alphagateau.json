@@ -1,0 +1,32 @@
+{
+  "a": {
+    "engine": "brokefish",
+    "ckpt": "checkpoints/t12h-gumbel-004009.pt",
+    "device": "cuda"
+  },
+  "b": {
+    "engine": "alphagateau",
+    "ckpt": "models/chess_2024-08-20:00h13/000499.ckpt",
+    "device": "cuda:0",
+    "iteration": 499,
+    "frames": 65536000,
+    "layers": 5,
+    "inner": 128
+  },
+  "n_a": 128,
+  "n_b": 128,
+  "games": 200,
+  "wins": 20,
+  "draws": 120,
+  "losses": 60,
+  "score": 0.4,
+  "ci95": [
+    0.3346046396837895,
+    0.46916456149987484
+  ],
+  "elo": -70.43650362227247,
+  "seed": 0,
+  "opening_plies": 8,
+  "max_plies": 300,
+  "mean_plies": 92.455
+}

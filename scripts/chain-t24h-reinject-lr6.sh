@@ -72,7 +72,7 @@
 #
 #   tail -f runs/t24h-reinject-lr6/chain.log
 set -u
-cd ~/brokefish
+cd "$(dirname "$(readlink -f "$0")")/.."
 RUN=t24h-reinject-lr6
 mkdir -p runs/$RUN
 LOG=runs/$RUN/chain.log

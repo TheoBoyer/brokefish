@@ -9,7 +9,7 @@ CUDA became accessible after the session permissions changed. GPU checks ran on 
 
 ## 1. Gumbel search flattens distinct small priors
 
-Locations: [gumbel.py](../brokefish/search/gumbel.py), line 160; [search.cuh](../csrc/search.cuh), lines 338, 458, and 477.
+Locations: `brokefish/search/gumbel.py`, line 160; `csrc/search.cuh`, lines 338, 458, and 477.
 
 ### Problem
 
@@ -35,7 +35,7 @@ Handle hard-zero priors without flattening positive, representable probabilities
 
 ## 2. Imported positions can acquire illegal castling rights
 
-Locations: [torch_impl.py](../brokefish/env/torch_impl.py), `from_board` around lines 705–740 and `from_fen` around lines 775–789.
+Locations: `brokefish/env/torch_impl.py`, `from_board` around lines 705–740 and `from_fen` around lines 775–789.
 
 ### Problem
 
@@ -64,7 +64,7 @@ Initialize rights for every live rook using its actual piece type, square, and t
 
 ## 3. Microbatching changes the masked value-loss gradient
 
-Locations: [loss.py](../brokefish/train/loss.py), lines 263–294; [loop.py](../brokefish/train/loop.py), lines 859–871.
+Locations: `brokefish/train/loss.py`, lines 263–294; `brokefish/train/loop.py`, lines 859–871.
 
 ### Problem
 
@@ -97,7 +97,7 @@ Accumulate policy and value terms separately: weight policy means by row count a
 
 ## 4. Zero-prior visited moves corrupt Gumbel's completion value
 
-Locations: [gumbel.py](../brokefish/search/gumbel.py), lines 127–136; [search.cuh](../csrc/search.cuh), lines 386–407.
+Locations: `brokefish/search/gumbel.py`, lines 127–136; `csrc/search.cuh`, lines 386–407.
 
 ### Problem
 
@@ -146,7 +146,7 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 .venv/bin/python -m pytest -q \
 # 78 passed, 8 skipped
 ```
 
-All 11 failures occurred during encoder construction in [test_quant.py](../tests/test_quant.py), principally lines 406 and 428. These tests request `int8=True, two_boards=False`, while the default quantization scheme is now `all`, which the encoder rejects with `two_boards=False`.
+All 11 failures occurred during encoder construction in `tests/test_quant.py`, principally lines 406 and 428. These tests request `int8=True, two_boards=False`, while the default quantization scheme is now `all`, which the encoder rejects with `two_boards=False`.
 
 The failures concern `test_two_boards_per_cta_is_bit_identical_to_one` (10 parameterizations) and `test_two_boards_runs_the_debug_stages`. They indicate stale test/configuration assumptions, not demonstrated incorrect kernel output. The comparison tests should explicitly select a scheme supporting both configurations, or be updated to cover the currently supported combinations.
 

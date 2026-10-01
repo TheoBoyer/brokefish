@@ -28,7 +28,9 @@
 # directly: n = 128 both sides, 200 games over 100 openings, 8 opening plies, 300-ply
 # cap. `t12h-gumbel-004009` scored 0.400 (20 W / 120 D / 60 L, -70 Elo) on it.
 set -u
-cd ~/brokefish
+cd "$(dirname "$(readlink -f "$0")")/.."
+REPO=$PWD
+AG_DIR=${AG_DIR:-$REPO/../alphagateau}
 CKPT=${1:?checkpoint}; TAG=${2:?tag}; GAMES=${3:-200}; N=${4:-128}; SEED=${5:-0}; SKIP=${6:-0}
 LOG=logs/h2h-$TAG.log
 PY="uv run --no-project --python .venv/bin/python"
@@ -45,11 +47,11 @@ start_servers() {
   systemctl --user reset-failed ag-h2h.scope bf-h2h.scope 2>/dev/null
   pkill -f serve_ag 2>/dev/null; pkill -f serve_brokefish 2>/dev/null; sleep 4
   : > logs/serve-ag-$TAG.log; : > logs/serve-bf-$TAG.log
-  ( cd ~/alphagateau && systemd-run --user --scope -p MemoryMax=10G \
+  ( cd "$AG_DIR" && systemd-run --user --scope -p MemoryMax=10G \
       --unit=ag-h2h --quiet env XLA_PYTHON_CLIENT_PREALLOCATE=false \
-      XLA_PYTHON_CLIENT_MEM_FRACTION=0.55 .venv/bin/python serve_ag.py \
+      XLA_PYTHON_CLIENT_MEM_FRACTION=0.55 .venv/bin/python "$REPO/scripts/alphagateau/serve_ag.py" \
       --ckpt "$AG" --port 8085 --pad 64 --warm-n "$N" \
-      > ~/brokefish/logs/serve-ag-$TAG.log 2>&1 & )
+      > "$REPO"/logs/serve-ag-$TAG.log 2>&1 & )
   ( systemd-run --user --scope -p MemoryMax=6G --unit=bf-h2h --quiet \
       $PY scripts/serve_brokefish.py --ckpt "$CKPT" --port 8081 \
       > logs/serve-bf-$TAG.log 2>&1 & )

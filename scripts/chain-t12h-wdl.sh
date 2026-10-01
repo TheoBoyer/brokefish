@@ -83,7 +83,7 @@
 #
 #   tail -f runs/t12h-wdl/chain.log
 set -u
-cd ~/brokefish
+cd "$(dirname "$(readlink -f "$0")")/.."
 RUN=t12h-wdl
 CTRL=t12h-flat
 mkdir -p runs/$RUN

@@ -68,7 +68,9 @@
 #
 #   tail -f runs/t24h-adamw-int8/chain.log
 set -u
-cd ~/brokefish
+cd "$(dirname "$(readlink -f "$0")")/.."
+REPO=$PWD
+AG_DIR=${AG_DIR:-$REPO/../alphagateau}
 RUN=t24h-adamw-int8
 mkdir -p runs/$RUN
 LOG=runs/$RUN/chain.log
@@ -121,11 +123,11 @@ start_servers() {
   systemctl --user stop ag-h2h.scope bf-h2h.scope 2>/dev/null
   pkill -f serve_ag 2>/dev/null; pkill -f serve_brokefish 2>/dev/null; sleep 3
   : > logs/serve-ag-h2h.log; : > logs/serve-bf-h2h.log
-  ( cd ~/alphagateau && systemd-run --user --scope -p MemoryMax=8G \
+  ( cd "$AG_DIR" && systemd-run --user --scope -p MemoryMax=8G \
       --unit=ag-h2h --quiet env XLA_PYTHON_CLIENT_PREALLOCATE=false \
-      XLA_PYTHON_CLIENT_MEM_FRACTION=0.35 .venv/bin/python serve_ag.py \
+      XLA_PYTHON_CLIENT_MEM_FRACTION=0.35 .venv/bin/python "$REPO/scripts/alphagateau/serve_ag.py" \
       --ckpt models/chess_2024-08-20:00h13/000499.ckpt --port 8085 --pad 64 \
-      --warm-n 0 > ~/brokefish/logs/serve-ag-h2h.log 2>&1 & )
+      --warm-n 0 > "$REPO"/logs/serve-ag-h2h.log 2>&1 & )
   ( systemd-run --user --scope -p MemoryMax=6G --unit=bf-h2h --quiet \
       $PY scripts/serve_brokefish.py --ckpt "$CKPT" --port 8081 \
       > logs/serve-bf-h2h.log 2>&1 & )

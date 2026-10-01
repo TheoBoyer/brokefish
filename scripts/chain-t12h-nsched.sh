@@ -77,7 +77,7 @@
 #
 #   tail -f runs/t12h-nsched/chain.log
 set -u
-cd ~/brokefish
+cd "$(dirname "$(readlink -f "$0")")/.."
 RUN=t12h-nsched
 CTRL=t12h-flat
 mkdir -p runs/$RUN

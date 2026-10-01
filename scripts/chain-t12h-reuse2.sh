@@ -75,7 +75,7 @@
 #
 #   tail -f runs/t12h-reuse2/chain.log
 set -u
-cd ~/brokefish
+cd "$(dirname "$(readlink -f "$0")")/.."
 RUN=t12h-reuse2
 CTRL=t24h-adamw-int8
 mkdir -p runs/$RUN

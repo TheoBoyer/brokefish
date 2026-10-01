@@ -18,7 +18,7 @@
 #
 #   tail -f logs/puct-vs-gumbel.log
 set -u
-cd ~/brokefish
+cd "$(dirname "$(readlink -f "$0")")/.."
 LOG=logs/puct-vs-gumbel.log
 PY="uv run --no-project --python .venv/bin/python"
 CKPT=runs/t12h-muon9-int8/checkpoints/t12h-muon9-int8-005010.pt

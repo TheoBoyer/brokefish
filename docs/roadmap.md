@@ -321,7 +321,7 @@ efficiency costs, which is why they follow E1 rather than lead it.
   follows E1.1's answer. ⚠️ It also needs its own equivalence story — the tree is
   currently checked bit-for-bit against the fp32 reference, and an fp8 rollout can
   only promise agreement on the *move*, not on the numbers.
-- **muP, then progressive network sizing.** [`model.py`](../brokefish/nn/model.py) already defers this in
+- **muP, then progressive network sizing.** `brokefish/nn/model.py` already defers this in
   place: *"Real muP treats embeddings and readouts differently and that is a training
   decision (C2), not a forward-pass one."* muP's payoff is hyperparameter transfer
   across width, which is what makes KataGo's progressive sizing — (6,96) → (10,128) →

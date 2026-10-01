@@ -19,7 +19,7 @@
 #
 #   tail -f logs/queue-reinject-both.log
 set -u
-cd ~/brokefish
+cd "$(dirname "$(readlink -f "$0")")/.."
 LOG=logs/queue-reinject-both.log
 PREV=runs/t12h-reinject/chain.log
 DAT=runs/t12h-reinject/replay/t12h-reinject.dat

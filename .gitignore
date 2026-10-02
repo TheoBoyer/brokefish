@@ -21,3 +21,15 @@ papers/
 
 # Secrets (HF_TOKEN).
 .env
+
+# Compiled CUDA test binaries (built from csrc/tests/*.cu)
+csrc/tests/tdirect
+csrc/tests/tfp8
+csrc/tests/tg2
+csrc/tests/tgemm
+csrc/tests/tmovegen
+csrc/tests/tperft
+csrc/tests/tselect
+csrc/tests/tstep
+csrc/tests/tterminal
+csrc/tests/tzobrist
